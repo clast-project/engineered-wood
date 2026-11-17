@@ -259,10 +259,20 @@ internal sealed class ShreddedVariantPath
     /// equals <paramref name="literal"/> (see <see cref="VariantBound.TryInvert"/>). Empty when no leaf value's does.
     /// False when this cannot say, and then nothing may be concluded.
     /// </summary>
-    public bool TryEncodeForProbe(LiteralValue literal, out byte[][] encodings)
+    /// <param name="literal">The value the result is compared with.</param>
+    /// <param name="setMembership">Whether it is a member of an <c>IN</c> list (see <see cref="VariantBound.TryInvert"/>).</param>
+    /// <param name="encodings">The encodings to probe for.</param>
+    public bool TryEncodeForProbe(LiteralValue literal, bool setMembership, out byte[][] encodings)
     {
         encodings = [];
-        if (!VariantBound.TryInvert(Kind, DecimalScale, TargetType, literal, out var leafValue))
+        // The width is the file's to declare; a decimal is at most 16 bytes, which is all the bounds decoder reads.
+        // Past that, decline: a null from ToStored would claim no row matches, and the buffer is the file's size.
+        if (Kind == VariantBoundKind.Decimal && Column.PhysicalType == PhysicalType.FixedLenByteArray
+            && Column.TypeLength is not (>= 1 and <= 16))
+        {
+            return false;
+        }
+        if (!VariantBound.TryInvert(Kind, DecimalScale, TargetType, literal, out var leafValue, setMembership))
             return false;
         if (leafValue is not { } value)
             return true;

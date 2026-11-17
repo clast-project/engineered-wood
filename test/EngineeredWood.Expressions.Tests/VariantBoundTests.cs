@@ -211,4 +211,46 @@ public class VariantBoundTests
         Assert.Equal(20765L, Invert(VariantBoundKind.Date, "date", LiteralValue.Of(new DateOnly(2026, 11, 8)))!.Value.AsInteger);
     }
 #endif
+
+    /// <summary>
+    /// Spark compares a decimal at the two sides' least common type. Where that rounds either side the inverse
+    /// declines (#901 review): <c>decimal(38,38)</c> against <c>0</c> is compared at <c>decimal(38,37)</c>.
+    /// </summary>
+    [Fact]
+    public void Invert_ComparisonThatRounds_Declines()
+    {
+        Declines(VariantBoundKind.Decimal, "decimal(38,38)", LiteralValue.Of(0), scale: 38);
+        Declines(VariantBoundKind.Decimal, "decimal(38,30)", LiteralValue.Of(123456789m), scale: 30);
+        // A literal with more scale than fits beside the result's integral digits is the one rounded.
+        Declines(VariantBoundKind.Int64, "bigint", LiteralValue.HighPrecisionDecimalOf(new BigInteger(7) * BigInteger.Pow(10, 19), 19));
+        // One digit and 29 places fit; an IN member types an int at its full 10 digits, which does not.
+        Assert.NotNull(Invert(VariantBoundKind.Decimal, "decimal(30,29)", LiteralValue.Of(1), scale: 29));
+        Assert.True(VariantBound.TryInvert(VariantBoundKind.Decimal, 29, "decimal(30,29)", LiteralValue.Of(1), out _,
+            setMembership: false));
+        Assert.False(VariantBound.TryInvert(VariantBoundKind.Decimal, 29, "decimal(30,29)", LiteralValue.Of(1), out _,
+            setMembership: true));
+        // Two integrals are never unified as decimals.
+        Assert.NotNull(Invert(VariantBoundKind.Int64, "bigint", LiteralValue.Of(long.MaxValue)));
+    }
+
+    /// <summary>
+    /// A literal no Spark type holds is declined before its digits are used: a 50-million-place scale, or an unscaled
+    /// value of 200,000 digits, would otherwise cost a huge power of ten or a quadratic digit count (#901 review).
+    /// </summary>
+    [Fact]
+    public void Invert_EnormousLiteral_DeclinesAtOnce()
+    {
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Declines(VariantBoundKind.Int64, "bigint", LiteralValue.HighPrecisionDecimalOf(BigInteger.One, 50_000_000));
+        Declines(VariantBoundKind.Int64, "bigint", LiteralValue.HighPrecisionDecimalOf(BigInteger.Zero, 50_000_000));
+        Declines(VariantBoundKind.Decimal, "decimal(38,2)", LiteralValue.HighPrecisionDecimalOf(BigInteger.One, 50_000_000), scale: 2);
+        // A 200,000-digit unscaled value: counting its digits one division at a time is quadratic.
+        var huge = BigInteger.Pow(10, 200_000);
+        watch.Restart();
+        // TryInvert directly: Declines would format the literal into its message, which is slow itself.
+        Assert.False(VariantBound.TryInvert(VariantBoundKind.Int64, 0, "bigint", LiteralValue.HighPrecisionDecimalOf(huge, 0), out _));
+        Assert.False(VariantBound.TryInvert(VariantBoundKind.Decimal, 2, "decimal(38,2)",
+            LiteralValue.HighPrecisionDecimalOf(huge, 2), out _));
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(1), $"took {watch.Elapsed}");
+    }
 }

@@ -118,18 +118,18 @@ internal static class MembershipPredicateEvaluator
                     if ((TryGetOperandAndLiteral(cmp.Left, cmp.Right, out var operand, out var value)
                          || TryGetOperandAndLiteral(cmp.Right, cmp.Left, out operand, out value))
                         && !value.IsNull)
-                        Add(operand!, [value]);
+                        Add(operand!, [value], setMembership: false);
                     break;
                 case SetPredicate set when set.Op == SetOperator.In:
                     if (IsOperand(set.Operand)
                         && set.Values.Count > 0
                         && set.TryGetLiteralValues(out var values))
-                        Add(set.Operand, values);
+                        Add(set.Operand, values, setMembership: true);
                     break;
             }
         }
 
-        void Add(Expression operand, IReadOnlyList<LiteralValue> values)
+        void Add(Expression operand, IReadOnlyList<LiteralValue> values, bool setMembership)
         {
             if (!TryResolve(schema, operand, out var target) || seen.Contains(target.Index))
                 return;
@@ -137,7 +137,7 @@ internal static class MembershipPredicateEvaluator
             bool asks = false;
             foreach (var value in values)
             {
-                if (!target.TryEncode(value, out var encodings))
+                if (!target.TryEncode(value, setMembership, out var encodings))
                     return;
                 asks |= encodings.Length > 0;
             }
@@ -215,7 +215,7 @@ internal static class MembershipPredicateEvaluator
         if (value.IsNull)
             return FilterResult.Unknown;
 
-        return await ProbeAsync(operand!, [value], ctx, ct).ConfigureAwait(false);
+        return await ProbeAsync(operand!, [value], setMembership: false, ctx, ct).ConfigureAwait(false);
     }
 
     private static async ValueTask<FilterResult> EvaluateInAsync(
@@ -231,7 +231,7 @@ internal static class MembershipPredicateEvaluator
         if (!set.TryGetLiteralValues(out var values))
             return FilterResult.Unknown;
 
-        return await ProbeAsync(set.Operand, values, ctx, ct).ConfigureAwait(false);
+        return await ProbeAsync(set.Operand, values, setMembership: true, ctx, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -239,7 +239,7 @@ internal static class MembershipPredicateEvaluator
     /// absent; Unknown if any might be present, or if the source cannot be asked.
     /// </summary>
     private static async ValueTask<FilterResult> ProbeAsync(
-        Expression operand, IReadOnlyList<LiteralValue> values, Context ctx, CancellationToken ct)
+        Expression operand, IReadOnlyList<LiteralValue> values, bool setMembership, Context ctx, CancellationToken ct)
     {
         if (!TryResolve(ctx.Schema, operand, out var target))
             return FilterResult.Unknown;
@@ -269,7 +269,7 @@ internal static class MembershipPredicateEvaluator
         var encoded = new List<byte[]>(values.Count);
         foreach (var v in values)
         {
-            if (!target.TryEncode(v, out var encodings))
+            if (!target.TryEncode(v, setMembership, out var encodings))
                 return FilterResult.Unknown; // can't encode → can't decide
             encoded.AddRange(encodings);
         }
@@ -663,11 +663,12 @@ internal static class MembershipPredicateEvaluator
     {
         /// <summary>
         /// The encodings to probe for <paramref name="value"/>; false when the source cannot be asked. Empty only
-        /// for a variant leaf none of whose values converts to <paramref name="value"/>.
+        /// for a variant leaf none of whose values converts to <paramref name="value"/>. Whether the value is an
+        /// <c>IN</c> member changes how Spark types it against a variant result's decimal.
         /// </summary>
-        public bool TryEncode(LiteralValue value, out byte[][] encodings) =>
+        public bool TryEncode(LiteralValue value, bool setMembership, out byte[][] encodings) =>
             Path is { } path
-                ? path.TryEncodeForProbe(value, out encodings)
+                ? path.TryEncodeForProbe(value, setMembership, out encodings)
                 : TryEncodeForProbe(value, Descriptor, out encodings);
     }
 

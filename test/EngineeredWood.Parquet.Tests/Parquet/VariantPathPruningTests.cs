@@ -670,8 +670,8 @@ public class VariantPathPruningTests : IDisposable
     [InlineData("decimal(10,2)", "15.00", "15")]
     [InlineData("decimal(10,2)", "-15.00", "-15")]
     [InlineData("decimal(10,1)", "0", "0")]
-    [InlineData("decimal(38,0)", "123456789012345678901234567.0", "123456789012345678901234567")]
-    [InlineData("decimal(38,0)", "-123456789012345678901234567.0", "-123456789012345678901234567")]
+    [InlineData("decimal(37,0)", "123456789012345678901234567.0", "123456789012345678901234567")]
+    [InlineData("decimal(37,0)", "-123456789012345678901234567.0", "-123456789012345678901234567")]
     public async Task FixedLenDecimalLeaf_ProbeBytes_DecodeToTheLiteral(string target, string literal, string unscaled)
     {
         string path = await WriteAsync(
@@ -688,7 +688,7 @@ public class VariantPathPruningTests : IDisposable
         Assert.Equal("FixedLenByteArray", resolved!.Column.PhysicalType.ToString());
 
         var value = ((LiteralExpression)cmp.Right).Value;
-        Assert.True(resolved.TryEncodeForProbe(value, out var encodings));
+        Assert.True(resolved.TryEncodeForProbe(value, setMembership: false, out var encodings));
         byte[] bytes = Assert.Single(encodings);
         Assert.Equal(resolved.Column.TypeLength, bytes.Length);
         // Big-endian two's complement of the unscaled value at the leaf's scale.
@@ -703,8 +703,87 @@ public class VariantPathPruningTests : IDisposable
         // 1.5 has a digit below the leaf's scale 0. Where it is a value of the target, no leaf value's result is it;
         // where it is not (decimal(38,0)), the probe declines rather than answer.
         bool ofTheTarget = !target.EndsWith(",0)", StringComparison.Ordinal);
-        Assert.Equal(ofTheTarget, resolved.TryEncodeForProbe(LiteralValue.Of(1.5m), out var none));
+        Assert.Equal(ofTheTarget, resolved.TryEncodeForProbe(LiteralValue.Of(1.5m), setMembership: false, out var none));
         Assert.Empty(none);
+    }
+
+    /// <summary>
+    /// A fixed-length decimal leaf's width is the file's to declare. One past the 16 bytes a decimal can use is declined
+    /// before any buffer is sized from it, and declined rather than answered "no row matches" (#901 review).
+    /// </summary>
+    [Theory]
+    [InlineData(100_000_000)]
+    [InlineData(17)]
+    [InlineData(0)]
+    public void FixedLenDecimalLeaf_WidthPastSixteenBytes_Declines(int width)
+    {
+        static EngineeredWood.Parquet.Metadata.SchemaElement Group(string name, int children,
+            FieldRepetitionType repetition =
+                FieldRepetitionType.Optional,
+            EngineeredWood.Parquet.Metadata.LogicalType? logical = null) =>
+            new() { Name = name, NumChildren = children, RepetitionType = repetition, LogicalType = logical };
+        static EngineeredWood.Parquet.Metadata.SchemaElement Binary(string name,
+            FieldRepetitionType repetition) =>
+            new() { Name = name, Type = PhysicalType.ByteArray, RepetitionType = repetition };
+
+        var schema = new EngineeredWood.Parquet.Schema.SchemaDescriptor(
+        [
+            new EngineeredWood.Parquet.Metadata.SchemaElement { Name = "schema", NumChildren = 1 },
+            Group("v", 3, logical: new EngineeredWood.Parquet.Metadata.LogicalType.VariantType()),
+            Binary("metadata", FieldRepetitionType.Required),
+            Binary("value", FieldRepetitionType.Optional),
+            Group("typed_value", 1),
+            Group("m", 2, FieldRepetitionType.Required),
+            Binary("value", FieldRepetitionType.Optional),
+            new EngineeredWood.Parquet.Metadata.SchemaElement
+            {
+                Name = "typed_value",
+                Type = PhysicalType.FixedLenByteArray,
+                TypeLength = width,
+                RepetitionType = FieldRepetitionType.Optional,
+                LogicalType = new EngineeredWood.Parquet.Metadata.LogicalType.DecimalType(1, 38),
+            },
+        ]);
+
+        var cmp = (ComparisonPredicate)SparkSqlParser.ParsePredicate("variant_get(v, '$.m', 'decimal(10,1)') = 1.5");
+        Assert.True(VariantGetCall.TryMatch(cmp.Left, out var call));
+        // A width of 0 is refused earlier, by Resolve; either way nothing is probed.
+        var resolved = ShreddedVariantPath.Resolve(schema, call);
+        Assert.True(resolved is null
+            || !resolved.TryEncodeForProbe(((LiteralExpression)cmp.Right).Value, setMembership: false, out _));
+        if (width > 16)
+            Assert.NotNull(resolved);
+    }
+
+    /// <summary>
+    /// Spark compares a decimal result with a literal at their least common type, which can give up scale. The leaf
+    /// holds only ±1e-18, so its dictionary lacks 0. Against <c>IN (0, 100000000000000000000000.0)</c>, a set typed
+    /// <c>decimal(25,1)</c>, a <c>decimal(38,38)</c> result is compared at <c>decimal(38,14)</c>, where ±1e-18 round
+    /// to 0 and match: the probe must decline, not prune (#901 review).
+    /// </summary>
+    [Fact]
+    public async Task RowGroups_ComparisonThatRounds_AreKept()
+    {
+        var shape = ShredSchema.ForObject(new Dictionary<string, ShredSchema>
+        {
+            ["m"] = ShredSchema.FromArrowType(new Decimal128Type(18, 18)),
+        });
+        VariantValue Tiny(bool negative) => Object(("m", VariantValue.FromDecimal8(new decimal(1, 0, 0, negative, 18))));
+        string path = await WriteAsync(
+            ParquetWriteOptions.Default with { VariantShredSchemas = new Dictionary<string, ShredSchema> { ["v"] = shape } },
+            Batch(Enumerable.Range(0, 1000).Select(i => (VariantValue?)Tiny(i % 2 == 0))));
+        await AssertEveryChunkAsync(path, "v.typed_value.m.typed_value", m => m.DictionaryPageOffset is not null,
+            "dictionary-encoded");
+
+        Assert.Equal(new[] { true }, await CandidatesAsync(path,
+            "variant_get(v, '$.m', 'decimal(38,38)') IN (0, 100000000000000000000000.0)"));
+        // decimal(38,38) against 0 is compared at decimal(38,37). That keeps 1e-18, but the common type gives up
+        // scale, so the probe declines rather than reason about which values it rounds.
+        Assert.Equal(new[] { true }, await CandidatesAsync(path, "variant_get(v, '$.m', 'decimal(38,38)') = 0"));
+        // Where the common type keeps every digit (decimal(20,18) against 0), the dictionary still answers.
+        Assert.Equal(new[] { false }, await CandidatesAsync(path, "variant_get(v, '$.m', 'decimal(20,18)') = 0"));
+        Assert.Equal(new[] { true }, await CandidatesAsync(path, "variant_get(v, '$.m', 'decimal(20,18)') = 0",
+            new ParquetReadOptions { FilterUseDictionaries = false }));
     }
 
     /// <summary>DuckDB's count of the matching rows of the same file against EW's after dictionary pruning.</summary>

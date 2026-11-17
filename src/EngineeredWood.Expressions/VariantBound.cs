@@ -139,12 +139,21 @@ public readonly struct VariantBound
     /// <c>int</c>, or 1000 against <c>tinyint</c>) declines.</para>
     /// <para>A NaN against <c>float</c> or <c>double</c> maps to a NaN of the kind; whether a source can be asked
     /// about it is the caller's concern.</para>
+    /// <para>Spark compares a decimal at the least common type of the two sides, which can give up scale: for a
+    /// <c>decimal(38,38)</c> result and the literal <c>0</c> it is <c>decimal(38,37)</c>, so a result of 1e-38
+    /// rounds to 0 and matches. Where that type would round either side, this declines. The result's type is
+    /// known exactly here, so only the literal's typing follows <see cref="SparkDecimalRounding"/>.</para>
     /// </remarks>
+    /// <param name="setMembership">
+    /// Whether <paramref name="literal"/> is a member of an <c>IN</c> list rather than an equality's operand. A set
+    /// types an integral member by its type's width, not its digits, which can force the common type to round.
+    /// </param>
     public static bool TryInvert(
-        VariantBoundKind kind, int scale, string targetType, LiteralValue literal, out VariantBound? value)
+        VariantBoundKind kind, int scale, string targetType, LiteralValue literal, out VariantBound? value,
+        bool setMembership = false)
     {
         value = null;
-        if (literal.IsNull)
+        if (literal.IsNull || !Bounded(literal) || ComparisonRounds(targetType, literal, setMembership))
             return false;
 
         switch (targetType)
@@ -216,6 +225,57 @@ public readonly struct VariantBound
                 return TryParseDecimalType(targetType, out int precision, out int declared)
                     && InvertDecimal(kind, scale, precision, declared, literal, out value);
         }
+    }
+
+    // Any literal exactly a value of a Spark type has at most 38 significant digits and scale 38. One far past that,
+    // trailing zeros or not, is declined before anything is computed from its digits: a public
+    // HighPrecisionDecimalOf(1, 50_000_000) would otherwise build a 50-million-digit power of ten.
+    private static bool Bounded(LiteralValue literal)
+    {
+        if (literal.Type != LiteralValue.Kind.HighPrecisionDecimal)
+            return true;
+        var (unscaled, scale) = literal.AsHighPrecisionDecimal;
+        return scale is >= 0 and <= 2 * SparkDecimalRounding.MaxPrecision
+            && BigInteger.Abs(unscaled).ToByteArray().Length <= 32; // 2^256 > 10^76
+    }
+
+    /// <summary>
+    /// Whether Spark's comparison of a <paramref name="targetType"/> result with <paramref name="literal"/> unifies the
+    /// two as decimals at a type that rounds either one. Two integrals, or a float or double, are not unified as
+    /// decimals.
+    /// </summary>
+    private static bool ComparisonRounds(string targetType, LiteralValue literal, bool setMembership)
+    {
+        int resultIntegral, resultScale;
+        switch (targetType)
+        {
+            // DecimalType.forType's widths.
+            case "tinyint": resultIntegral = 3; resultScale = 0; break;
+            case "smallint": resultIntegral = 5; resultScale = 0; break;
+            case "int": resultIntegral = 10; resultScale = 0; break;
+            case "bigint": resultIntegral = 20; resultScale = 0; break;
+            default:
+                if (!TryParseDecimalType(targetType, out int precision, out resultScale))
+                    return false;
+                resultIntegral = precision - resultScale;
+                break;
+        }
+
+        bool literalIsDecimal = literal.Type is LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal;
+        if (resultScale == 0 && !literalIsDecimal && !targetType.StartsWith("decimal", StringComparison.Ordinal))
+            return false;
+        if (!SparkDecimalRounding.TryDescribe(literal, literalTyping: !setMembership, out int literalIntegral,
+                out int literalScale))
+        {
+            return false; // a float or double: compared as a double, which the inverse's own typing settles
+        }
+        // A set member's decimal width is the whole set's, unknown from one member: the widest it could be.
+        if (literalIntegral < 0)
+            literalIntegral = SparkDecimalRounding.MaxPrecision - literalScale;
+
+        int commonScale = Math.Max(resultScale, literalScale);
+        int commonIntegral = Math.Max(resultIntegral, literalIntegral);
+        return commonIntegral + commonScale > SparkDecimalRounding.MaxPrecision;
     }
 
     // An integer result of the range [min, max]: the literal must be exactly one, and the kind must be an integer,
