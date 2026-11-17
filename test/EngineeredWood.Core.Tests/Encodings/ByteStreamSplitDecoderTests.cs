@@ -84,6 +84,61 @@ public class ByteStreamSplitDecoderTests
         }
     }
 
+    /// <summary>
+    /// The count and the payload both come from the file. The SIMD kernels load without bounds checks,
+    /// so a payload one byte short of count x width must be refused before any kernel runs, at every
+    /// count that reaches a SIMD path (16+ for the 128-bit kernel, 32+ for AVX2).
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(16)]
+    [InlineData(17)]
+    [InlineData(32)]
+    [InlineData(33)]
+    [InlineData(1000)]
+    public void TruncatedPayload_IsRefused(int count)
+    {
+        Assert.Throws<InvalidDataException>(() =>
+            ByteStreamSplitDecoder.DecodeFloats(new byte[count * 4 - 1], new float[count], count));
+        Assert.Throws<InvalidDataException>(() =>
+            ByteStreamSplitDecoder.DecodeInt32s(new byte[count * 4 - 1], new int[count], count));
+        Assert.Throws<InvalidDataException>(() =>
+            ByteStreamSplitDecoder.DecodeDoubles(new byte[count * 8 - 1], new double[count], count));
+        Assert.Throws<InvalidDataException>(() =>
+            ByteStreamSplitDecoder.DecodeInt64s(new byte[count * 8 - 1], new long[count], count));
+        foreach (int width in new[] { 2, 4, 8, 16 })
+        {
+            Assert.Throws<InvalidDataException>(() => ByteStreamSplitDecoder.DecodeFixedLenByteArrays(
+                new byte[count * width - 1], new byte[count * width], count, width));
+        }
+    }
+
+    [Theory]
+    [InlineData(16)]
+    [InlineData(33)]
+    public void ShortDestination_IsRefused(int count)
+    {
+        Assert.Throws<ArgumentException>(() =>
+            ByteStreamSplitDecoder.DecodeFloats(new byte[count * 4], new float[count - 1], count));
+        Assert.Throws<ArgumentException>(() =>
+            ByteStreamSplitDecoder.DecodeInt64s(new byte[count * 8], new long[count - 1], count));
+        Assert.Throws<ArgumentException>(() => ByteStreamSplitDecoder.DecodeFixedLenByteArrays(
+            new byte[count * 8], new byte[count * 8 - 1], count, 8));
+    }
+
+    [Fact]
+    public void LongerPayload_IsAccepted()
+    {
+        // Only a short payload is corrupt; trailing bytes past count x width are ignored, as before.
+        const int count = 40;
+        var values = RandomValues(count, 4);
+        var payload = Split(values, count, 4).Concat(new byte[] { 0xAA, 0xBB }).ToArray();
+        // Split lays the streams out at stride count, so the extra bytes sit after the last stream.
+        var decoded = new int[count];
+        ByteStreamSplitDecoder.DecodeInt32s(payload, decoded, count);
+        Assert.Equal(values, MemoryMarshal.AsBytes(decoded.AsSpan()).ToArray());
+    }
+
 #if NET8_0_OR_GREATER
     [SkippableTheory]
     [MemberData(nameof(Counts))]

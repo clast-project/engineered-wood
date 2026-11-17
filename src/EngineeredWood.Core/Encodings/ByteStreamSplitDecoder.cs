@@ -26,25 +26,70 @@ namespace EngineeredWood.Encodings;
 internal static class ByteStreamSplitDecoder
 {
     public static void DecodeFloats(ReadOnlySpan<byte> data, Span<float> destination, int count)
-        => Unsplit4(data, MemoryMarshal.AsBytes(destination), count);
+    {
+        var bytes = MemoryMarshal.AsBytes(destination);
+        CheckLengths(data, bytes, count, sizeof(float));
+        Unsplit4(data, bytes, count);
+    }
 
     public static void DecodeDoubles(ReadOnlySpan<byte> data, Span<double> destination, int count)
-        => Unsplit8(data, MemoryMarshal.AsBytes(destination), count);
+    {
+        var bytes = MemoryMarshal.AsBytes(destination);
+        CheckLengths(data, bytes, count, sizeof(double));
+        Unsplit8(data, bytes, count);
+    }
 
     public static void DecodeInt32s(ReadOnlySpan<byte> data, Span<int> destination, int count)
-        => Unsplit4(data, MemoryMarshal.AsBytes(destination), count);
+    {
+        var bytes = MemoryMarshal.AsBytes(destination);
+        CheckLengths(data, bytes, count, sizeof(int));
+        Unsplit4(data, bytes, count);
+    }
 
     public static void DecodeInt64s(ReadOnlySpan<byte> data, Span<long> destination, int count)
-        => Unsplit8(data, MemoryMarshal.AsBytes(destination), count);
+    {
+        var bytes = MemoryMarshal.AsBytes(destination);
+        CheckLengths(data, bytes, count, sizeof(long));
+        Unsplit8(data, bytes, count);
+    }
 
     public static void DecodeFixedLenByteArrays(ReadOnlySpan<byte> data, Span<byte> destination, int count, int typeLength)
     {
+        if (typeLength < 0)
+            throw new ArgumentOutOfRangeException(nameof(typeLength), typeLength, "The type length cannot be negative.");
+        CheckLengths(data, destination, count, typeLength);
+
         if (typeLength == 4)
             Unsplit4(data, destination, count);
         else if (typeLength == 8)
             Unsplit8(data, destination, count);
         else
             Unsplit(data, destination, count, typeLength);
+    }
+
+    /// <summary>
+    /// The SIMD kernels load and store without bounds checks, so every entry point validates the
+    /// spans first. The count and the payload come from the file, so a short payload is corrupt input;
+    /// a short destination is a caller bug.
+    /// </summary>
+    private static void CheckLengths(ReadOnlySpan<byte> data, Span<byte> destination, int count, int width)
+    {
+        if (count < 0)
+            throw new ArgumentOutOfRangeException(nameof(count), count, "The value count cannot be negative.");
+
+        long needed = (long)count * width;
+        if (data.Length < needed)
+        {
+            throw new InvalidDataException(
+                $"BYTE_STREAM_SPLIT data holds {data.Length} bytes, but {count} values of {width} bytes need {needed}.");
+        }
+
+        if (destination.Length < needed)
+        {
+            throw new ArgumentException(
+                $"The destination holds {destination.Length} bytes, but {count} values of {width} bytes need {needed}.",
+                nameof(destination));
+        }
     }
 
     private static void Unsplit4(ReadOnlySpan<byte> data, Span<byte> destination, int count)
