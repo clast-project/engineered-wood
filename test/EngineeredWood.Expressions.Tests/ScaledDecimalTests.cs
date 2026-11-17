@@ -288,4 +288,44 @@ public class ScaledDecimalTests
         }
     }
 #endif
+    /// <summary>
+    /// The digit count from the bit length is exact at every power of ten and either side of it,
+    /// which is where an estimate from a logarithm would be off by one. #902.
+    /// </summary>
+    [Fact]
+    public void DigitCountIsExactAtEveryPowerOfTen()
+    {
+        var wrong = new List<string>();
+        var power = BigInteger.One;
+
+        for (var k = 1; k <= 400; k++)
+        {
+            power *= 10; // 10^k, which has k + 1 digits
+            foreach (var (value, expected) in new[] { (power - 1, k), (power, k + 1), (power + 1, k + 1) })
+            {
+                if (ScaledDecimal.DigitCount(value) != expected)
+                    wrong.Add($"10^{k}{(value < power ? "-1" : value > power ? "+1" : "")}");
+                if (ScaledDecimal.DigitCount(-value) != expected)
+                    wrong.Add($"-(10^{k}{(value < power ? "-1" : value > power ? "+1" : "")})");
+            }
+        }
+
+        // Either side of the ulong boundary, where the count changes method.
+        var top = new BigInteger(ulong.MaxValue);
+        Assert.Equal(20, ScaledDecimal.DigitCount(top));
+        Assert.Equal(20, ScaledDecimal.DigitCount(top + 1));
+        Assert.Equal(1, ScaledDecimal.DigitCount(BigInteger.Zero));
+        Assert.Empty(wrong);
+    }
+
+    /// <summary>Counting digits costs about one multiplication of the value's size, not one division per digit.</summary>
+    [Fact]
+    public void DigitCountOfAHugeValueIsQuick()
+    {
+        var value = BigInteger.Pow(10, 200_000) - 1;
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Assert.Equal(200_000, ScaledDecimal.DigitCount(value));
+        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+    }
 }

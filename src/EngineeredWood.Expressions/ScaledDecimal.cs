@@ -288,6 +288,47 @@ internal static class ScaledDecimal
         return quotient;
     }
 
+    /// <summary>How many digits an integer is written with, which is one for zero.</summary>
+    /// <remarks>
+    /// Not by dividing by ten once per digit, which is quadratic in the length and is reached by a
+    /// predicate literal of any size (#902). The bit length pins the count to within one, and a
+    /// single power of ten about as long as the value settles it.
+    /// </remarks>
+    internal static int DigitCount(BigInteger value)
+    {
+        value = BigInteger.Abs(value);
+
+        if (value <= ulong.MaxValue)
+        {
+            var small = (ulong)value;
+            var count = 1;
+            while (small >= 10)
+            {
+                small /= 10;
+                count++;
+            }
+
+            return count;
+        }
+
+        // 2^(bits-1) <= value, so the value has at least floor((bits-1) log10 2) + 1 digits. The
+        // margin keeps floating-point error from overshooting an exact integer, so this is a lower
+        // bound, at most one short; the loop below then counts up to the exact figure.
+        var bits = BitLength(value);
+        var digits = (int)Math.Floor(((bits - 1) * Log10Of2) - 1e-9) + 1;
+
+        var power = BigInteger.Pow(10, digits);
+        while (value >= power)
+        {
+            power *= 10;
+            digits++;
+        }
+
+        return digits;
+    }
+
+    private const double Log10Of2 = 0.30102999566398119521;
+
     /// <summary>
     /// Bits in a non-negative <see cref="BigInteger"/>. Not <c>GetBitLength</c>, which arrived in
     /// net5.0 and this assembly targets netstandard2.0.
