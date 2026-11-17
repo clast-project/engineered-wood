@@ -1572,6 +1572,23 @@ internal static class ColumnChunkReader
         int count,
         ColumnBuildState state)
     {
+        // The value count comes from the page header and the payload from the page body. The SIMD
+        // kernels load without bounds checks, so a payload too short for the count must be refused here.
+        int width = column.PhysicalType switch
+        {
+            PhysicalType.Float or PhysicalType.Int32 => 4,
+            PhysicalType.Double or PhysicalType.Int64 => 8,
+            PhysicalType.FixedLenByteArray => column.TypeLength ?? throw new ParquetFormatException(
+                "FIXED_LEN_BYTE_ARRAY column missing TypeLength."),
+            _ => 0,
+        };
+        if (width > 0 && (long)count * width > data.Length)
+        {
+            throw new ParquetFormatException(
+                $"Column '{column.DottedPath}': BYTE_STREAM_SPLIT page holds {data.Length} bytes, " +
+                $"but {count} values of {width} bytes need {(long)count * width}.");
+        }
+
         switch (column.PhysicalType)
         {
             case PhysicalType.Float:

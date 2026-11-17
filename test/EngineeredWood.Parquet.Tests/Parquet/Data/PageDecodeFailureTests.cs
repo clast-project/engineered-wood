@@ -199,7 +199,67 @@ public class PageDecodeFailureTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A BYTE_STREAM_SPLIT page one byte short of its values. The SIMD decode kernels load without
+    /// bounds checks, so the reader refuses the page itself, naming the column, before it reserves
+    /// output for the values. A null InnerException shows the refusal is that check, not a decoder
+    /// failure wrapped afterwards. 32 values reach both the AVX2 and the 128-bit kernels (#916).
+    /// </summary>
+    [Theory]
+    [InlineData(PhysicalType.Float, 4)]
+    [InlineData(PhysicalType.Int32, 4)]
+    [InlineData(PhysicalType.Double, 8)]
+    [InlineData(PhysicalType.Int64, 8)]
+    [InlineData(PhysicalType.FixedLenByteArray, 8)]
+    [InlineData(PhysicalType.FixedLenByteArray, 3)]
+    public void AByteStreamSplitPageShortOfItsValues_IsRefused(PhysicalType type, int width)
+    {
+        const int values = 32;
+        var chunk = ByteStreamSplitChunk(type, width, values, new byte[values * width - 1]);
+
+        foreach (var ex in AssertRefused(chunk,
+            $"Column 'n': BYTE_STREAM_SPLIT page holds {values * width - 1} bytes, " +
+            $"but {values} values of {width} bytes need {values * width}."))
+        {
+            Assert.Null(ex.InnerException);
+        }
+    }
+
+    [Theory]
+    [InlineData(PhysicalType.Float, 4)]
+    [InlineData(PhysicalType.Int32, 4)]
+    [InlineData(PhysicalType.Double, 8)]
+    [InlineData(PhysicalType.Int64, 8)]
+    [InlineData(PhysicalType.FixedLenByteArray, 8)]
+    [InlineData(PhysicalType.FixedLenByteArray, 3)]
+    public void AByteStreamSplitPageOfExactlyItsValues_Reads(PhysicalType type, int width)
+    {
+        const int values = 32;
+        byte[] expected = new byte[values * width];
+        new Random(width).NextBytes(expected);
+        // Stream s holds byte s of every value.
+        byte[] payload = new byte[expected.Length];
+        for (int s = 0; s < width; s++)
+            for (int i = 0; i < values; i++)
+                payload[s * values + i] = expected[i * width + s];
+
+        var chunk = ByteStreamSplitChunk(type, width, values, payload);
+        // The decoded arrays, not the encoded chunk, own the memory the spans read (#834 review round 1).
+        var whole = ReadWhole(chunk);
+        var batched = ReadBatched(chunk);
+        Assert.Equal(expected, whole.Data.Buffers[1].Span[..expected.Length].ToArray());
+        Assert.Equal(expected, batched.Data.Buffers[1].Span[..expected.Length].ToArray());
+        GC.KeepAlive(whole);
+        GC.KeepAlive(batched);
+    }
+
     // ───── Helpers ─────
+
+    /// <summary>One uncompressed BYTE_STREAM_SPLIT data page of <paramref name="values"/> required values.</summary>
+    private static TestChunk ByteStreamSplitChunk(PhysicalType type, int width, int values, byte[] payload) =>
+        Chunk(type, CompressionCodec.Uncompressed, numValues: values,
+            typeLength: type == PhysicalType.FixedLenByteArray ? width : null,
+            (DataPage(values, Encoding.ByteStreamSplit, payload.Length), payload));
 
     private sealed record TestChunk(byte[] Bytes, ColumnDescriptor Column, ColumnMetaData Meta, Field Field);
 
@@ -278,7 +338,12 @@ public class PageDecodeFailureTests : IDisposable
     }
 
     private static TestChunk Chunk(
-        PhysicalType type, CompressionCodec codec, long numValues, params (PageHeader Header, byte[] Payload)[] pages)
+        PhysicalType type, CompressionCodec codec, long numValues, params (PageHeader Header, byte[] Payload)[] pages) =>
+        Chunk(type, codec, numValues, typeLength: null, pages);
+
+    private static TestChunk Chunk(
+        PhysicalType type, CompressionCodec codec, long numValues, int? typeLength,
+        params (PageHeader Header, byte[] Payload)[] pages)
     {
         var bytes = new List<byte>();
         long uncompressed = 0;
@@ -293,7 +358,7 @@ public class PageDecodeFailureTests : IDisposable
         var column = new SchemaDescriptor(
         [
             new SchemaElement { Name = "schema", NumChildren = 1 },
-            new SchemaElement { Name = "n", Type = type, RepetitionType = FieldRepetitionType.Required },
+            new SchemaElement { Name = "n", Type = type, TypeLength = typeLength, RepetitionType = FieldRepetitionType.Required },
         ]).Columns[0];
         var meta = new ColumnMetaData
         {
@@ -306,7 +371,15 @@ public class PageDecodeFailureTests : IDisposable
             TotalCompressedSize = bytes.Count,
             DataPageOffset = 0,
         };
-        IArrowType arrowType = type == PhysicalType.Int32 ? Int32Type.Default : BinaryType.Default;
+        IArrowType arrowType = type switch
+        {
+            PhysicalType.Int32 => Int32Type.Default,
+            PhysicalType.Int64 => Int64Type.Default,
+            PhysicalType.Float => FloatType.Default,
+            PhysicalType.Double => DoubleType.Default,
+            PhysicalType.FixedLenByteArray => new FixedSizeBinaryType(typeLength!.Value),
+            _ => BinaryType.Default,
+        };
         return new TestChunk([.. bytes], column, meta, new Field("n", arrowType, nullable: false));
     }
 
