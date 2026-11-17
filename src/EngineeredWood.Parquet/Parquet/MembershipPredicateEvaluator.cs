@@ -37,6 +37,10 @@ internal enum MembershipSource
 /// <see cref="FilterResult.AlwaysFalse"/> or <see cref="FilterResult.Unknown"/> for a leaf. Other
 /// predicate kinds (range, IS NULL, function calls) are treated as Unknown and contribute nothing.
 ///
+/// An equality or IN on a <c>variant_get</c> path asks the shredded <c>typed_value</c> leaf that holds the path
+/// (#772), in a row group whose residual <c>value</c> column is null throughout, for the one leaf value whose
+/// result is the literal (<see cref="VariantBound.TryInvert"/>).
+///
 /// Compose with <see cref="StatisticsEvaluator"/>: run statistics first, then fall back to a
 /// membership source only for row groups still marked Unknown.
 /// </remarks>
@@ -89,11 +93,10 @@ internal static class MembershipPredicateEvaluator
     /// NULL literal, an IN list holding a non-literal (<c>x IN (a, b)</c>), and a literal that cannot
     /// be encoded for the column (an integer against a DECIMAL stored as INT32) are all declined.
     /// </summary>
-    internal static List<(int Index, ColumnDescriptor Descriptor)> MembershipColumns(
-        Predicate predicate, SchemaDescriptor schema)
+    internal static List<MembershipColumn> MembershipColumns(Predicate predicate, SchemaDescriptor schema)
     {
-        var columns = new List<(int, ColumnDescriptor)>();
-        var seen = new HashSet<int>();
+        var columns = new List<MembershipColumn>();
+        var byIndex = new Dictionary<int, MembershipColumn>();
         Collect(predicate);
         return columns;
 
@@ -111,31 +114,43 @@ internal static class MembershipPredicateEvaluator
                     Collect(not.Child);
                     break;
                 case ComparisonPredicate cmp when IsEquality(cmp.Op):
-                    if ((TryGetColumnAndLiteral(cmp.Left, cmp.Right, out IReadOnlyList<string>? column, out var value)
-                         || TryGetColumnAndLiteral(cmp.Right, cmp.Left, out column, out value))
+                    if ((TryGetOperandAndLiteral(cmp.Left, cmp.Right, out var operand, out var value)
+                         || TryGetOperandAndLiteral(cmp.Right, cmp.Left, out operand, out value))
                         && !value.IsNull)
-                        Add(column!, [value]);
+                        Add(operand!, [value], setMembership: false);
                     break;
                 case SetPredicate set when set.Op == SetOperator.In:
-                    if (TryGetColumnName(set.Operand, out IReadOnlyList<string>? operand)
+                    if (IsOperand(set.Operand)
                         && set.Values.Count > 0
                         && set.TryGetLiteralValues(out var values))
-                        Add(operand!, values);
+                        Add(set.Operand, values, setMembership: true);
                     break;
             }
         }
 
-        void Add(IReadOnlyList<string> name, IReadOnlyList<LiteralValue> values)
+        void Add(Expression operand, IReadOnlyList<LiteralValue> values, bool setMembership)
         {
-            if (!FindColumn(schema, name, out int index, out var descriptor) || seen.Contains(index))
+            if (!TryResolve(schema, operand, out var target))
                 return;
+            // A variant leaf whose every value is ruled out by type alone (no encodings) needs no read.
+            bool asks = false;
             foreach (var value in values)
             {
-                if (!TryEncodeForProbe(value, descriptor!, out _))
+                if (!target.TryEncode(value, setMembership, out var encodings))
                     return;
+                asks |= encodings.Length > 0;
             }
-            seen.Add(index);
-            columns.Add((index, descriptor!));
+            if (!asks)
+                return;
+            // Every leaf of the predicate that names the column, so a read-ahead skips a row group only when none
+            // of them would ask there.
+            if (!byIndex.TryGetValue(target.Index, out var column))
+            {
+                column = new MembershipColumn(target.Index, target.Descriptor);
+                byIndex.Add(target.Index, column);
+                columns.Add(column);
+            }
+            column.Targets.Add(target);
         }
     }
 
@@ -199,20 +214,20 @@ internal static class MembershipPredicateEvaluator
     private static async ValueTask<FilterResult> EvaluateEqualityAsync(
         ComparisonPredicate cmp, Context ctx, CancellationToken ct)
     {
-        if (!TryGetColumnAndLiteral(cmp.Left, cmp.Right, out IReadOnlyList<string>? column, out var value)
-            && !TryGetColumnAndLiteral(cmp.Right, cmp.Left, out column, out value))
+        if (!TryGetOperandAndLiteral(cmp.Left, cmp.Right, out var operand, out var value)
+            && !TryGetOperandAndLiteral(cmp.Right, cmp.Left, out operand, out value))
             return FilterResult.Unknown;
 
         if (value.IsNull)
             return FilterResult.Unknown;
 
-        return await ProbeAsync(column!, [value], ctx, ct).ConfigureAwait(false);
+        return await ProbeAsync(operand!, [value], setMembership: false, ctx, ct).ConfigureAwait(false);
     }
 
     private static async ValueTask<FilterResult> EvaluateInAsync(
         SetPredicate set, Context ctx, CancellationToken ct)
     {
-        if (!TryGetColumnName(set.Operand, out IReadOnlyList<string>? column))
+        if (!IsOperand(set.Operand))
             return FilterResult.Unknown;
         if (set.Values.Count == 0)
             return FilterResult.AlwaysFalse;
@@ -222,7 +237,7 @@ internal static class MembershipPredicateEvaluator
         if (!set.TryGetLiteralValues(out var values))
             return FilterResult.Unknown;
 
-        return await ProbeAsync(column!, values, ctx, ct).ConfigureAwait(false);
+        return await ProbeAsync(set.Operand, values, setMembership: true, ctx, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -230,25 +245,36 @@ internal static class MembershipPredicateEvaluator
     /// absent; Unknown if any might be present, or if the source cannot be asked.
     /// </summary>
     private static async ValueTask<FilterResult> ProbeAsync(
-        IReadOnlyList<string> column, IReadOnlyList<LiteralValue> values, Context ctx, CancellationToken ct)
+        Expression operand, IReadOnlyList<LiteralValue> values, bool setMembership, Context ctx, CancellationToken ct)
     {
-        if (!ctx.TryFindColumn(column, out int columnIndex, out var descriptor))
+        if (!TryResolve(ctx.Schema, operand, out var target))
             return FilterResult.Unknown;
+        int columnIndex = target.Index;
+        var descriptor = target.Descriptor;
 
-        var chunk = ctx.Metadata.RowGroups[ctx.RowGroupIndex].Columns[columnIndex];
+        var rowGroup = ctx.Metadata.RowGroups[ctx.RowGroupIndex];
+        var chunk = rowGroup.Columns[columnIndex];
         // A chunk stored in another file has its filter and dictionary there too (#405); reading this file
         // at that offset could rule the row group out, so it would never reach the read that refuses it.
         if (chunk.FilePath is not null && ctx.FilePath == ColumnChunkFilePathKind.Refuse)
+            return FilterResult.Unknown;
+
+        if (!target.AsksIn(rowGroup))
             return FilterResult.Unknown;
 
         // Encode before any I/O: a value the source cannot be asked about decides the answer alone.
         var encoded = new List<byte[]>(values.Count);
         foreach (var v in values)
         {
-            if (!TryEncodeForProbe(v, descriptor!, out var encodings))
+            if (!target.TryEncode(v, setMembership, out var encodings))
                 return FilterResult.Unknown; // can't encode → can't decide
             encoded.AddRange(encodings);
         }
+
+        // Only a variant leaf encodes a value as nothing: no leaf value's result is that value, so no row matches
+        // whatever the source holds.
+        if (encoded.Count == 0)
+            return FilterResult.AlwaysFalse;
 
         // One read per column per row group, however many leaves of the predicate name the column.
         if (!ctx.Sets.TryGetValue(columnIndex, out var set))
@@ -577,18 +603,108 @@ internal static class MembershipPredicateEvaluator
 
     // ── Helpers ──
 
-    private static bool TryGetColumnAndLiteral(
-        Expression maybeRef, Expression maybeLit,
-        out IReadOnlyList<string>? column, out LiteralValue value)
+    private static bool TryGetOperandAndLiteral(
+        Expression maybeOperand, Expression maybeLit,
+        out Expression? operand, out LiteralValue value)
     {
-        if (TryGetColumnName(maybeRef, out column) && maybeLit is LiteralExpression lit)
+        if (IsOperand(maybeOperand) && maybeLit is LiteralExpression lit)
         {
+            operand = maybeOperand;
             value = lit.Value;
             return true;
         }
-        column = null;
+        operand = null;
         value = LiteralValue.Null;
         return false;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="expr"/> is something a membership source can be asked about: a column reference, or a
+    /// variant extraction (<see cref="VariantGetCall"/>), which may name a shredded leaf (#772).
+    /// </summary>
+    private static bool IsOperand(Expression expr) =>
+        TryGetColumnName(expr, out _) || VariantGetCall.TryMatch(expr, out _);
+
+    /// <summary>
+    /// The leaf column a membership operand asks about. A reference names its own leaf. A variant extraction names
+    /// the <c>typed_value</c> leaf that holds its path (<see cref="ShreddedVariantPath"/>), resolved by the
+    /// reference's <c>NameParts</c>, whose values are probed as the result converts them.
+    /// </summary>
+    private static bool TryResolve(SchemaDescriptor schema, Expression operand, out ProbeTarget target)
+    {
+        if (TryGetColumnName(operand, out var name))
+        {
+            if (FindColumn(schema, name!, out int index, out var descriptor))
+            {
+                target = new ProbeTarget(index, descriptor!, null, false);
+                return true;
+            }
+        }
+        else if (VariantGetCall.TryMatch(operand, out var call)
+                 && ShreddedVariantPath.Resolve(schema, call) is { } path)
+        {
+            target = new ProbeTarget(path.Leaf, path.Column, path, call.FailOnError);
+            return true;
+        }
+
+        target = default;
+        return false;
+    }
+
+    /// <summary>
+    /// A column a predicate asks a membership source about, with every operand that names it (<see cref="MembershipColumns"/>).
+    /// </summary>
+    internal sealed class MembershipColumn(int index, ColumnDescriptor descriptor)
+    {
+        public int Index { get; } = index;
+
+        public ColumnDescriptor Descriptor { get; } = descriptor;
+
+        internal List<ProbeTarget> Targets { get; } = new();
+
+        /// <summary>Whether any operand naming the column would ask its source in <paramref name="rowGroup"/>.</summary>
+        public bool AsksIn(RowGroup rowGroup)
+        {
+            foreach (var target in Targets)
+            {
+                if (target.AsksIn(rowGroup))
+                    return true;
+            }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// A resolved membership operand: the leaf column, and for a variant extraction the shredded path and whether
+    /// a failed conversion raises (<c>variant_get</c>) rather than answering NULL (<c>try_variant_get</c>).
+    /// </summary>
+    internal readonly record struct ProbeTarget(
+        int Index, ColumnDescriptor Descriptor, ShreddedVariantPath? Path, bool FailOnError)
+    {
+        /// <summary>
+        /// Whether a source may be asked on this operand's behalf in <paramref name="rowGroup"/>: always for a column,
+        /// and for a variant leaf only where it holds every value at the path and no row's conversion fails.
+        /// </summary>
+        /// <remarks>
+        /// The leaf holds every value at the path only where the residual is null throughout; a value of another
+        /// type is there, where neither source sees it. And absence of the literal means no row matches only where
+        /// no row's conversion fails: variant_get raises on one, and pruning would answer instead. Both bounds
+        /// converting rules that out; try_variant_get answers NULL there and needs no such test. The probe and the
+        /// read-ahead both ask this, so neither reads a source the other would not use.
+        /// </remarks>
+        public bool AsksIn(RowGroup rowGroup) =>
+            Path is not { } path
+            || (path.ResidualNullThroughout(rowGroup) && (!FailOnError || path.BoundsConvert(rowGroup)));
+
+        /// <summary>
+        /// The encodings to probe for <paramref name="value"/>; false when the source cannot be asked. Empty only
+        /// for a variant leaf none of whose values converts to <paramref name="value"/>. Whether the value is an
+        /// <c>IN</c> member changes how Spark types it against a variant result's decimal.
+        /// </summary>
+        public bool TryEncode(LiteralValue value, bool setMembership, out byte[][] encodings) =>
+            Path is { } path
+                ? path.TryEncodeForProbe(value, setMembership, out encodings)
+                : TryEncodeForProbe(value, Descriptor, out encodings);
     }
 
     private static bool TryGetColumnName(Expression expr, out IReadOnlyList<string>? name)
@@ -814,9 +930,6 @@ internal static class MembershipPredicateEvaluator
         public IRandomAccessFile File { get; }
         public long FileLength { get; }
         public ColumnChunkFilePathKind FilePath { get; }
-
-        public bool TryFindColumn(IReadOnlyList<string> name, out int index, out ColumnDescriptor? descriptor) =>
-            FindColumn(Schema, name, out index, out descriptor);
     }
 
     /// <summary>

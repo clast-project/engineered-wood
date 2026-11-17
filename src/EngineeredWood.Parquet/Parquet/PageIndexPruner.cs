@@ -419,7 +419,7 @@ internal static class PageIndexPruner
                 if (Index.NullPages[page] || Index.NullCounts?[page] == owner.PageRows(leaf, page))
                     return interval.End - interval.Start;
                 return Index.NullCounts?[page] == 0
-                    && GetMinValue(interval, column) is not null && GetMaxValue(interval, column) is not null
+                    && ShreddedVariantPath.ConvertedRange(GetMinValue(interval, column), GetMaxValue(interval, column))
                     ? 0
                     : null;
             }

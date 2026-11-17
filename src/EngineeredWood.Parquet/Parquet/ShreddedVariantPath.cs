@@ -232,6 +232,134 @@ internal sealed class ShreddedVariantPath
         }
     }
 
+    /// <summary>
+    /// Whether the residual <c>value</c> column is null in every row of <paramref name="rowGroup"/>, by its chunk
+    /// statistics: only then does the leaf hold every value at the path.
+    /// </summary>
+    public bool ResidualNullThroughout(RowGroup rowGroup) =>
+        Residual is not int residual
+        || (residual < rowGroup.Columns.Count
+            && rowGroup.Columns[residual].MetaData?.Statistics?.NullCount == rowGroup.NumRows);
+
+    /// <summary>
+    /// Whether both of the leaf's bounds in <paramref name="rowGroup"/> convert to the target type and describe a range,
+    /// which means every leaf value lies between them and converts: no row's conversion fails there.
+    /// </summary>
+    public bool BoundsConvert(RowGroup rowGroup) =>
+        Leaf < rowGroup.Columns.Count && rowGroup.Columns[Leaf].MetaData?.Statistics is { } stats && BoundsConvert(stats);
+
+    /// <summary>The same, for the leaf's chunk statistics.</summary>
+    public bool BoundsConvert(Statistics stats)
+    {
+        byte[]? max = stats.MaxValue ?? ParquetStatisticsAccessor.FallbackBytes(Column, stats.Max);
+        byte[]? min = stats.MinValue ?? ParquetStatisticsAccessor.FallbackBytes(Column, stats.Min);
+        return ConvertedRange(LowerBound(min, max), UpperBound(max));
+    }
+
+    /// <summary>
+    /// Whether two converted bounds describe a range every leaf value lies in: both convert, and the minimum is not
+    /// above the maximum.
+    /// </summary>
+    /// <remarks>
+    /// An inverted pair is the mark of statistics ordered in the wrong type: EW before #398 ordered FIXED_LEN_BYTE_ARRAY
+    /// decimals as unsigned bytes, so a chunk holding -1 and 1 recorded 1 as its minimum and -1 as its maximum. Both
+    /// convert, but the values are not between them, so a value whose conversion fails may be outside. As
+    /// <c>StatisticsEvaluator.IsInverted</c>, only an exact comparison declares a pair inverted. The exactness flags do
+    /// not enter: an inexact bound still bounds every value, and is only wider.
+    /// </remarks>
+    internal static bool ConvertedRange(LiteralValue? lower, LiteralValue? upper)
+    {
+        if (lower is not { } min || upper is not { } max)
+            return false;
+        try
+        {
+            return !(min.CompareTo(max, out bool exact) > 0 && exact);
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Every encoding, as a dictionary or Bloom filter holds the leaf's values, of the one leaf value whose result
+    /// equals <paramref name="literal"/> (see <see cref="VariantBound.TryInvert"/>). Empty when no leaf value's does.
+    /// False when this cannot say, and then nothing may be concluded.
+    /// </summary>
+    /// <param name="literal">The value the result is compared with.</param>
+    /// <param name="setMembership">Whether it is a member of an <c>IN</c> list (see <see cref="VariantBound.TryInvert"/>).</param>
+    /// <param name="encodings">The encodings to probe for.</param>
+    public bool TryEncodeForProbe(LiteralValue literal, bool setMembership, out byte[][] encodings)
+    {
+        encodings = [];
+        // The width is the file's to declare; a decimal is at most 16 bytes, which is all the bounds decoder reads.
+        // Past that, decline: a null from ToStored would claim no row matches, and the buffer is the file's size.
+        if (Kind == VariantBoundKind.Decimal && Column.PhysicalType == PhysicalType.FixedLenByteArray
+            && Column.TypeLength is not (>= 1 and <= 16))
+        {
+            return false;
+        }
+        if (!VariantBound.TryInvert(Kind, DecimalScale, TargetType, literal, out var leafValue, setMembership))
+            return false;
+        if (leafValue is not { } value)
+            return true;
+        // A value the leaf's physical type cannot store, a decimal too wide for it, is in no row either.
+        if (ToStored(value) is not { } stored)
+            return true;
+        // A NaN declines here: a filter or dictionary may hold any of its bit patterns.
+        return BloomFilter.BloomFilterValueEncoder.TryEncodeEquivalents(stored, Column.PhysicalType, out encodings);
+    }
+
+    private int DecimalScale =>
+        Column.SchemaElement.LogicalType is LogicalType.DecimalType d ? d.Scale : Column.SchemaElement.Scale ?? 0;
+
+    /// <summary>The boxed value the leaf stores for <paramref name="value"/>, or null when it can store none.</summary>
+    private object? ToStored(VariantBound value)
+    {
+        switch (Kind)
+        {
+            case VariantBoundKind.Boolean:
+                return value.AsInteger != 0;
+            case VariantBoundKind.Int8 or VariantBoundKind.Int16 or VariantBoundKind.Int32 or VariantBoundKind.Date:
+                return (int)value.AsInteger;
+            case VariantBoundKind.Int64 or VariantBoundKind.Timestamp or VariantBoundKind.TimestampNtz:
+                return value.AsInteger;
+            case VariantBoundKind.Float:
+                return (float)value.AsReal;
+            case VariantBoundKind.Double:
+                return value.AsReal;
+            case VariantBoundKind.String:
+                return value.AsString;
+            case VariantBoundKind.Decimal:
+            {
+                BigInteger unscaled = value.AsDecimal.Unscaled;
+                switch (Column.PhysicalType)
+                {
+                    case PhysicalType.Int32:
+                        return unscaled >= int.MinValue && unscaled <= int.MaxValue ? (int)unscaled : null;
+                    case PhysicalType.Int64:
+                        return unscaled >= long.MinValue && unscaled <= long.MaxValue ? (long)unscaled : null;
+                    case PhysicalType.FixedLenByteArray when Column.TypeLength is int width and > 0:
+                    {
+                        // Big-endian two's complement, sign-extended to the width.
+                        byte[] little = unscaled.ToByteArray();
+                        if (little.Length > width)
+                            return null;
+                        var bytes = new byte[width];
+                        byte fill = unscaled.Sign < 0 ? (byte)0xFF : (byte)0;
+                        for (int i = 0; i < width; i++)
+                            bytes[width - 1 - i] = i < little.Length ? little[i] : fill;
+                        return bytes;
+                    }
+                    default:
+                        return null;
+                }
+            }
+            default:
+                return null;
+        }
+    }
+
     /// <summary>A lower bound on the result from the leaf's minimum, given the maximum beside it.</summary>
     public LiteralValue? LowerBound(byte[]? min, byte[]? max)
     {

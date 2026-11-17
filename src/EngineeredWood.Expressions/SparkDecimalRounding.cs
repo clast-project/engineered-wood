@@ -207,7 +207,7 @@ internal static class SparkDecimalRounding
     /// Integral digits, or -1 when the value is a decimal whose declared width is not knowable
     /// from the value alone.
     /// </param>
-    private static bool TryDescribe(LiteralValue value, bool literalTyping, out int digits, out int scale)
+    internal static bool TryDescribe(LiteralValue value, bool literalTyping, out int digits, out int scale)
     {
         digits = 0;
         scale = 0;

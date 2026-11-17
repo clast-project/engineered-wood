@@ -320,11 +320,18 @@ are refused with `DELTA_SHREDDING_TABLE_PROPERTY_DISABLED`. Checkpoints are
 never shredded. EW derives per-path variant bounds from the footers it
 writes, as delta-spark 4.3 does, and prunes files (#677) and, inside the
 Parquet reader, row groups and pages (#682) on `variant_get`,
-`try_variant_get` and `v:a::int` predicates. delta-spark 4.3.1 and DuckDB
-do not prune on these bounds. Gaps:
+`try_variant_get` and `v:a::int` predicates. An equality or `IN` on a path
+also asks the shredded leaf's dictionary or Bloom filter (#772), in a row
+group whose residual is null throughout. delta-spark 4.3.1 and DuckDB do not
+prune on these bounds. Gaps:
 
-- *Dictionaries and Bloom filters are not consulted on a variant path*
-  ([#772](https://github.com/clast-project/engineered-wood/issues/772)).
+- *A FIXED_LEN_BYTE_ARRAY decimal leaf is probed but untested on a real
+  file.* EW cannot write one with values: the Arrow shredder fails on a
+  `Decimal16` value
+  ([apache/arrow-dotnet#498](https://github.com/apache/arrow-dotnet/issues/498)),
+  and takes the column's scale from its values, so a leaf with none is
+  written as `DECIMAL(38,0)` whatever the shredding schema declared. The
+  probe's bytes are checked against the statistics decoder instead.
 - *Row-level `variant_get` (#681) refuses some casts.* DML predicates and
   CHECK constraints on a variant path are evaluated row by row, but an
   object or array cast to `string`, a `timestamp_ntz` or nested target, and
