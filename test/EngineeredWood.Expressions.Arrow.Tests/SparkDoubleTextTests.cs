@@ -252,6 +252,33 @@ public class SparkDoubleTextTests
         Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
     }
 
+    /// <summary>
+    /// A million digits through the public entry point, which on netstandard2.0 asks the
+    /// platform's parser first. #907.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="AMillionDigitsParseAtOnce"/> times only the exact pass. On .NET Framework the
+    /// platform reads the text before it, and an out-of-range value is refused and read a second
+    /// time by <c>double.Parse</c>, which raises to tell overflow from malformed text. Measured on
+    /// net472, both platform reads are linear, under 1 ms per million digits.
+    /// </remarks>
+    [Theory]
+    [InlineData("0.", "", 4592670820000712476L)]                      // in range: 1/9's double
+    [InlineData("", "", 9218868437227405312L)]                        // overflow: +infinity
+    [InlineData("-", "", unchecked((long)0xFFF0000000000000UL))]      // overflow: -infinity
+    [InlineData("0.000", "e-1000000", 0L)]                            // underflow
+    public void AMillionDigitsParseAtOnceThroughThePlatform(string prefix, string suffix, long expected)
+    {
+        var text = prefix + new string('1', 1_000_000) + suffix;
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Assert.True(SparkDoubleText.TryParse(text, out var parsed));
+        watch.Stop();
+
+        Assert.Equal(expected, BitConverter.DoubleToInt64Bits(parsed));
+        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+    }
+
     private static void AssertParses(string text, long expected)
     {
         Assert.True(SparkDoubleText.TryParseExact(text, out var parsed), text);

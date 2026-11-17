@@ -167,6 +167,27 @@ public class SparkFloatRoundingTests
     }
 
     /// <summary>
+    /// A million digits through the public float entry point, which on netstandard2.0 asks the
+    /// platform's float parser first and, for an out-of-range value, its double parser too. #907.
+    /// </summary>
+    [Theory]
+    [InlineData("0.", "", 0x3DE38E39)]                       // in range: 1/9's float
+    [InlineData("", "", 0x7F800000)]                         // overflow: +infinity
+    [InlineData("-", "", unchecked((int)0xFF800000))]        // overflow: -infinity
+    [InlineData("0.000", "e-1000000", 0)]                    // underflow
+    public void AMillionDigitsParseAsAFloatAtOnceThroughThePlatform(string prefix, string suffix, int expected)
+    {
+        var text = prefix + new string('1', 1_000_000) + suffix;
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Assert.True(SparkDoubleText.TryParseSingle(text, out var parsed));
+        watch.Stop();
+
+        Assert.True(Bits(parsed) == expected, $"{Hex(parsed)} against {Hex(expected)}");
+        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+    }
+
+    /// <summary>
     /// Each route into a float, through the evaluator, on the value the issue named.
     /// </summary>
     /// <remarks>
