@@ -354,7 +354,7 @@ internal static class ScaledDecimal
     /// Bits in a non-negative <see cref="BigInteger"/>. Not <c>GetBitLength</c>, which arrived in
     /// net5.0 and this assembly targets netstandard2.0.
     /// </summary>
-    private static int BitLength(BigInteger value)
+    internal static int BitLength(BigInteger value)
     {
         if (value.IsZero)
             return 0;

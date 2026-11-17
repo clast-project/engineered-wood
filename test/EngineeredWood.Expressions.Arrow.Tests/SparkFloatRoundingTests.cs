@@ -138,6 +138,35 @@ public class SparkFloatRoundingTests
     }
 
     /// <summary>
+    /// The float tie at 1 + 2^-24, broken only by a digit thousands of places past the scan's cap
+    /// on significant digits, and a million-digit text read within a second. #905.
+    /// </summary>
+    [Theory]
+    [InlineData("1.000000059604644775390625", "", 0x3F800000)]  // the tie: to even
+    [InlineData("1.000000059604644775390625", "1", 0x3F800001)]
+    [InlineData("-1.000000059604644775390625", "1", unchecked((int)0xBF800001))]
+    public void ADigitFarPastTheCapStillBreaksAFloatTie(string head, string tail, int expected)
+    {
+        var text = head + new string('0', 5000) + tail;
+
+        Assert.True(SparkDoubleText.TryParseExactSingle(text, out var parsed));
+        Assert.True(Bits(parsed) == expected, $"{head}…{tail}: {Hex(parsed)} against {Hex(expected)}");
+    }
+
+    [Fact]
+    public void AMillionDigitsParseAsAFloatAtOnce()
+    {
+        var text = "0." + new string('1', 1_000_000);
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Assert.True(SparkDoubleText.TryParseExactSingle(text, out var parsed));
+        watch.Stop();
+
+        Assert.True(Bits(parsed) == Bits(1f / 9f), $"{Hex(parsed)} against {Hex(1f / 9f)}");
+        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+    }
+
+    /// <summary>
     /// Each route into a float, through the evaluator, on the value the issue named.
     /// </summary>
     /// <remarks>

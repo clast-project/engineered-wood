@@ -182,6 +182,76 @@ public class SparkDoubleTextTests
     public void AShapeOutsideItsGrammarIsDeclined(string text) =>
         Assert.False(SparkDoubleText.TryParseExact(text, out _));
 
+    /// <summary>
+    /// A digit thousands of places past the cap on significant digits still decides a tie. #905.
+    /// </summary>
+    /// <remarks>
+    /// The scan keeps 800 significant digits and stands one sticky digit in for the rest, so these
+    /// put an exact midpoint in the first few digits and the only thing that breaks the tie far
+    /// beyond the cap - in the fraction, in the integer part, and after the 758 significant digits
+    /// of the smallest subnormal's half, where the cap has the least room.
+    /// </remarks>
+    [Theory]
+    [InlineData("1.00000000000000011102230246251565404236316680908203125", "", 4607182418800017408L)] // tie: to even
+    [InlineData("1.00000000000000011102230246251565404236316680908203125", "1", 4607182418800017409L)]
+    // 1 - 2^-54, the midpoint below 1, and a hair under it: thousands of nines, all past the cap.
+    [InlineData("0.999999999999999944488848768742172978818416595458984375", "", 4607182418800017408L)]
+    public void ADigitFarPastTheCapStillBreaksATie(string head, string tail, long expected) =>
+        AssertParses(head + new string('0', 5000) + tail, expected);
+
+    [Fact]
+    public void ThousandsOfNinesPastTheCapStayBelowATie() =>
+        AssertParses(
+            "0.999999999999999944488848768742172978818416595458984374" + new string('9', 5000),
+            4607182418800017407L);
+
+    [Fact]
+    public void ADigitFarPastTheCapBreaksATieInTheIntegerPart()
+    {
+        // 2^53 + 1 is the midpoint between 2^53 and 2^53 + 2; to even is 2^53.
+        var zeros = new string('0', 5000);
+        AssertParses("9007199254740993" + zeros + "e-5000", 4845873199050653696L);
+        AssertParses("9007199254740993" + zeros + "1e-5001", 4845873199050653697L);
+        AssertParses("-9007199254740993" + zeros + "1e-5001", unchecked((long)0xC340000000000001UL));
+    }
+
+    [Fact]
+    public void ADigitFarPastTheCapBreaksTheSmallestSubnormalsTie()
+    {
+        // 2^-1075, half the smallest subnormal, written out exactly: 5^1075 over 10^1075.
+        var digits = System.Numerics.BigInteger.Pow(5, 1075).ToString(CultureInfo.InvariantCulture);
+        var half = "0." + new string('0', 1075 - digits.Length) + digits;
+
+        AssertParses(half, 0L); // to even
+        AssertParses(half + new string('0', 5000), 0L);
+        AssertParses(half + new string('0', 5000) + "1", 1L);
+        AssertParses("-" + half + new string('0', 5000) + "1", unchecked((long)0x8000000000000001UL));
+    }
+
+    /// <summary>
+    /// Long text costs a scan, not a BigInteger as long as it. #905.
+    /// </summary>
+    /// <remarks>
+    /// Every digit used to be parsed into one integer and counted by dividing by ten once per digit,
+    /// both quadratic, and on netstandard2.0 this runs for every string cast to a double. Past the
+    /// cap nothing grows with the length, so a fixed budget holds on every runtime.
+    /// </remarks>
+    [Theory]
+    [InlineData("0.", "", 4592670820000712476L)]            // 0.111…, which is 1/9's double
+    [InlineData("", "e-999990", 4742447145771539570L)]      // 1.111… x 10^9
+    [InlineData("", "", 9218868437227405312L)]              // a million-digit integer: infinity
+    [InlineData("0.000", "e-1000000", 0L)]                  // underflow
+    public void AMillionDigitsParseAtOnce(string prefix, string suffix, long expected)
+    {
+        var text = prefix + new string('1', 1_000_000) + suffix;
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        AssertParses(text, expected);
+        watch.Stop();
+
+        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+    }
+
     private static void AssertParses(string text, long expected)
     {
         Assert.True(SparkDoubleText.TryParseExact(text, out var parsed), text);
