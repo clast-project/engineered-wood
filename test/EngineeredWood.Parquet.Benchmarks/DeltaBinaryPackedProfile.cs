@@ -30,7 +30,7 @@ internal static class DeltaBinaryPackedProfile
 
         Console.WriteLine($"{rows:N0} rows, one column, uncompressed, dictionary off, in memory; best of {rounds} (ms).");
         Console.WriteLine("| Column | Read PLAIN | Read DELTA | Decoder alone | Write PLAIN | Write DELTA | Encoder alone | Bytes PLAIN | Bytes DELTA |");
-        Console.WriteLine("|---|---|---|---|---|---|---|---|---|");
+        Console.WriteLine("|---|---|---|---|---|---|---|");
 
         foreach (var (name, long64, values) in Shapes(rows))
         {
@@ -73,8 +73,8 @@ internal static class DeltaBinaryPackedProfile
 
         Console.WriteLine();
         Console.WriteLine("Prototype kernels, ms per stream (int64 full width left out: widths over 56 take another path).");
-        Console.WriteLine("| Column | Encode shipped | Encode by word | Decode shipped | Unpack only | Unpack + sum fused |");
-        Console.WriteLine("|---|---|---|---|---|---|");
+        Console.WriteLine("| Column | Decode shipped | Unpack only | Unpack + sum fused |");
+        Console.WriteLine("|---|---|---|---|");
         foreach (var (name, long64, values) in Shapes(rows))
         {
             if (!(long64 && name.Contains("full width")))
