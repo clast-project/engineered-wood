@@ -38,7 +38,7 @@ internal ref struct DeltaBinaryPackedDecoder
     private readonly int _miniblockCount;
     private readonly int _valuesPerMiniblock;
     private readonly int _totalValueCount;
-    private long _lastValue;
+    private readonly long _firstValue;
 
     public DeltaBinaryPackedDecoder(ReadOnlySpan<byte> data)
     {
@@ -48,7 +48,7 @@ internal ref struct DeltaBinaryPackedDecoder
         _blockSize = checked((int)ReadUnsignedVarInt());
         _miniblockCount = checked((int)ReadUnsignedVarInt());
         _totalValueCount = checked((int)ReadUnsignedVarInt());
-        _lastValue = ReadZigZagVarInt();
+        _firstValue = ReadZigZagVarInt();
         if (_miniblockCount <= 0)
             throw new InvalidDataException("DELTA_BINARY_PACKED miniblock count must be positive.");
         _valuesPerMiniblock = _blockSize / _miniblockCount;
@@ -68,7 +68,7 @@ internal ref struct DeltaBinaryPackedDecoder
         if (_totalValueCount == 0)
             return;
 
-        int lastInt = (int)_lastValue;
+        int lastInt = (int)_firstValue;
         destination[0] = lastInt;
         int valuesDecoded = 1;
 
@@ -111,7 +111,8 @@ internal ref struct DeltaBinaryPackedDecoder
         if (_totalValueCount == 0)
             return;
 
-        destination[0] = _lastValue;
+        long last = _firstValue;
+        destination[0] = last;
         int valuesDecoded = 1;
 
         Span<byte> bitWidths = _miniblockCount <= 64 ? stackalloc byte[_miniblockCount] : new byte[_miniblockCount];
@@ -132,13 +133,13 @@ internal ref struct DeltaBinaryPackedDecoder
                 {
                     for (int i = 0; i < valuesToDecode; i++)
                     {
-                        _lastValue += minDelta;
-                        destination[valuesDecoded++] = _lastValue;
+                        last += minDelta;
+                        destination[valuesDecoded++] = last;
                     }
                 }
                 else
                 {
-                    _lastValue = UnpackSum(destination.Slice(valuesDecoded, valuesToDecode), bitWidth, minDelta, _lastValue);
+                    last = UnpackSum(destination.Slice(valuesDecoded, valuesToDecode), bitWidth, minDelta, last);
                     valuesDecoded += valuesToDecode;
                 }
             }
@@ -189,6 +190,20 @@ internal ref struct DeltaBinaryPackedDecoder
             for (int i = 0; i < destination.Length; i++, bitOffset += bitWidth)
             {
                 last += minDelta + (long)((ReadWord(ref source, bitOffset >> 3) >> (bitOffset & 7)) & mask);
+                destination[i] = last;
+            }
+        }
+        else if (bitWidth <= 64 && (long)_pos + bytes + 16 <= _data.Length)
+        {
+            // Over 56 bits a value may run into a second word. Shifting the second word left by
+            // 64 - b in two steps makes it contribute nothing when b = 0, where one shift by 64 would
+            // be a shift by 0.
+            ref byte source = ref MemoryMarshal.GetReference(_data);
+            for (int i = 0; i < destination.Length; i++, bitOffset += bitWidth)
+            {
+                int at = bitOffset >> 3, b = bitOffset & 7;
+                ulong raw = (ReadWord(ref source, at) >> b) | ((ReadWord(ref source, at + 8) << 1) << (63 - b));
+                last += minDelta + (long)(raw & mask);
                 destination[i] = last;
             }
         }
