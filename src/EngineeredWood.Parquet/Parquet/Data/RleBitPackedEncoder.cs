@@ -76,7 +76,7 @@ internal sealed class RleBitPackedEncoder
     /// Encodes all values using the RLE/Bit-Packing Hybrid scheme.
     /// Runs of 8+ identical values are RLE-encoded; mixed values are collected
     /// into complete bit-packed groups of 8 (partial groups only at stream end).
-    /// At width 1 with batching, the packed path in <see cref="EncodeBits"/> instead, which keeps a short run
+    /// At width 1 with batching, it takes the packed path in <see cref="EncodeBits"/> instead, which keeps a short run
     /// in the literals where RLE would cost more.
     /// </summary>
     public void Encode(ReadOnlySpan<int> values)
