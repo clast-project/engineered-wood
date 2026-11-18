@@ -429,13 +429,13 @@ internal static class NullableKernelProfile
 
     private static (double Min, double Max, bool Any) MinMaxGatherThenDense(double[] values, int[] levels, double[] scratch)
     {
+        // Capacity is checked before each store: an all-null page brings an empty scratch array.
         ref double dst = ref MemoryMarshal.GetArrayDataReference(scratch);
         int idx = 0;
-        for (int i = 0; i < values.Length; i++)
+        for (int i = 0; i < values.Length && idx < scratch.Length; i++)
         {
             Unsafe.Add(ref dst, idx) = values[i];
             idx += levels[i] != 0 ? 1 : 0;
-            if (idx == scratch.Length) break;
         }
 
         return MinMaxDense(scratch.AsSpan(0, idx));
@@ -487,13 +487,13 @@ internal static class NullableKernelProfile
 
     private static (long Min, long Max, bool Any) MinMaxGatherThenDenseGeneric(long[] values, int[] levels, long[] scratch, Comparison<long> compare)
     {
+        // Capacity is checked before each store: an all-null page brings an empty scratch array.
         ref long dst = ref MemoryMarshal.GetArrayDataReference(scratch);
         int idx = 0;
-        for (int i = 0; i < values.Length; i++)
+        for (int i = 0; i < values.Length && idx < scratch.Length; i++)
         {
             Unsafe.Add(ref dst, idx) = values[i];
             idx += levels[i] != 0 ? 1 : 0;
-            if (idx == scratch.Length) break;
         }
 
         if (idx == 0) return (0, 0, false);
