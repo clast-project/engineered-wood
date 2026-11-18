@@ -476,8 +476,8 @@ internal ref struct RleBitPackedDecoder
     /// <para>MEASURED at 1.78x the per-value loop on a real dictionary column read — but only where
     /// the literal runs are long. A bit-packed run holds as few as eight values, and how many it
     /// holds is the writer's choice: parquet-mr and arrow-rs batch up to 63 groups into one run,
-    /// while EW itself emits a run header every eight values unless
-    /// <c>ParquetWriteOptions.BatchBitPackedRuns</c> is set. At eight values a run there is exactly
+    /// as EW itself does unless <c>ParquetWriteOptions.BatchBitPackedRuns</c> is turned off, when it
+    /// emits a run header every eight values. At eight values a run there is exactly
     /// one group to unpack and the setup below does not pay for itself, which is what
     /// <see cref="MinBulkValues"/> keeps it out of.</para>
     /// <para>Deliberately NOT <c>AggressiveOptimization</c>, unlike the ALP unpacker this is modelled

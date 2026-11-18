@@ -83,6 +83,12 @@ if (args.Length > 0 && args[0] == "nullable-kernels")
     return;
 }
 
+if (args.Length > 0 && args[0] == "batched-write")
+{
+    Environment.ExitCode = await BatchedRunsWriteProfile.RunAsync(args);
+    return;
+}
+
 if (args.Length > 0 && args[0] is "nullable-profile" or "nullable-loop")
 {
     Environment.ExitCode = await NullableColumnProfile.RunAsync(args);

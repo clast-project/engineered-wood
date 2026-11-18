@@ -2164,8 +2164,9 @@ internal static class ColumnChunkWriter
     /// <paramref name="pages"/>.
     /// </summary>
     /// <remarks>
-    /// Unless <see cref="ParquetWriteOptions.BatchBitPackedRuns"/> is set, every 8-value bit-packed
-    /// group carries its own 1-byte header: a bit per value over the width. A run of 8 or more
+    /// Bounded as if <see cref="ParquetWriteOptions.BatchBitPackedRuns"/> were off, where every 8-value
+    /// bit-packed group carries its own 1-byte header: a bit per value over the width. Batching only
+    /// removes headers, so the bound holds either way. A run of 8 or more
     /// repeats, a 1-byte header and one value, is never more. Each page can end on a partial group.
     /// </remarks>
     private static long HybridBytes(long count, PageLayout pages, int bitWidth) =>

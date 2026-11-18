@@ -122,6 +122,8 @@ public class BatchedRunsInteropTests : IDisposable
         var batch = BuildListBatch(rows: 2000, length: 3);
         var baseOptions = ParquetWriteOptions.Default with
         {
+            // The unbatched twin, pinned: batching is the default.
+            BatchBitPackedRuns = false,
             DataPageVersion = pageVersion,
             Compression = codec,
         };
@@ -157,6 +159,8 @@ public class BatchedRunsInteropTests : IDisposable
         var batch = BuildDictBatch(rows: 20_000, cardinality: 1000);
         var baseOptions = ParquetWriteOptions.Default with
         {
+            // The unbatched twin, pinned: batching is the default.
+            BatchBitPackedRuns = false,
             DataPageVersion = pageVersion,
             Compression = codec,
         };
@@ -328,6 +332,8 @@ public class BatchedRunsInteropTests : IDisposable
         var batch = BuildDictBatch(rows: 20_000, cardinality: 1000);
         var baseOptions = ParquetWriteOptions.Default with
         {
+            // The unbatched twin, pinned: batching is the default.
+            BatchBitPackedRuns = false,
             DataPageVersion = pageVersion,
             Compression = codec,
         };
@@ -371,6 +377,8 @@ public class BatchedRunsInteropTests : IDisposable
         var batch = BuildListBatch(rows: 5000, length: 3);
         var baseOptions = ParquetWriteOptions.Default with
         {
+            // The unbatched twin, pinned: batching is the default.
+            BatchBitPackedRuns = false,
             DataPageVersion = pageVersion,
             Compression = codec,
         };

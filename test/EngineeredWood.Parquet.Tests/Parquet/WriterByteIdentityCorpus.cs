@@ -142,7 +142,7 @@ public class WriterByteIdentityCorpus
             FloatingPointOrder = FloatingPointColumnOrder.Ieee754TotalOrder,
         });
         yield return ("no-stats", Base with { WriteStatistics = false });
-        yield return ("batched-runs", Base with { BatchBitPackedRuns = true });
+        yield return ("unbatched-runs", Base with { BatchBitPackedRuns = false });
         yield return ("per-column", Base with
         {
             ColumnCodecs = new Dictionary<string, CompressionCodec> { ["str_lo"] = CompressionCodec.Zstd },

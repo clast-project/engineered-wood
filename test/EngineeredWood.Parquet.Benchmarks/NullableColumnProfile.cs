@@ -153,7 +153,7 @@ internal static class NullableColumnProfile
         return new RecordBatch(new Apache.Arrow.Schema([field], null), [array], rows);
     }
 
-    private static double Best(int rounds, Func<Task> action)
+    internal static double Best(int rounds, Func<Task> action)
     {
         double best = double.MaxValue;
         for (int i = -3; i < rounds; i++)
@@ -168,7 +168,7 @@ internal static class NullableColumnProfile
         return best;
     }
 
-    private static async ValueTask<byte[]> WriteAsync(RecordBatch batch, ParquetWriteOptions options)
+    internal static async ValueTask<byte[]> WriteAsync(RecordBatch batch, ParquetWriteOptions options)
     {
         var file = new MemorySequentialFile();
         await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
@@ -180,14 +180,14 @@ internal static class NullableColumnProfile
         return file.ToArray();
     }
 
-    private static async Task DiscardWriteAsync(RecordBatch batch, ParquetWriteOptions options)
+    internal static async Task DiscardWriteAsync(RecordBatch batch, ParquetWriteOptions options)
     {
         await using var writer = new ParquetFileWriter(new CountingSequentialFile(), ownsFile: true, options);
         await writer.WriteRowGroupAsync(batch);
         await writer.CloseAsync();
     }
 
-    private static async Task ReadAsync(byte[] file)
+    internal static async Task ReadAsync(byte[] file)
     {
         using var reader = new ParquetFileReader(new MemoryRandomAccessFile(file), ownsFile: true);
         await foreach (var batch in reader.ReadAllAsync())

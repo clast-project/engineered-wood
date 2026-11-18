@@ -133,9 +133,12 @@ internal sealed class RleBitPackedEncoder
         if (_bitWidth == 0 || runLength <= 0)
             return;
 
-        if (runLength >= 8 && _pendingCount == 0)
+        if (runLength >= 8 && (_pendingCount & 7) == 0)
         {
-            // Pure RLE run, no pending values to flush first
+            // At a group boundary: flush any whole groups pending, then the run is RLE. Unbatched, nothing is
+            // ever pending here; batched, earlier groups may be, and taking the run into them instead would
+            // bit-pack values depth 1 encodes as RLE, growing the stream.
+            FlushLiterals();
             WriteRleRun(value, runLength);
             return;
         }
