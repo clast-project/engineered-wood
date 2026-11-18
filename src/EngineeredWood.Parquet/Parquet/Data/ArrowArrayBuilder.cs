@@ -123,18 +123,9 @@ internal static class ArrowArrayBuilder
         using var bitmapBuf = new NativeBuffer<byte>(bitmapBytes);
         var bitmap = bitmapBuf.ByteSpan;
 
-        // In-place reverse scatter: reuse the dense buffer, walking right-to-left
-        // so each value moves rightward (read index always <= write index).
-        var values = state.GetWritableValueSpan<T>();
-        int readIdx = nonNullCount - 1;
-        for (int i = numValues - 1; i >= 0 && readIdx >= 0; i--)
-        {
-            if (defLevels[i] == state.MaxDefLevel)
-            {
-                values[i] = values[readIdx--];
-                bitmap[i >> 3] |= (byte)(1 << (i & 7));
-            }
-        }
+        // In-place reverse scatter: reuse the dense buffer, the values moving up to their rows.
+        BuildBitmapFromDefLevels(defLevels, bitmap, numValues, (byte)state.MaxDefLevel);
+        PresentValues.Scatter(state.GetWritableValueSpan<T>(), bitmap, numValues, nonNullCount);
 
         var valueArrow = state.BuildValueBuffer();
         var bitmapArrow = bitmapBuf.Build();
@@ -383,14 +374,7 @@ internal static class ArrowArrayBuilder
 
         // Build bitmap using SIMD, then scatter values using the bitmap
         BuildBitmapFromDefLevels(defLevels, bitmap, rowCount, (byte)state.MaxDefLevel);
-
-        var values = state.GetWritableValueSpan<T>();
-        int readIdx = nonNullCount - 1;
-        for (int i = rowCount - 1; i >= 0 && readIdx >= 0; i--)
-        {
-            if ((bitmap[i >> 3] & (1 << (i & 7))) != 0)
-                values[i] = values[readIdx--];
-        }
+        PresentValues.Scatter(state.GetWritableValueSpan<T>(), bitmap, rowCount, nonNullCount);
 
         var valueArrow = state.BuildValueBuffer();
         var bitmapArrow = bitmapBuf.Build();

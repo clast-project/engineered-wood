@@ -68,6 +68,7 @@ internal static class NullableKernelProfile
         Add("R bitmap: BuildFromEquality (today)", k => () => BitmapHelper.BuildFromEquality(k.ByteLevels, k.OutBitmap, k.Rows, 1));
         Add("R scatter: per bit, reverse (today)", k => () => { k.ResetScatter(); ScatterPerBit(k.ScatterValues, k.Bitmap, k.Rows, k.NonNull); });
         Add("R scatter: per byte, early exit", k => () => { k.ResetScatter(); ScatterByByte(k.ScatterValues, k.Bitmap, k.Rows, k.NonNull); });
+        Add("R scatter: PresentValues.Scatter (shipped)", k => () => { k.ResetScatter(); PresentValues.Scatter<double>(k.ScatterValues, k.Bitmap, k.Rows, k.NonNull); });
         Add("R scatter: reset copy alone", k => () => k.ResetScatter());
 
         foreach (var (name, ms) in lines)
@@ -161,10 +162,13 @@ internal static class NullableKernelProfile
             expectDense.AsSpan(0, n).CopyTo(b);
             ScatterPerBit(a, k.Bitmap, k.Rows, n);
             ScatterByByte(b, k.Bitmap, k.Rows, n);
+            var c = new double[k.Rows];
+            expectDense.AsSpan(0, n).CopyTo(c);
+            PresentValues.Scatter<double>(c, k.Bitmap, k.Rows, n);
             for (int i = 0; i < k.Rows; i++)
             {
                 if (expectInts[i] != 0)
-                    Check(a[i] == k.Values[i] && b[i] == k.Values[i], "scatter");
+                    Check(a[i] == k.Values[i] && b[i] == k.Values[i] && c[i] == k.Values[i], "scatter");
             }
 
             // The bit-packed copy must decode to the same levels, at either literal batching.
