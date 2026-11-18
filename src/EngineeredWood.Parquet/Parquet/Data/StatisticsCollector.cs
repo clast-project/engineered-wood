@@ -86,8 +86,8 @@ internal static class StatisticsCollector
         var (minBytes, maxBytes, minExact, maxExact) = physicalType switch
         {
             PhysicalType.Boolean => WithExact(ComputeBooleanMinMax(array, defLevels, 0, array.Length)),
-            PhysicalType.Int32 => WithExact(ComputeMinMax<int>(array, defLevels, Int32Comparison(order), 0, array.Length)),
-            PhysicalType.Int64 => WithExact(ComputeMinMax<long>(array, defLevels, Int64Comparison(order), 0, array.Length)),
+            PhysicalType.Int32 => WithExact(ComputeInt32MinMax(array, defLevels, order, 0, array.Length)),
+            PhysicalType.Int64 => WithExact(ComputeInt64MinMax(array, defLevels, order, 0, array.Length)),
             PhysicalType.ByteArray => ComputeByteArrayMinMaxTruncated(array, defLevels),
             PhysicalType.FixedLenByteArray
                 => WithExact(ComputeFlbaMinMax(array, defLevels, typeLength, order, 0, array.Length)),
@@ -163,13 +163,13 @@ internal static class StatisticsCollector
             }
             case PhysicalType.Int32:
             {
-                var (min, max) = ComputeMinMax<int>(array, defLevels, Int32Comparison(order), start, end);
+                var (min, max) = ComputeInt32MinMax(array, defLevels, order, start, end);
                 bounds = new PageBounds(min, max, 0);
                 break;
             }
             case PhysicalType.Int64:
             {
-                var (min, max) = ComputeMinMax<long>(array, defLevels, Int64Comparison(order), start, end);
+                var (min, max) = ComputeInt64MinMax(array, defLevels, order, start, end);
                 bounds = new PageBounds(min, max, 0);
                 break;
             }
@@ -722,57 +722,29 @@ internal static class StatisticsCollector
         return ([minByte], [maxByte]);
     }
 
-    private static (byte[]?, byte[]?) ComputeMinMax<T>(
-        IArrowArray array, int[]? defLevels, Comparison<T> compare, int start, int end)
-        where T : unmanaged
+    /// <summary>
+    /// The bounds of the INT32 values in <paramref name="start"/> .. <paramref name="end"/>, ordered as
+    /// <paramref name="order"/> says (signed, or unsigned); nulls are skipped. See <see cref="IntegerBounds"/>.
+    /// </summary>
+    private static (byte[]?, byte[]?) ComputeInt32MinMax(
+        IArrowArray array, int[]? defLevels, StatisticsOrder order, int start, int end)
     {
-        var valueBuffer = MemoryMarshal.Cast<byte, T>(array.Data.Buffers[1].Span);
+        var values = MemoryMarshal.Cast<byte, int>(array.Data.Buffers[1].Span).Slice(start, end - start);
+        var levels = defLevels == null ? default : defLevels.AsSpan(start, end - start);
+        return IntegerBounds.TryInt32(values, levels, order == StatisticsOrder.Unsigned, out int min, out int max)
+            ? (Int32BitsToBytes(min), Int32BitsToBytes(max))
+            : (null, null);
+    }
 
-        // Seeded with the first present value, which every null then stands in for: a duplicate of a value
-        // already counted moves neither bound under any order, and choosing it by mask leaves no branch on
-        // the level. MEASURED for INT64, per million: 1.0 / 1.9 / 3.5 ms at 0% / 14% / 50% random nulls
-        // skipping them, 0.91 at each this way (#919's nullable-kernels harness).
-        int f = start;
-        if (defLevels != null)
-        {
-            while (f < end && defLevels[f] == 0)
-                f++;
-        }
-
-        if (f >= end) return (null, null);
-
-        T seed = valueBuffer[f];
-        T min = seed, max = seed;
-        if (defLevels == null)
-        {
-            for (int i = f + 1; i < end; i++)
-            {
-                T val = valueBuffer[i];
-                if (compare(val, min) < 0) min = val;
-                if (compare(val, max) > 0) max = val;
-            }
-        }
-        else
-        {
-            for (int i = f + 1; i < end; i++)
-            {
-                T val = PresentValues.Select(defLevels[i] != 0, valueBuffer[i], seed);
-                if (compare(val, min) < 0) min = val;
-                if (compare(val, max) > 0) max = val;
-            }
-        }
-
-        int size = Marshal.SizeOf<T>();
-        var minBytes = new byte[size];
-        var maxBytes = new byte[size];
-#if NET8_0_OR_GREATER
-        MemoryMarshal.Write(minBytes, in min);
-        MemoryMarshal.Write(maxBytes, in max);
-#else
-        MemoryMarshal.Write(minBytes, ref min);
-        MemoryMarshal.Write(maxBytes, ref max);
-#endif
-        return (minBytes, maxBytes);
+    /// <summary>The INT64 counterpart of <see cref="ComputeInt32MinMax"/>.</summary>
+    private static (byte[]?, byte[]?) ComputeInt64MinMax(
+        IArrowArray array, int[]? defLevels, StatisticsOrder order, int start, int end)
+    {
+        var values = MemoryMarshal.Cast<byte, long>(array.Data.Buffers[1].Span).Slice(start, end - start);
+        var levels = defLevels == null ? default : defLevels.AsSpan(start, end - start);
+        return IntegerBounds.TryInt64(values, levels, order == StatisticsOrder.Unsigned, out long min, out long max)
+            ? (Int64BitsToBytes(min), Int64BitsToBytes(max))
+            : (null, null);
     }
 
     /// <summary>Whether a level in <paramref name="start"/> .. <paramref name="end"/> is a null; a
