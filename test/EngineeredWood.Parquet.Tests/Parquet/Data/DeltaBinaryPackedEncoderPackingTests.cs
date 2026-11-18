@@ -90,6 +90,7 @@ public class DeltaBinaryPackedEncoderPackingTests
         {
             long[] values = Int64s(random, count, () => width);
             AssertMatchesReference(values, long64: true);
+            AssertWidths(values, long64: true, width);
         }
     }
 
@@ -102,6 +103,7 @@ public class DeltaBinaryPackedEncoderPackingTests
         {
             long[] values = Int32s(random, count, () => width);
             AssertMatchesReference(values, long64: false);
+            AssertWidths(values, long64: false, width);
         }
     }
 
@@ -167,37 +169,91 @@ public class DeltaBinaryPackedEncoderPackingTests
         }
     }
 
-    /// <summary>Values whose deltas, less the block's minimum, are up to <paramref name="width"/> bits.</summary>
+    /// <summary>
+    /// Values whose deltas come from <see cref="Delta"/>, so that with one width throughout, every
+    /// miniblock of two or more deltas packs at exactly that width.
+    /// </summary>
     private static long[] Int64s(Random random, int count, Func<int> width)
     {
         var values = new long[count];
-        values[0] = (long)Bits(random, 64);
+        values[0] = (long)Random64(random);
         for (int i = 1; i < count; i++)
-            values[i] = unchecked(values[i - 1] + (long)Bits(random, width()));
+            values[i] = unchecked(values[i - 1] + Delta(random, i - 1, width()));
         return values;
     }
 
-    /// <summary>As <see cref="Int64s"/>, but 32-bit: deltas wrap at 32 bits.</summary>
+    /// <summary>As <see cref="Int64s"/>, but 32-bit: widths are capped at 32.</summary>
     private static long[] Int32s(Random random, int count, Func<int> width)
     {
         var values = new long[count];
-        values[0] = random.Next(int.MinValue, int.MaxValue);
+        values[0] = (int)Random64(random);
         for (int i = 1; i < count; i++)
-            values[i] = unchecked((int)values[i - 1] + (int)Bits(random, Math.Min(32, width())));
+            values[i] = unchecked((int)values[i - 1] + (int)Delta(random, i - 1, Math.Min(32, width())));
         return values;
     }
 
-    /// <summary>A random value of exactly <paramref name="width"/> bits, its top bit set.</summary>
-    private static ulong Bits(Random random, int width)
+    /// <summary>
+    /// A delta of <paramref name="width"/> bits, signed: the remainder r, from 0 to 2^width - 1, less
+    /// 2^(width - 1). Each miniblock's first delta has r = 0, the least possible, and its second the
+    /// greatest, so the block minimum is the low end of the range and those two remainders span all
+    /// <paramref name="width"/> bits. Width 64 covers the whole of <see cref="long"/> (and 32 the whole
+    /// of <see cref="int"/>), so the deltas reach both signed extremes.
+    /// </summary>
+    private static long Delta(Random random, int index, int width)
     {
         if (width == 0)
             return 0;
+        ulong top = width == 64 ? ulong.MaxValue : (1UL << width) - 1;
+        ulong r = (index % PerMiniblock) switch
+        {
+            0 => 0,
+            1 => top,
+            _ => Random64(random) & top,
+        };
+        return unchecked((long)r - (long)(1UL << (width - 1)));
+    }
+
+    private static ulong Random64(Random random)
+    {
         var bytes = new byte[8];
         random.NextBytes(bytes);
-        ulong v = BitConverter.ToUInt64(bytes, 0);
-        if (width < 64)
-            v &= (1UL << width) - 1;
-        return v | 1UL << (width - 1);
+        return BitConverter.ToUInt64(bytes, 0);
+    }
+
+    /// <summary>
+    /// Asserts the widths the encoder wrote: <paramref name="width"/> for each miniblock of two or more
+    /// deltas, 0 for one of a single delta (its remainder is 0) or none.
+    /// </summary>
+    private static void AssertWidths(long[] values, bool long64, int width)
+    {
+        var encoder = new DeltaBinaryPackedEncoder();
+        if (long64)
+            encoder.EncodeInt64s(values);
+        else
+            encoder.EncodeInt32s(Array.ConvertAll(values, v => (int)v));
+        byte[] data = encoder.ToArray();
+
+        int pos = 0;
+        Varint.ReadUnsigned(data, ref pos);
+        Varint.ReadUnsigned(data, ref pos);
+        Varint.ReadUnsigned(data, ref pos);
+        Varint.ReadSigned(data, ref pos);
+        int deltas = values.Length - 1;
+        for (int s = 0; s < deltas; s += BlockSize)
+        {
+            Varint.ReadSigned(data, ref pos);
+            int packed = 0;
+            for (int mb = 0; mb < MiniblockCount; mb++)
+            {
+                int inMiniblock = Math.Max(0, Math.Min(PerMiniblock, deltas - s - mb * PerMiniblock));
+                Assert.Equal(inMiniblock >= 2 ? width : 0, data[pos + mb]);
+                packed += PerMiniblock * data[pos + mb] / 8;
+            }
+
+            pos += MiniblockCount + packed;
+        }
+
+        Assert.Equal(data.Length, pos);
     }
 
     /// <summary>
