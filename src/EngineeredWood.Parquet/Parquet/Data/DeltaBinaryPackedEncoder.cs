@@ -189,29 +189,20 @@ internal sealed class DeltaBinaryPackedEncoder
 
         WriteZigZagVarInt(minDelta);
 
-        // Compute bit widths for each miniblock
+        // A miniblock's bit width is the bit length of its largest remainder, which is also the bit
+        // length of the OR of its remainders. A miniblock past the last delta has width 0.
         for (int mb = 0; mb < MiniblockCount; mb++)
         {
             int mbStart = mb * ValuesPerMiniblock;
             int mbEnd = Math.Min(mbStart + ValuesPerMiniblock, blockValues);
-
-            if (mbStart >= blockValues)
-            {
-                bitWidths[mb] = 0;
-                continue;
-            }
-
-            ulong maxRemainder = 0;
+            ulong or = 0;
             for (int i = mbStart; i < mbEnd; i++)
-            {
-                ulong remainder = unchecked((ulong)(deltas[i] - minDelta));
-                if (remainder > maxRemainder) maxRemainder = remainder;
-            }
+                or |= unchecked((ulong)(deltas[i] - minDelta));
 
 #if NET8_0_OR_GREATER
-            bitWidths[mb] = maxRemainder == 0 ? (byte)0 : (byte)(64 - ulong.LeadingZeroCount(maxRemainder));
+            bitWidths[mb] = (byte)(64 - ulong.LeadingZeroCount(or));
 #else
-            bitWidths[mb] = maxRemainder == 0 ? (byte)0 : (byte)(64 - BitPolyfills.LeadingZeroCount(maxRemainder));
+            bitWidths[mb] = (byte)(64 - BitPolyfills.LeadingZeroCount(or));
 #endif
         }
 
@@ -228,34 +219,49 @@ internal sealed class DeltaBinaryPackedEncoder
                 continue;
 
             int mbStart = mb * ValuesPerMiniblock;
-            int bytesNeeded = (ValuesPerMiniblock * bw + 7) / 8;
+            int bytesNeeded = ValuesPerMiniblock * bw / 8; // 32 values: always whole bytes
             EnsureCapacity(bytesNeeded);
-            _buffer.AsSpan(_position, bytesNeeded).Clear();
-
-            int bitPos = 0;
-            for (int i = 0; i < ValuesPerMiniblock; i++)
-            {
-                ulong val = (mbStart + i < blockValues)
-                    ? unchecked((ulong)(deltas[mbStart + i] - minDelta))
-                    : 0UL; // padding for partial miniblock
-
-                if (val != 0)
-                {
-                    int byteOffset = bitPos / 8;
-                    int bitOffset = bitPos % 8;
-
-                    int bytesToWrite = (bitOffset + bw + 7) / 8;
-                    // First byte: shift left (only low byte matters)
-                    _buffer[_position + byteOffset] |= (byte)(val << bitOffset);
-                    // Remaining bytes: shift right
-                    for (int b = 1; b < bytesToWrite; b++)
-                        _buffer[_position + byteOffset + b] |= (byte)(val >> (b * 8 - bitOffset));
-                }
-                bitPos += bw;
-            }
-
+            PackMiniblock(deltas, mbStart, minDelta, bw, _buffer.AsSpan(_position, bytesNeeded));
             _position += bytesNeeded;
         }
+    }
+
+    /// <summary>
+    /// Packs the 32 remainders of one miniblock at <paramref name="bitWidth"/> bits each, least
+    /// significant bit first, into exactly <paramref name="destination"/> (32 × width / 8 bytes).
+    /// Remainders past the end of <paramref name="deltas"/> pad as zeros.
+    /// </summary>
+    /// <remarks>
+    /// The remainders gather into a 64-bit accumulator that is stored whole each time it fills; the
+    /// bits of a remainder that straddles the boundary start the next word. A full word is stored
+    /// only once 64 bits have been packed, so it never runs past the miniblock, and what is left at
+    /// the end (32 × width is a multiple of 8) is whole bytes.
+    /// </remarks>
+    private static void PackMiniblock(
+        ReadOnlySpan<long> deltas, int start, long minDelta, int bitWidth, Span<byte> destination)
+    {
+        int end = Math.Min(start + ValuesPerMiniblock, deltas.Length);
+        ulong word = 0;
+        int bits = 0, at = 0;
+        for (int i = start; i < start + ValuesPerMiniblock; i++)
+        {
+            ulong value = i < end ? unchecked((ulong)(deltas[i] - minDelta)) : 0;
+            word |= value << bits;
+            bits += bitWidth;
+            if (bits >= 64)
+            {
+                BinaryPrimitives.WriteUInt64LittleEndian(destination.Slice(at), word);
+                at += 8;
+                bits -= 64;
+
+                // The high bits of the value that did not fit; none when it ended on the boundary
+                // (a shift by 64 would be a shift by 0 in .NET).
+                word = bits == 0 ? 0 : value >> (bitWidth - bits);
+            }
+        }
+
+        for (; bits > 0; bits -= 8, word >>= 8)
+            destination[at++] = (byte)word;
     }
 
     private void WriteUnsignedVarInt(long value)
