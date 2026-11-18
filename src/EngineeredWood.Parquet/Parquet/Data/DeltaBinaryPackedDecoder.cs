@@ -154,19 +154,20 @@ internal ref struct DeltaBinaryPackedDecoder
     private int UnpackSum(Span<int> destination, int bitWidth, int minDelta, int last)
     {
         ulong mask = Mask(bitWidth);
-        int bitOffset = _pos * 8;
-        int bytes = MiniblockBytes(bitWidth);
-        if (FastPath(bitWidth, bytes))
+        long bytes = MiniblockBytes(bitWidth);
+        if (FastPath(bitWidth, bytes, 8))
         {
-            ref byte source = ref MemoryMarshal.GetReference(_data);
-            for (int i = 0; i < destination.Length; i++, bitOffset += bitWidth)
+            ref byte source = ref Unsafe.Add(ref MemoryMarshal.GetReference(_data), _pos);
+            long bit = 0;
+            for (int i = 0; i < destination.Length; i++, bit += bitWidth)
             {
-                last += minDelta + (int)((ReadWord(ref source, bitOffset >> 3) >> (bitOffset & 7)) & mask);
+                last += minDelta + (int)((ReadWord(ref source, (int)(bit >> 3)) >> (int)(bit & 7)) & mask);
                 destination[i] = last;
             }
         }
         else
         {
+            long bitOffset = (long)_pos * 8;
             for (int i = 0; i < destination.Length; i++, bitOffset += bitWidth)
             {
                 last += minDelta + (int)ReadValue(bitOffset, bitWidth, mask);
@@ -174,7 +175,7 @@ internal ref struct DeltaBinaryPackedDecoder
             }
         }
 
-        _pos += bytes;
+        Advance(bytes);
         return last;
     }
 
@@ -182,26 +183,27 @@ internal ref struct DeltaBinaryPackedDecoder
     private long UnpackSum(Span<long> destination, int bitWidth, long minDelta, long last)
     {
         ulong mask = Mask(bitWidth);
-        int bitOffset = _pos * 8;
-        int bytes = MiniblockBytes(bitWidth);
-        if (FastPath(bitWidth, bytes))
+        long bytes = MiniblockBytes(bitWidth);
+        if (FastPath(bitWidth, bytes, 8))
         {
-            ref byte source = ref MemoryMarshal.GetReference(_data);
-            for (int i = 0; i < destination.Length; i++, bitOffset += bitWidth)
+            ref byte source = ref Unsafe.Add(ref MemoryMarshal.GetReference(_data), _pos);
+            long bit = 0;
+            for (int i = 0; i < destination.Length; i++, bit += bitWidth)
             {
-                last += minDelta + (long)((ReadWord(ref source, bitOffset >> 3) >> (bitOffset & 7)) & mask);
+                last += minDelta + (long)((ReadWord(ref source, (int)(bit >> 3)) >> (int)(bit & 7)) & mask);
                 destination[i] = last;
             }
         }
-        else if (bitWidth <= 64 && (long)_pos + bytes + 16 <= _data.Length)
+        else if (FastPath(bitWidth, bytes, 16))
         {
             // Over 56 bits a value may run into a second word. Shifting the second word left by
             // 64 - b in two steps makes it contribute nothing when b = 0, where one shift by 64 would
             // be a shift by 0.
-            ref byte source = ref MemoryMarshal.GetReference(_data);
-            for (int i = 0; i < destination.Length; i++, bitOffset += bitWidth)
+            ref byte source = ref Unsafe.Add(ref MemoryMarshal.GetReference(_data), _pos);
+            long bit = 0;
+            for (int i = 0; i < destination.Length; i++, bit += bitWidth)
             {
-                int at = bitOffset >> 3, b = bitOffset & 7;
+                int at = (int)(bit >> 3), b = (int)(bit & 7);
                 ulong raw = (ReadWord(ref source, at) >> b) | ((ReadWord(ref source, at + 8) << 1) << (63 - b));
                 last += minDelta + (long)(raw & mask);
                 destination[i] = last;
@@ -209,6 +211,7 @@ internal ref struct DeltaBinaryPackedDecoder
         }
         else
         {
+            long bitOffset = (long)_pos * 8;
             for (int i = 0; i < destination.Length; i++, bitOffset += bitWidth)
             {
                 last += minDelta + (long)ReadValue(bitOffset, bitWidth, mask);
@@ -216,22 +219,44 @@ internal ref struct DeltaBinaryPackedDecoder
             }
         }
 
-        _pos += bytes;
+        Advance(bytes);
         return last;
     }
 
     private static ulong Mask(int bitWidth) => bitWidth == 64 ? ulong.MaxValue : (1UL << bitWidth) - 1;
 
-    private readonly int MiniblockBytes(int bitWidth) => (_valuesPerMiniblock * bitWidth + 7) / 8;
+    /// <summary>
+    /// The bytes of a miniblock at <paramref name="bitWidth"/>. The values per miniblock come from the
+    /// file, so the product is taken in 64 bits: in 32 it can wrap to a small number.
+    /// </summary>
+    private readonly long MiniblockBytes(int bitWidth) => ((long)_valuesPerMiniblock * bitWidth + 7) / 8;
 
     /// <summary>
-    /// Whether every value of the miniblock at <see cref="_pos"/> is one 8-byte read that stays inside
-    /// the data. A value of at most 56 bits fits one read from its first byte (7 + 56 = 63 bits). The
-    /// last value of the miniblock starts within its <paramref name="bytes"/>, so its read ends before
-    /// <c>_pos + bytes + 8</c>. Usually only the last miniblock of a page falls short of that.
+    /// Whether every value of the miniblock at <see cref="_pos"/> can be read unchecked: its
+    /// <paramref name="bytes"/> plus <paramref name="slack"/> lie inside the data. A value starts within
+    /// the miniblock's bytes, and its read is one word (8 bytes) up to 56 bits, or two words (16) up to
+    /// 64. Usually only the last miniblock of a page falls short of that.
     /// </summary>
-    private readonly bool FastPath(int bitWidth, int bytes) =>
-        bitWidth <= 56 && (long)_pos + bytes + 8 <= _data.Length;
+    /// <remarks>
+    /// The fast paths count bits from the start of the miniblock, in 64 bits: a bit offset in the
+    /// miniblock is under 8 × <paramref name="bytes"/>, so its byte index fits an <see cref="int"/>,
+    /// where a bit offset from the start of the data would wrap past 256 MiB.
+    /// </remarks>
+    private readonly bool FastPath(int bitWidth, long bytes, int slack) =>
+        bitWidth <= (slack == 8 ? 56 : 64) && (long)_pos + bytes + slack <= _data.Length;
+
+    /// <summary>
+    /// Moves past a miniblock. A truncated last miniblock can leave <see cref="_pos"/> past the end of
+    /// the data, as before; one that would put it past <see cref="int.MaxValue"/> is refused.
+    /// </summary>
+    private void Advance(long bytes)
+    {
+        long next = _pos + bytes;
+        if (next > int.MaxValue)
+            throw new InvalidDataException(
+                $"DELTA_BINARY_PACKED miniblock of {_valuesPerMiniblock} values runs past the end of the data.");
+        _pos = (int)next;
+    }
 
     /// <summary>An unaligned little-endian read; the caller has checked it is in range.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -242,13 +267,13 @@ internal ref struct DeltaBinaryPackedDecoder
     }
 
     /// <summary>
-    /// One value at <paramref name="bitOffset"/>, read with bounds checks: bytes past the end of the
-    /// data read as zeros, and a value over 56 bits may take two reads.
+    /// One value at <paramref name="bitOffset"/> from the start of the data, read with bounds checks:
+    /// bytes past the end of the data read as zeros, and a value over 56 bits may take two reads.
     /// </summary>
-    private readonly ulong ReadValue(int bitOffset, int bitWidth, ulong mask)
+    private readonly ulong ReadValue(long bitOffset, int bitWidth, ulong mask)
     {
-        int byteIdx = bitOffset >> 3;
-        int bitIdx = bitOffset & 7;
+        long byteIdx = bitOffset >> 3;
+        int bitIdx = (int)(bitOffset & 7);
         if (bitWidth <= 56 || bitIdx == 0)
             return (ReadUInt64LE(_data, byteIdx) >> bitIdx) & mask;
 
@@ -258,17 +283,17 @@ internal ref struct DeltaBinaryPackedDecoder
     }
 
     /// <summary>
-    /// Reads 8 bytes as a little-endian <c>ulong</c>, padding with zeros if near end of buffer.
+    /// Reads 8 bytes as a little-endian <c>ulong</c>, padding with zeros past the end of the data.
     /// </summary>
-    private static ulong ReadUInt64LE(ReadOnlySpan<byte> data, int offset)
+    private static ulong ReadUInt64LE(ReadOnlySpan<byte> data, long offset)
     {
         if (offset + 8 <= data.Length)
-            return BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(offset));
+            return BinaryPrimitives.ReadUInt64LittleEndian(data.Slice((int)offset));
 
-        // Near end of buffer — read available bytes (only hit at tail of last miniblock)
+        // Near or past the end of the data: read what there is (only the tail of a last miniblock).
         ulong value = 0;
-        for (int i = offset; i < data.Length; i++)
-            value |= (ulong)data[i] << ((i - offset) * 8);
+        for (long i = offset; i < data.Length; i++)
+            value |= (ulong)data[(int)i] << (int)((i - offset) * 8);
         return value;
     }
 

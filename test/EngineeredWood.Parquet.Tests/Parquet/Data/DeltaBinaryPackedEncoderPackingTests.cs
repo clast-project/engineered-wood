@@ -159,6 +159,58 @@ public class DeltaBinaryPackedEncoderPackingTests
         }
     }
 
+    /// <summary>
+    /// A stream claiming one miniblock of 2^30 values at width 32, with 10 values and only the 8 bytes
+    /// of the first two deltas (1 and 2). Its size, 2^32 bytes, wraps to 0 in 32 bits: the decoder then
+    /// took the miniblock as fitting and read the other deltas from past the end of the data. Past the
+    /// end here is 0xFF, outside the span.
+    /// </summary>
+    [Fact]
+    public void Decoder_MiniblockSizeOverflowing32Bits_IsRefused()
+    {
+        byte[] stream = HugeMiniblock(blockSizeVarint: [0x80, 0x80, 0x80, 0x80, 0x04]); // 1 << 30
+        var backing = new byte[stream.Length + 64];
+        stream.CopyTo(backing, 0);
+        backing.AsSpan(stream.Length).Fill(0xFF);
+
+        Assert.Throws<InvalidDataException>(() =>
+            new DeltaBinaryPackedDecoder(backing.AsSpan(0, stream.Length)).DecodeInt32s(new int[10]));
+        Assert.Throws<InvalidDataException>(() =>
+            new DeltaBinaryPackedDecoder(backing.AsSpan(0, stream.Length)).DecodeInt64s(new long[10]));
+    }
+
+    /// <summary>
+    /// As above but 2^20 values, a 4 MiB miniblock that fits 32 bits and not the data: the bytes past
+    /// the end read as zeros, as they always have, so the deltas after the first two are 0.
+    /// </summary>
+    [Fact]
+    public void Decoder_TruncatedMiniblock_ReadsZerosPastTheEnd()
+    {
+        byte[] stream = HugeMiniblock(blockSizeVarint: [0x80, 0x80, 0x40]); // 1 << 20
+        var backing = new byte[stream.Length + 64];
+        stream.CopyTo(backing, 0);
+        backing.AsSpan(stream.Length).Fill(0xFF);
+
+        var ints = new int[10];
+        new DeltaBinaryPackedDecoder(backing.AsSpan(0, stream.Length)).DecodeInt32s(ints);
+        Assert.Equal(new[] { 0, 1, 3, 3, 3, 3, 3, 3, 3, 3 }, ints);
+
+        var longs = new long[10];
+        new DeltaBinaryPackedDecoder(backing.AsSpan(0, stream.Length)).DecodeInt64s(longs);
+        Assert.Equal(new long[] { 0, 1, 3, 3, 3, 3, 3, 3, 3, 3 }, longs);
+    }
+
+    /// <summary>
+    /// One block of one miniblock of the given size, 10 values from 0, min delta 0, width 32, and the
+    /// first two deltas only: 1 and 2.
+    /// </summary>
+    private static byte[] HugeMiniblock(byte[] blockSizeVarint) =>
+    [
+        .. blockSizeVarint, 0x01, 0x0A, 0x00, // block size, 1 miniblock, 10 values, first value 0
+        0x00, 0x20,                           // min delta 0, width 32
+        0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    ];
+
     [Fact]
     public void MixedWidthsPerMiniblock_MatchReference()
     {
