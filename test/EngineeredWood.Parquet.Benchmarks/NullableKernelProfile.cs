@@ -48,8 +48,8 @@ internal static class NullableKernelProfile
         Add("W gather: branchy on int[] (today)", k => () => GatherBranchy(k.Values, k.IntLevels, k.Dense));
         Add("W gather: branchless on int[]", k => () => GatherBranchless(k.Values, k.IntLevels, k.Dense));
         Add("W gather: by bitmap byte", k => () => GatherByBitmap(k.Values, k.Bitmap, k.Rows, k.Dense));
-        Add("W stats: skip nulls by int[] (today)", k => () => k.Sink = MinMaxSkipping(k.Values, k.IntLevels));
-        Add("W stats: over the gathered values", k => () => k.Sink = MinMaxDense(k.Dense.AsSpan(0, k.NonNull)));
+        Add("W stats: skip nulls by int[] (today)", k => () => k.Sink = MinMaxSkipping(k.Values, k.IntLevels).Min);
+        Add("W stats: over the gathered values", k => () => k.Sink = MinMaxDense(k.Dense.AsSpan(0, k.NonNull)).Min);
         // The writer's default (BatchBitPackedRuns = false) heads every 8-value literal group; batching puts up
         // to 63 groups under one header. Both sides are timed at both settings.
         Add("W def RLE: encoder over int[] (today, 1 group/header)", k => () => EncodeLevels(k.IntLevels, 1));
@@ -137,6 +137,10 @@ internal static class NullableKernelProfile
             GatherByBitmap(k.Values, k.Bitmap, k.Rows, d);
             Check(d.AsSpan(0, n).SequenceEqual(expectDense.AsSpan(0, n)), "gather bitmap");
 
+            var skipping = MinMaxSkipping(k.Values, expectInts);
+            var gathered = MinMaxDense(expectDense.AsSpan(0, n));
+            Check(skipping == gathered, "min/max on the benchmark data");
+
             var a = new double[k.Rows];
             var b = new double[k.Rows];
             expectDense.AsSpan(0, n).CopyTo(a);
@@ -163,7 +167,58 @@ internal static class NullableKernelProfile
             }
         }
 
+        VerifyMinMax();
         Console.WriteLine("All alternatives verified against today's output.");
+    }
+
+    /// <summary>
+    /// The stats over the gathered values against today's null-skipping loop: on the benchmark data, and on
+    /// hand-made pages holding NaN, both zeros in each order, all nulls, and all NaN. Compared bit for bit,
+    /// so -0.0 and +0.0 are told apart.
+    /// </summary>
+    private static void VerifyMinMax()
+    {
+        var pages = new List<(double[] Values, int[] Levels)>();
+        var random = new Random(3);
+        for (int p = 0; p < 200; p++)
+        {
+            int n = random.Next(0, 40);
+            var values = new double[n];
+            var levels = new int[n];
+            for (int i = 0; i < n; i++)
+            {
+                levels[i] = random.Next(4) == 0 ? 0 : 1;
+                values[i] = random.Next(6) switch
+                {
+                    0 => double.NaN,
+                    1 => 0.0,
+                    2 => -0.0,
+                    _ => random.Next(-5, 5) / 2.0,
+                };
+            }
+
+            pages.Add((values, levels));
+        }
+
+        pages.Add(([double.NaN, -0.0, 0.0, 7, 3, -0.0], [1, 1, 1, 0, 1, 1]));
+        pages.Add(([0.0, -0.0], [1, 1]));
+        pages.Add(([-0.0, 0.0], [1, 1]));
+        pages.Add(([1, 2, 3], [0, 0, 0]));
+        pages.Add(([double.NaN, double.NaN], [1, 1]));
+        pages.Add(([], []));
+
+        foreach (var (values, levels) in pages)
+        {
+            var dense = new double[values.Length + 1];
+            GatherBranchy(values, levels, dense);
+            int n = levels.Count(l => l != 0);
+            var expected = MinMaxSkipping(values, levels);
+            var actual = MinMaxDense(dense.AsSpan(0, n));
+            Check(expected.Any == actual.Any
+                && BitConverter.DoubleToInt64Bits(expected.Min) == BitConverter.DoubleToInt64Bits(actual.Min)
+                && BitConverter.DoubleToInt64Bits(expected.Max) == BitConverter.DoubleToInt64Bits(actual.Max),
+                "min/max over the gathered values");
+        }
     }
 
     private static void Check(bool ok, string what)
@@ -323,7 +378,7 @@ internal static class NullableKernelProfile
     }
 
     // StatisticsCollector.ComputeDoubleMinMax without the NaN and signed-zero handling, which both sides keep.
-    private static double MinMaxSkipping(double[] values, int[] levels)
+    private static (double Min, double Max, bool Any) MinMaxSkipping(double[] values, int[] levels)
     {
         bool first = true;
         double min = 0, max = 0;
@@ -340,10 +395,10 @@ internal static class NullableKernelProfile
             }
         }
 
-        return min + max;
+        return (min, max, !first);
     }
 
-    private static double MinMaxDense(ReadOnlySpan<double> values)
+    private static (double Min, double Max, bool Any) MinMaxDense(ReadOnlySpan<double> values)
     {
         bool first = true;
         double min = 0, max = 0;
@@ -359,7 +414,7 @@ internal static class NullableKernelProfile
             }
         }
 
-        return min + max;
+        return (min, max, !first);
     }
 
     private static byte[] EncodeLevels(int[] levels, int maxLiteralGroups)
