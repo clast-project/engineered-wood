@@ -20,8 +20,9 @@ namespace EngineeredWood.Parquet.Data;
 /// <para>A null stands in as the first present value, a duplicate that moves neither bound, so the
 /// level picks the value without a branch. On .NET 8 and later the scan runs a <see cref="Vector{T}"/>
 /// at a time; elsewhere, and for the tail, a value at a time.</para>
-/// <para>MEASURED per million values, against a <see cref="Comparison{T}"/> delegate call per
-/// comparison: see the PR that introduced this class.</para>
+/// <para>MEASURED per million values (<c>stats-profile</c>), against the <see cref="Comparison{T}"/>
+/// delegate call per comparison this replaced: INT32 3.3 -> 0.06 ms, INT64 3.8 -> 0.18, INT64 with 14%
+/// nulls 4.1 -> 0.27. That was over half the time of writing an INT32 column without a dictionary.</para>
 /// </remarks>
 internal static class IntegerBounds
 {
