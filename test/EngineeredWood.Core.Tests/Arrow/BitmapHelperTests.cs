@@ -11,6 +11,8 @@ namespace EngineeredWood.Core.Tests.Arrow;
 /// these cross-check every path against an independent scalar reference across counts that straddle the
 /// 16- and 32-element thresholds and their immediate neighbours — where a mis-sized tail or a partial
 /// final byte would show up.
+/// <para><c>ExpandToLevels</c> has no vector dispatch; its risk is the bit offset, so its tests take every
+/// offset from 0 to 15 over the same counts.</para>
 /// </summary>
 public class BitmapHelperTests
 {

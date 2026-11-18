@@ -377,7 +377,8 @@ internal static class NullableKernelProfile
         }
     }
 
-    // StatisticsCollector.ComputeDoubleMinMax without the NaN and signed-zero handling, which both sides keep.
+    // StatisticsCollector.ComputeDoubleMinMax's ordering: NaN skipped, -0.0 below +0.0. Left out, on both
+    // sides alike: the NaN count and the total-order NaN range.
     private static (double Min, double Max, bool Any) MinMaxSkipping(double[] values, int[] levels)
     {
         bool first = true;

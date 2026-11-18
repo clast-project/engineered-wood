@@ -12,8 +12,13 @@ namespace EngineeredWood.Parquet.Tests.Parquet.Data;
 /// A nullable flat column's definition levels come from its validity bitmap a byte at a time, and its
 /// fixed-width values are gathered without a branch on the level. These round-trip what that has to get
 /// right: random nulls at shares from none to all, row counts that end mid-byte, pages that start
-/// mid-column, an array sliced at an unaligned bit, and an array that declares no nulls over a bitmap
-/// with clear bits, which <c>IsNull</c> reads as all valid.
+/// mid-column, and an array that declares no nulls over a bitmap with clear bits, which <c>IsNull</c>
+/// reads as all valid.
+/// <para>The sliced cases guard the whole write path, not the writer's own offset handling: the file
+/// writer rebases every sliced column, bitmap included, before an encoder sees it
+/// (<c>ParquetFileWriter.CompactSlicedColumns</c>), so the array reaching <c>ColumnChunkWriter</c> always
+/// has offset 0, and passing it 0 instead of <c>array.Offset</c> leaves these green. The expansion at a
+/// non-zero bit offset is tested in <c>BitmapHelperTests</c>.</para>
 /// </summary>
 public class NullableFlatWriteTests : IDisposable
 {
