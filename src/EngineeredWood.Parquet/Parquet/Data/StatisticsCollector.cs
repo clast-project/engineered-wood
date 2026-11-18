@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
@@ -726,26 +727,40 @@ internal static class StatisticsCollector
         where T : unmanaged
     {
         var valueBuffer = MemoryMarshal.Cast<byte, T>(array.Data.Buffers[1].Span);
-        bool first = true;
-        T min = default, max = default;
 
-        for (int i = start; i < end; i++)
+        // Seeded with the first present value, which every null then stands in for: a duplicate of a value
+        // already counted moves neither bound under any order, and choosing it by mask leaves no branch on
+        // the level. MEASURED for INT64, per million: 1.0 / 1.9 / 3.5 ms at 0% / 14% / 50% random nulls
+        // skipping them, 0.91 at each this way (#919's nullable-kernels harness).
+        int f = start;
+        if (defLevels != null)
         {
-            if (defLevels != null && defLevels[i] == 0) continue;
-            T val = valueBuffer[i];
-            if (first)
+            while (f < end && defLevels[f] == 0)
+                f++;
+        }
+
+        if (f >= end) return (null, null);
+
+        T seed = valueBuffer[f];
+        T min = seed, max = seed;
+        if (defLevels == null)
+        {
+            for (int i = f + 1; i < end; i++)
             {
-                min = max = val;
-                first = false;
-            }
-            else
-            {
+                T val = valueBuffer[i];
                 if (compare(val, min) < 0) min = val;
                 if (compare(val, max) > 0) max = val;
             }
         }
-
-        if (first) return (null, null);
+        else
+        {
+            for (int i = f + 1; i < end; i++)
+            {
+                T val = PresentValues.Select(defLevels[i] != 0, valueBuffer[i], seed);
+                if (compare(val, min) < 0) min = val;
+                if (compare(val, max) > 0) max = val;
+            }
+        }
 
         int size = Marshal.SizeOf<T>();
         var minBytes = new byte[size];
@@ -760,20 +775,42 @@ internal static class StatisticsCollector
         return (minBytes, maxBytes);
     }
 
+    /// <summary>Whether a level in <paramref name="start"/> .. <paramref name="end"/> is a null; a
+    /// vectorised search, so a page without one skips the gather.</summary>
+    private static bool HasNull([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] int[]? defLevels, int start, int end) =>
+        defLevels != null && defLevels.AsSpan(start, end - start).IndexOf(0) >= 0;
+
     private static (byte[]?, byte[]?, long) ComputeFloatMinMax(
         IArrowArray array, int[]? defLevels, bool totalOrder, int start, int end)
     {
-        var valueBuffer = MemoryMarshal.Cast<byte, float>(array.Data.Buffers[1].Span);
-        var bitsBuffer = MemoryMarshal.Cast<byte, int>(array.Data.Buffers[1].Span);
+        var values = MemoryMarshal.Cast<byte, float>(array.Data.Buffers[1].Span).Slice(start, end - start);
+        if (!HasNull(defLevels, start, end))
+            return FloatMinMax(values, totalOrder);
+
+        float[] dense = ArrayPool<float>.Shared.Rent(values.Length);
+        try
+        {
+            int n = PresentValues.Gather(values, defLevels.AsSpan(start, end - start), dense.AsSpan(0, values.Length));
+            return FloatMinMax(dense.AsSpan(0, n), totalOrder);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(dense);
+        }
+    }
+
+    /// <summary>The bounds and NaN count of <paramref name="values"/>, every one of them present.</summary>
+    private static (byte[]?, byte[]?, long) FloatMinMax(ReadOnlySpan<float> values, bool totalOrder)
+    {
+        var bitsBuffer = MemoryMarshal.Cast<float, int>(values);
         bool first = true;
         float min = 0, max = 0;
         long nanCount = 0;
         var nans = default(NaNRange);
 
-        for (int i = start; i < end; i++)
+        for (int i = 0; i < values.Length; i++)
         {
-            if (defLevels != null && defLevels[i] == 0) continue;
-            float val = valueBuffer[i];
+            float val = values[i];
             if (float.IsNaN(val))
             {
                 if (totalOrder)
@@ -863,20 +900,43 @@ internal static class StatisticsCollector
         return bytes;
     }
 
+    /// <remarks>
+    /// A range with nulls is first gathered without a branch on the level, then scanned as if it had
+    /// none: MEASURED per million, 2.6 -> 1.8 ms at 14% random nulls and 3.7 -> 1.3 at 50%, against
+    /// skipping each null in the scan (#919's nullable-kernels harness). A range without one is scanned
+    /// in place. The scan is the same either way, so NaN, signed-zero and total-order handling are too.
+    /// </remarks>
     private static (byte[]?, byte[]?, long) ComputeDoubleMinMax(
         IArrowArray array, int[]? defLevels, bool totalOrder, int start, int end)
     {
-        var valueBuffer = MemoryMarshal.Cast<byte, double>(array.Data.Buffers[1].Span);
-        var bitsBuffer = MemoryMarshal.Cast<byte, long>(array.Data.Buffers[1].Span);
+        var values = MemoryMarshal.Cast<byte, double>(array.Data.Buffers[1].Span).Slice(start, end - start);
+        if (!HasNull(defLevels, start, end))
+            return DoubleMinMax(values, totalOrder);
+
+        double[] dense = ArrayPool<double>.Shared.Rent(values.Length);
+        try
+        {
+            int n = PresentValues.Gather(values, defLevels.AsSpan(start, end - start), dense.AsSpan(0, values.Length));
+            return DoubleMinMax(dense.AsSpan(0, n), totalOrder);
+        }
+        finally
+        {
+            ArrayPool<double>.Shared.Return(dense);
+        }
+    }
+
+    /// <summary>The bounds and NaN count of <paramref name="values"/>, every one of them present.</summary>
+    private static (byte[]?, byte[]?, long) DoubleMinMax(ReadOnlySpan<double> values, bool totalOrder)
+    {
+        var bitsBuffer = MemoryMarshal.Cast<double, long>(values);
         bool first = true;
         double min = 0, max = 0;
         long nanCount = 0;
         var nans = default(NaNRange);
 
-        for (int i = start; i < end; i++)
+        for (int i = 0; i < values.Length; i++)
         {
-            if (defLevels != null && defLevels[i] == 0) continue;
-            double val = valueBuffer[i];
+            double val = values[i];
             if (double.IsNaN(val))
             {
                 if (totalOrder)
