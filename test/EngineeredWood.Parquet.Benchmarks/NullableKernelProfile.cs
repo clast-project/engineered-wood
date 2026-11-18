@@ -50,6 +50,11 @@ internal static class NullableKernelProfile
         Add("W gather: by bitmap byte", k => () => GatherByBitmap(k.Values, k.Bitmap, k.Rows, k.Dense));
         Add("W stats: skip nulls by int[] (today)", k => () => k.Sink = MinMaxSkipping(k.Values, k.IntLevels).Min);
         Add("W stats: over the gathered values", k => () => k.Sink = MinMaxDense(k.Dense.AsSpan(0, k.NonNull)).Min);
+        Add("W stats: gather to scratch, then dense", k => () => k.Sink = MinMaxGatherThenDense(k.Values, k.IntLevels, k.Scratch).Min);
+        Add("W stats: nulls replaced by a present value", k => () => k.Sink = MinMaxSeeded(k.Values, k.IntLevels).Min);
+        Add("W stats int64: skip nulls, Comparison<long> (today)", k => () => k.LongSink = MinMaxSkippingGeneric(k.Longs, k.IntLevels, LongCompare).Min);
+        Add("W stats int64: nulls replaced, Comparison<long>", k => () => k.LongSink = MinMaxSeededGeneric(k.Longs, k.IntLevels, LongCompare).Min);
+        Add("W stats int64: gather to scratch, then dense", k => () => k.LongSink = MinMaxGatherThenDenseGeneric(k.Longs, k.IntLevels, k.LongScratch, LongCompare).Min);
         // The writer's default (BatchBitPackedRuns = false) heads every 8-value literal group; batching puts up
         // to 63 groups under one header. Both sides are timed at both settings.
         Add("W def RLE: encoder over int[] (today, 1 group/header)", k => () => EncodeLevels(k.IntLevels, 1));
@@ -82,6 +87,10 @@ internal static class NullableKernelProfile
         public readonly int[] IntLevels;
         public readonly byte[] ByteLevels;
         public readonly double[] Dense;
+        public readonly double[] Scratch;
+        public readonly long[] Longs;
+        public long LongSink;
+        public readonly long[] LongScratch;
         public readonly double[] ScatterValues;
         public readonly byte[] OutBitmap;
         public readonly byte[] EncodedLevels;
@@ -105,6 +114,11 @@ internal static class NullableKernelProfile
             IntLevels = new int[Rows];
             ByteLevels = new byte[Rows];
             Dense = new double[Rows + 1];
+            Scratch = new double[Rows];
+            Longs = new long[Rows];
+            LongScratch = new long[Rows];
+            for (int i = 0; i < Rows; i++)
+                Longs[i] = BitConverter.DoubleToInt64Bits(Values[i]) >> 3;
             ScatterValues = new double[Rows];
             OutBitmap = new byte[(Rows + 7) / 8 + 8];
             Encoded = new byte[Rows / 4 + 1024];
@@ -213,11 +227,23 @@ internal static class NullableKernelProfile
             GatherBranchy(values, levels, dense);
             int n = levels.Count(l => l != 0);
             var expected = MinMaxSkipping(values, levels);
-            var actual = MinMaxDense(dense.AsSpan(0, n));
-            Check(expected.Any == actual.Any
-                && BitConverter.DoubleToInt64Bits(expected.Min) == BitConverter.DoubleToInt64Bits(actual.Min)
-                && BitConverter.DoubleToInt64Bits(expected.Max) == BitConverter.DoubleToInt64Bits(actual.Max),
-                "min/max over the gathered values");
+            foreach (var actual in new[]
+            {
+                MinMaxDense(dense.AsSpan(0, n)),
+                MinMaxGatherThenDense(values, levels, new double[n]),
+                MinMaxSeeded(values, levels),
+            })
+            {
+                Check(expected.Any == actual.Any
+                    && (!expected.Any
+                        || (BitConverter.DoubleToInt64Bits(expected.Min) == BitConverter.DoubleToInt64Bits(actual.Min)
+                            && BitConverter.DoubleToInt64Bits(expected.Max) == BitConverter.DoubleToInt64Bits(actual.Max))),
+                    "min/max alternative");
+            }
+
+            var longs = values.Select(v => BitConverter.DoubleToInt64Bits(v) >> 3).ToArray();
+            Check(MinMaxSkippingGeneric(longs, levels, LongCompare) == MinMaxSeededGeneric(longs, levels, LongCompare),
+                "int64 min/max");
         }
     }
 
@@ -397,6 +423,106 @@ internal static class NullableKernelProfile
         }
 
         return (min, max, !first);
+    }
+
+    private static readonly Comparison<long> LongCompare = (a, b) => a.CompareTo(b);
+
+    private static (double Min, double Max, bool Any) MinMaxGatherThenDense(double[] values, int[] levels, double[] scratch)
+    {
+        // Capacity is checked before each store: an all-null page brings an empty scratch array.
+        ref double dst = ref MemoryMarshal.GetArrayDataReference(scratch);
+        int idx = 0;
+        for (int i = 0; i < values.Length && idx < scratch.Length; i++)
+        {
+            Unsafe.Add(ref dst, idx) = values[i];
+            idx += levels[i] != 0 ? 1 : 0;
+        }
+
+        return MinMaxDense(scratch.AsSpan(0, idx));
+    }
+
+    /// <summary>
+    /// Every null replaced by a value already in the set, selected by mask: a duplicate never moves a min or a
+    /// max under any order, and a present value is never NaN, so the NaN test stays exact.
+    /// </summary>
+    private static (double Min, double Max, bool Any) MinMaxSeeded(double[] values, int[] levels)
+    {
+        int f = 0;
+        while (f < values.Length && (levels[f] == 0 || double.IsNaN(values[f]))) f++;
+        if (f == values.Length) return (0, 0, false);
+        long seed = BitConverter.DoubleToInt64Bits(values[f]);
+        double min = values[f], max = min;
+        ref long bits = ref Unsafe.As<double, long>(ref MemoryMarshal.GetArrayDataReference(values));
+        for (int i = f + 1; i < values.Length; i++)
+        {
+            long mask = -(long)(levels[i] != 0 ? 1 : 0);
+            double v = BitConverter.Int64BitsToDouble((Unsafe.Add(ref bits, i) & mask) | (seed & ~mask));
+            if (double.IsNaN(v)) continue;
+            if (v < min || (v == 0.0 && min == 0.0 && double.IsNegative(v))) min = v;
+            if (v > max || (v == 0.0 && max == 0.0 && !double.IsNegative(v))) max = v;
+        }
+
+        return (min, max, true);
+    }
+
+    // StatisticsCollector.ComputeMinMax<T>, as for INT64.
+    private static (long Min, long Max, bool Any) MinMaxSkippingGeneric(long[] values, int[] levels, Comparison<long> compare)
+    {
+        bool first = true;
+        long min = 0, max = 0;
+        for (int i = 0; i < values.Length; i++)
+        {
+            if (levels[i] == 0) continue;
+            long v = values[i];
+            if (first) { min = max = v; first = false; }
+            else
+            {
+                if (compare(v, min) < 0) min = v;
+                if (compare(v, max) > 0) max = v;
+            }
+        }
+
+        return (min, max, !first);
+    }
+
+    private static (long Min, long Max, bool Any) MinMaxGatherThenDenseGeneric(long[] values, int[] levels, long[] scratch, Comparison<long> compare)
+    {
+        // Capacity is checked before each store: an all-null page brings an empty scratch array.
+        ref long dst = ref MemoryMarshal.GetArrayDataReference(scratch);
+        int idx = 0;
+        for (int i = 0; i < values.Length && idx < scratch.Length; i++)
+        {
+            Unsafe.Add(ref dst, idx) = values[i];
+            idx += levels[i] != 0 ? 1 : 0;
+        }
+
+        if (idx == 0) return (0, 0, false);
+        long min = scratch[0], max = min;
+        for (int i = 1; i < idx; i++)
+        {
+            long v = scratch[i];
+            if (compare(v, min) < 0) min = v;
+            if (compare(v, max) > 0) max = v;
+        }
+
+        return (min, max, true);
+    }
+
+    private static (long Min, long Max, bool Any) MinMaxSeededGeneric(long[] values, int[] levels, Comparison<long> compare)
+    {
+        int f = 0;
+        while (f < values.Length && levels[f] == 0) f++;
+        if (f == values.Length) return (0, 0, false);
+        long seed = values[f], min = seed, max = seed;
+        for (int i = f + 1; i < values.Length; i++)
+        {
+            long mask = -(long)(levels[i] != 0 ? 1 : 0);
+            long v = (values[i] & mask) | (seed & ~mask);
+            if (compare(v, min) < 0) min = v;
+            if (compare(v, max) > 0) max = v;
+        }
+
+        return (min, max, true);
     }
 
     private static (double Min, double Max, bool Any) MinMaxDense(ReadOnlySpan<double> values)
