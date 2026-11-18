@@ -42,22 +42,24 @@ internal static class ByteArrayBounds
 
             int at = offsets[i];
             int length = offsets[i + 1] - at;
-            var value = data.Slice(at, length);
 
             if (minIdx < 0)
             {
                 minIdx = maxIdx = i;
-                min = max = value;
+                min = max = data.Slice(at, length);
                 (prefix, minKey, maxKey) = Keys(data, offsets, minIdx, maxIdx, min, max);
                 continue;
             }
 
-            if (length >= prefix && value.Slice(0, prefix).SequenceEqual(min.Slice(0, prefix)))
+            // Usually the bounds share no prefix (random strings) and there is nothing to check.
+            if (length >= prefix && (prefix == 0 || data.Slice(at, prefix).SequenceEqual(min.Slice(0, prefix))))
             {
                 ulong key = Key(data, at + prefix, length - prefix);
                 if (key > minKey && key < maxKey)
                     continue;
             }
+
+            var value = data.Slice(at, length);
 
             bool moved = false;
             if (value.SequenceCompareTo(min) < 0)
