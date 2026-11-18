@@ -17,8 +17,8 @@ namespace EngineeredWood.Parquet.Data;
 /// order of the keys with the top bit flipped. So a value is two word reads and a word compare or two,
 /// where a byte comparison of a decimal ran through its leading sign bytes, which are mostly equal.</para>
 /// <para>Ties keep the first position, as the byte comparison did; equal keys are equal bytes anyway.</para>
-/// <para>MEASURED per million DECIMAL(38,4) values (<c>stats-profile</c>): see the PR that introduced
-/// this class.</para>
+/// <para>MEASURED per million values (<c>stats-profile</c>), against the byte comparison: DECIMAL(38,4)
+/// 9.1 -> 2.2 ms, random fixed_size_binary(16) 6.4 -> 1.5.</para>
 /// </remarks>
 internal static class FixedLenBounds
 {
