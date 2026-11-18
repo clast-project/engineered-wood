@@ -77,6 +77,18 @@ if (args.Length > 0 && args[0] == "twopass-index-ab")
     return;
 }
 
+if (args.Length > 0 && args[0] == "nullable-kernels")
+{
+    Environment.ExitCode = NullableKernelProfile.Run(args);
+    return;
+}
+
+if (args.Length > 0 && args[0] is "nullable-profile" or "nullable-loop")
+{
+    Environment.ExitCode = await NullableColumnProfile.RunAsync(args);
+    return;
+}
+
 if (args.Length > 0 && args[0] == "rowfilter-ab")
 {
     Environment.ExitCode = await RowFilterAb.RunAsync(args);

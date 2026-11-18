@@ -11,6 +11,8 @@ namespace EngineeredWood.Core.Tests.Arrow;
 /// these cross-check every path against an independent scalar reference across counts that straddle the
 /// 16- and 32-element thresholds and their immediate neighbours — where a mis-sized tail or a partial
 /// final byte would show up.
+/// <para><c>ExpandToLevels</c> has no vector dispatch; its risk is the bit offset, so its tests take every
+/// offset from 0 to 15 over the same counts.</para>
 /// </summary>
 public class BitmapHelperTests
 {
@@ -162,6 +164,55 @@ public class BitmapHelperTests
         BitmapHelper.BuildFromBooleans(allFalse, bitmap2, count);
         for (int i = 0; i < count; i++)
             Assert.True((bitmap2[i >> 3] & (1 << (i & 7))) == 0, $"bit {i} should be clear");
+    }
+
+    /// <summary>
+    /// Every bit offset 0..15 (aligned, each unaligned shift, and past the first byte) over counts
+    /// with and without a partial final group, against a per-bit reference.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Counts))]
+    public void ExpandToLevels_MatchesPerBitReference(int count)
+    {
+        var random = new Random(count);
+        var bitmap = new byte[(count + 16 + 7) / 8];
+        random.NextBytes(bitmap);
+        for (int bitOffset = 0; bitOffset < 16; bitOffset++)
+        {
+            var levels = new int[count];
+            levels.AsSpan().Fill(-1);
+            int set = BitmapHelper.ExpandToLevels(bitmap, bitOffset, levels);
+
+            int expectedSet = 0;
+            for (int i = 0; i < count; i++)
+            {
+                int bit = bitOffset + i;
+                int expected = (bitmap[bit >> 3] >> (bit & 7)) & 1;
+                Assert.True(expected == levels[i], $"offset {bitOffset}, level {i}");
+                expectedSet += expected;
+            }
+
+            Assert.Equal(expectedSet, set);
+        }
+    }
+
+    [Fact]
+    public void ExpandToLevels_AllSetAndAllClear()
+    {
+        var levels = new int[100];
+        Assert.Equal(100, BitmapHelper.ExpandToLevels(Enumerable.Repeat((byte)0xFF, 13).ToArray(), 3, levels));
+        Assert.All(levels, l => Assert.Equal(1, l));
+        Assert.Equal(0, BitmapHelper.ExpandToLevels(new byte[13], 3, levels));
+        Assert.All(levels, l => Assert.Equal(0, l));
+    }
+
+    [Fact]
+    public void ExpandToLevels_RefusesBitsPastTheBitmap()
+    {
+        var bitmap = new byte[2];
+        Assert.Equal(0, BitmapHelper.ExpandToLevels(bitmap, 16, new int[0]));
+        Assert.Throws<ArgumentOutOfRangeException>(() => BitmapHelper.ExpandToLevels(bitmap, 1, new int[16]));
+        Assert.Throws<ArgumentOutOfRangeException>(() => BitmapHelper.ExpandToLevels(bitmap, -1, new int[1]));
     }
 
     [Fact]
