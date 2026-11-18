@@ -181,6 +181,47 @@ public class RleBitPackedEncoderWidthOneTests
     }
 
     /// <summary>
+    /// The writer sizes its buffers by ColumnChunkWriter.HybridBytes, which allows 2 bytes per 8 values at
+    /// width 1 plus 2 per page for a partial group. The packed path can outgrow an unbatched encode, but
+    /// must stay inside that.
+    /// </summary>
+    [Fact]
+    public void Packed_StaysWithinTheWriterBound()
+    {
+        var shapes = new List<int[]>();
+        foreach (int run in new[] { 1, 7, 8, 9, 15, 16, 17, 24, 25, 63, 64, 65, 8_191, 8_192 })
+        {
+            // Alternating runs of one length, and the same with a mixed byte between them.
+            var values = new List<int>();
+            for (int bit = 0; values.Count < 20_000; bit ^= 1)
+                values.AddRange(Filled(run, bit));
+            shapes.Add(values.ToArray());
+
+            values.Clear();
+            for (int bit = 0; values.Count < 20_000; bit ^= 1)
+            {
+                values.AddRange(Filled(run, bit));
+                values.AddRange(new[] { 0, 1, 1, 0, 1, 0, 0, 1 });
+            }
+
+            shapes.Add(values.ToArray());
+        }
+
+        for (int seed = 0; seed < 50; seed++)
+            shapes.Add(RandomRuns(new Random(seed), 1 + seed * 97, 1 + seed * 3));
+
+        foreach (var values in shapes)
+        {
+            foreach (int depth in Depths)
+            {
+                long bound = (values.Length / 8 + 1) * 2L;
+                int length = Encode(values, depth).Length;
+                Assert.True(length <= bound, $"{values.Length} values at depth {depth}: {length} bytes > {bound}");
+            }
+        }
+    }
+
+    /// <summary>
     /// The cost rule is a heuristic, so a single stream can come out a few bytes larger than the group path or
     /// an unbatched encode; summed over many, it must not. Checked at the writer's depth and at 8. At depth 2
     /// a header comes every other byte, which the rule's even share per byte models too coarsely: measured

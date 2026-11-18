@@ -461,10 +461,14 @@ public sealed record ParquetWriteOptions
     /// <remarks>
     /// <para>The output is spec-conformant either way; multi-group literal runs are what parquet-mr
     /// and arrow already emit, and every reader handles them (validated against ParquetSharp,
-    /// pyarrow, fastparquet, DuckDB and arrow-rs). Batching only removes run headers: every value
-    /// goes RLE or bit-packed exactly as unbatched, so no stream grows. It shrinks bit-packed-heavy
-    /// streams and gives decoders a contiguous block instead of header-interleaved single bytes,
-    /// which the reader's bulk unpacker needs. See doc/batched-bitpacked-runs.md.</para>
+    /// pyarrow, fastparquet, DuckDB and arrow-rs). At widths above 1, batching only removes run
+    /// headers: every value goes RLE or bit-packed exactly as unbatched, so no stream grows. Width-1
+    /// streams (flat definition levels, single-level repetition levels, RLE booleans) are instead
+    /// packed to bits and keep a short run bit-packed where RLE would cost more. That rule is a
+    /// heuristic: over many streams they come out smaller (14% random nulls: about 42% smaller than
+    /// unbatched), but a single stream can be a few bytes larger than unbatched. Batching gives
+    /// decoders a contiguous block instead of header-interleaved single bytes, which the reader's
+    /// bulk unpacker needs. See doc/batched-bitpacked-runs.md.</para>
     /// <para>Set <see langword="false"/> to reproduce the framing written before batching became the
     /// default, byte for byte.</para>
     /// </remarks>
