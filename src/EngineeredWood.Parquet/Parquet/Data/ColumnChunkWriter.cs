@@ -2165,9 +2165,13 @@ internal static class ColumnChunkWriter
     /// </summary>
     /// <remarks>
     /// Bounded as if <see cref="ParquetWriteOptions.BatchBitPackedRuns"/> were off, where every 8-value
-    /// bit-packed group carries its own 1-byte header: a bit per value over the width. Batching only
-    /// removes headers, so the bound holds either way. A run of 8 or more
-    /// repeats, a 1-byte header and one value, is never more. Each page can end on a partial group.
+    /// bit-packed group carries its own 1-byte header: a bit per value over the width. Batched, a literal
+    /// run of g groups costs g bytes per width and at most g headers, so no more. That holds for the
+    /// width-1 packed path too, though there a stream can outgrow its unbatched encoding: its RLE runs
+    /// cover 8 or more values and cost 2 bytes under 64 values and 3 under 8,192, never more than the
+    /// 2 bytes per 8 values allowed here, and the header that resumes literals after one belongs to that
+    /// literal run. A run of 8 or more repeats, a 1-byte header and one value, is never more. Each page
+    /// can end on a partial group.
     /// </remarks>
     private static long HybridBytes(long count, PageLayout pages, int bitWidth) =>
         bitWidth == 0 ? 0 : (count / 8 + pages.Count) * (1 + bitWidth);

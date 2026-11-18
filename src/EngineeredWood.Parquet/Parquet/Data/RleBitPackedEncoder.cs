@@ -1,6 +1,14 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Buffers.Binary;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+#if NET8_0_OR_GREATER
+using System.Runtime.Intrinsics;
+#endif
+
 namespace EngineeredWood.Parquet.Data;
 
 /// <summary>
@@ -27,6 +35,9 @@ internal sealed class RleBitPackedEncoder
     private int[]? _pending;
     private int _pendingCount;
 
+    // Width-1 values packed to bits, for EncodeBits; kept across pages like _buffer.
+    private byte[]? _bits;
+
     /// <param name="maxLiteralGroups">
     /// How many bit-packed groups may be batched into one literal run. The default of 1 emits a run
     /// header for every 8 values; raising it amortises that header across more values, shrinking
@@ -42,6 +53,12 @@ internal sealed class RleBitPackedEncoder
         _maxLiteralValues = maxLiteralGroups * 8;
         _buffer = new byte[initialCapacity];
     }
+
+    /// <summary>
+    /// Whether <see cref="Encode"/> takes the packed path at width 1 when batching. Off, it encodes as at any
+    /// other width; tests and the kernel harness compare the two.
+    /// </summary>
+    internal bool PackWidthOne { get; init; } = true;
 
     /// <summary>Number of bytes written.</summary>
     public int Length => _position;
@@ -59,11 +76,19 @@ internal sealed class RleBitPackedEncoder
     /// Encodes all values using the RLE/Bit-Packing Hybrid scheme.
     /// Runs of 8+ identical values are RLE-encoded; mixed values are collected
     /// into complete bit-packed groups of 8 (partial groups only at stream end).
+    /// At width 1 with batching, it takes the packed path in <see cref="EncodeBits"/> instead, which keeps a short run
+    /// in the literals where RLE would cost more.
     /// </summary>
     public void Encode(ReadOnlySpan<int> values)
     {
         if (_bitWidth == 0)
             return; // all values are 0, nothing to encode
+
+        if (_bitWidth == 1 && _maxLiteralValues > 8 && PackWidthOne)
+        {
+            EncodeBits(values);
+            return;
+        }
 
         _pending ??= new int[_maxLiteralValues];
         _pendingCount = 0;
@@ -85,6 +110,179 @@ internal sealed class RleBitPackedEncoder
     }
 
     /// <summary>
+    /// <see cref="Encode"/> at width 1, batched: definition levels of a flat column, RLE booleans. The values
+    /// are packed to bits first, and at width 1 a bit-packed group is one byte of that packing, so a literal
+    /// run is a byte copy. A run of identical values becomes RLE only where that is smaller than leaving it
+    /// in the literals; see <see cref="RlePays"/>.
+    /// </summary>
+    /// <remarks>
+    /// Like <see cref="Encode"/>, an RLE run starts only at a group boundary (literals go out in whole
+    /// groups) but may end anywhere, so the group grid moves with each RLE run: groups are read at any bit
+    /// offset, not only on byte boundaries.
+    /// </remarks>
+    private void EncodeBits(ReadOnlySpan<int> values)
+    {
+        int n = values.Length;
+        int byteCount = (n + 7) >> 3;
+
+        // 8 zero bytes past the packing, for ReadGroup and ReadWord to read into near the end.
+        if (_bits == null || _bits.Length < byteCount + 8)
+            _bits = new byte[byteCount + 8];
+        PackBits(values, _bits);
+        _bits.AsSpan(byteCount, 8).Clear();
+
+        int maxGroups = _maxLiteralValues >> 3;
+        int header = -1; // where the open literal run's header goes, or -1 when none is open
+        int groups = 0;
+        int p = 0;
+        while (p < n)
+        {
+            int group = ReadGroup(_bits, p);
+            if (group is 0 or 0xFF && n - p >= 8)
+            {
+                int run = RunLength(_bits, p, n, group & 1);
+                bool before = groups > 0;
+                // Literals after the run only ever count against RLE, so the look ahead is needed only when
+                // the run pays without them and not with them.
+                if (RlePays(run, before, literalsAfter: false, maxGroups)
+                    && (RlePays(run, before, literalsAfter: true, maxGroups)
+                        || !LiteralsFollow(_bits, p + run, n, group & 1, maxGroups)))
+                {
+                    CloseLiterals(header, groups);
+                    header = -1;
+                    groups = 0;
+                    WriteRleRun(group & 1, run);
+                    p += run;
+                    continue;
+                }
+            }
+
+            if (groups == 0)
+            {
+                EnsureCapacity(1 + maxGroups);
+                header = _position++;
+            }
+
+            // Bits past n were packed as 0: the final group's padding.
+            _buffer[_position++] = (byte)group;
+            p += 8;
+            if (++groups == maxGroups)
+            {
+                CloseLiterals(header, groups);
+                groups = 0;
+            }
+        }
+
+        CloseLiterals(header, groups);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="run"/> identical bits at a group boundary cost less as an RLE run than left in
+    /// the literals. RLE costs its header and a value byte; left in, the run costs a byte per 8 bits and a
+    /// share of a literal header per <paramref name="maxGroups"/> bytes. Either choice may also cost a whole
+    /// literal header: RLE when it splits literals on both sides into two runs, leaving it in when it opens a
+    /// literal run that nothing else shares. Ties stay literal.
+    /// </summary>
+    private static bool RlePays(int run, bool literalsBefore, bool literalsAfter, int maxGroups)
+    {
+        int rle = VarintLength((uint)run << 1) + 1 + (literalsBefore && literalsAfter ? 1 : 0);
+        int literal = !literalsBefore && !literalsAfter ? 1 : 0;
+        // rle < literal + (run / 8) * (maxGroups + 1) / maxGroups, in integers.
+        return (long)(rle - literal) * 8 * maxGroups < (long)run * (maxGroups + 1);
+    }
+
+    /// <summary>
+    /// Whether literals resume at <paramref name="q"/>, where a run of <paramref name="bit"/> just ended: not
+    /// at the end of the stream, and not when the run starting there pays as RLE on its own. RLE runs that
+    /// follow one another start each on a group boundary and need no literal header between them.
+    /// </summary>
+    private static bool LiteralsFollow(byte[] bits, int q, int n, int bit, int maxGroups) =>
+        q < n && !RlePays(RunLength(bits, q, n, bit ^ 1), literalsBefore: false, literalsAfter: true, maxGroups);
+
+    private void CloseLiterals(int header, int groups)
+    {
+        if (groups > 0)
+            _buffer[header] = (byte)((groups << 1) | 1); // groups <= 63, so a one-byte varint
+    }
+
+    /// <summary>Packs width-1 values LSB first, eight to a byte; bits past the end are 0.</summary>
+    private static void PackBits(ReadOnlySpan<int> values, byte[] bits)
+    {
+        int n = values.Length;
+        int i = 0;
+        ref int v = ref MemoryMarshal.GetReference(values);
+#if NET8_0_OR_GREATER
+        if (Vector256.IsHardwareAccelerated)
+        {
+            for (; i + 8 <= n; i += 8)
+            {
+                // Bit 0 of each value is what bit-packing at width 1 keeps; move it to the sign bit.
+                var lanes = Vector256.ShiftLeft(Vector256.LoadUnsafe(ref v, (nuint)i), 31);
+                bits[i >> 3] = (byte)Vector256.ExtractMostSignificantBits(lanes);
+            }
+        }
+#endif
+        for (; i + 8 <= n; i += 8)
+        {
+            int b = 0;
+            for (int j = 0; j < 8; j++)
+                b |= (Unsafe.Add(ref v, i + j) & 1) << j;
+            bits[i >> 3] = (byte)b;
+        }
+
+        if (i < n)
+        {
+            int b = 0;
+            for (int j = 0; i + j < n; j++)
+                b |= (Unsafe.Add(ref v, i + j) & 1) << j;
+            bits[i >> 3] = (byte)b;
+        }
+    }
+
+    /// <summary>The 8 bits from bit <paramref name="p"/>, LSB first.</summary>
+    private static int ReadGroup(byte[] bits, int p)
+    {
+        int i = p >> 3;
+        return ((bits[i] | (bits[i + 1] << 8)) >> (p & 7)) & 0xFF;
+    }
+
+    /// <summary>The 64 bits from bit <paramref name="p"/>, LSB first.</summary>
+    private static ulong ReadWord(byte[] bits, int p)
+    {
+        int i = p >> 3, s = p & 7;
+        ulong word = BinaryPrimitives.ReadUInt64LittleEndian(bits.AsSpan(i, 8)) >> s;
+        return s == 0 ? word : word | ((ulong)bits[i + 8] << (64 - s));
+    }
+
+    /// <summary>How many bits from <paramref name="p"/> equal <paramref name="bit"/>, stopping at <paramref name="n"/>.</summary>
+    private static int RunLength(byte[] bits, int p, int n, int bit)
+    {
+        ulong flip = bit != 0 ? ulong.MaxValue : 0;
+        int q = p;
+        while (q < n)
+        {
+            ulong differ = ReadWord(bits, q) ^ flip;
+            if (differ != 0)
+                return Math.Min(q + BitOperations.TrailingZeroCount(differ), n) - p;
+            q += 64;
+        }
+
+        return n - p;
+    }
+
+    private static int VarintLength(uint value)
+    {
+        int length = 1;
+        while (value > 0x7F)
+        {
+            value >>= 7;
+            length++;
+        }
+
+        return length;
+    }
+
+    /// <summary>
     /// Encodes a sequence already known as runs — <paramref name="values"/>[r] repeated
     /// <paramref name="lengths"/>[r] times — without materializing the values it stands for.
     ///
@@ -92,7 +290,8 @@ internal sealed class RleBitPackedEncoder
     /// substitution rather than a second encoding: <see cref="Encode"/>'s only use of the expanded form is
     /// to REDISCOVER these runs. Adjacent runs holding the same value are the one case where the two part
     /// company — they encode as two RLE runs here and one there — so callers that can merge them should
-    /// (<see cref="DictionaryEncoder"/> does).</para>
+    /// (<see cref="DictionaryEncoder"/> does). The other is width 1 with batching, where <see cref="Encode"/>
+    /// takes its packed path; dictionary indices are width 1 only for a dictionary of two values.</para>
     /// </summary>
     public void EncodeRuns(ReadOnlySpan<int> values, ReadOnlySpan<int> lengths)
     {

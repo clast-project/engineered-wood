@@ -187,6 +187,41 @@ before the growth fix:
 Writes cost the same either way, within run-to-run noise. Reads are equal or faster, and files are
 smaller. The PR that flipped the default records the numbers after the fix.
 
+## Width 1
+
+Width-1 streams are the definition levels of flat columns, the repetition levels of single-level
+lists, and RLE booleans. Batched, they take their own path in `RleBitPackedEncoder.Encode`.
+At width 1 a bit-packed group of 8 values is one byte, so the encoder packs the values to bits
+(eight `int`s to a byte, vectorised) and copies groups as bytes. It takes an RLE run only where
+that is smaller than leaving the run in the literals, which the group-by-group path does not ask:
+- RLE costs a header and a value byte, and a second literal header if the run splits literals on
+  both sides.
+- Left in, a run costs a byte per 8 values, and a whole header if it opens a literal run nothing
+  else shares.
+- Whether literals follow is a one-run lookahead, taken only when the answer changes the choice.
+  RLE runs that follow each other each start on a group boundary and share no header.
+
+Like the group path, an RLE run starts on a group boundary but may end anywhere, so groups are read
+at any bit offset. Unbatched, width 1 keeps the group path, so `BatchBitPackedRuns = false` still
+writes the old framing byte for byte.
+
+The rule is a heuristic. A single stream can come out a few bytes larger than the group path or an
+unbatched encode would make it: up to 4 bytes on 2,000-value streams of random runs. Summed over
+many streams it is never larger at depths 8 and 63. At depth 2 it is 0.07% over the group path for
+runs up to 64; the writer never uses that depth. So "batching only removes headers" holds at every
+width but 1.
+
+Measured, 1M values with random nulls, ms and bytes of level data:
+
+| Nulls | Group path | Packed | Group path bytes | Packed bytes |
+| ---: | ---: | ---: | ---: | ---: |
+| 0% | 0.30 | 0.19 | 4 | 4 |
+| 14% | 4.51 | 0.69 | 154,999 | 124,247 |
+| 50% | 8.32 | 0.41 | 128,355 | 126,985 |
+
+At 14% the packed stream is also smaller than a straight copy of the validity bitmap (126,961),
+because long runs still go RLE.
+
 ## Not covered by the prototype
 
 - **Adaptive depth.** The cap is a flat 63 groups. A writer could choose depth per stream based on
