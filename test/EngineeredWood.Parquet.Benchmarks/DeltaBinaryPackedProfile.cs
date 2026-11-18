@@ -30,7 +30,7 @@ internal static class DeltaBinaryPackedProfile
 
         Console.WriteLine($"{rows:N0} rows, one column, uncompressed, dictionary off, in memory; best of {rounds} (ms).");
         Console.WriteLine("| Column | Read PLAIN | Read DELTA | Decoder alone | Write PLAIN | Write DELTA | Encoder alone | Bytes PLAIN | Bytes DELTA |");
-        Console.WriteLine("|---|---|---|---|---|---|---|");
+        Console.WriteLine("|---|---|---|---|---|---|---|---|---|");
 
         foreach (var (name, long64, values) in Shapes(rows))
         {
