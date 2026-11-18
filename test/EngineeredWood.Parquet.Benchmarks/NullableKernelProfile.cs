@@ -50,11 +50,16 @@ internal static class NullableKernelProfile
         Add("W gather: by bitmap byte", k => () => GatherByBitmap(k.Values, k.Bitmap, k.Rows, k.Dense));
         Add("W stats: skip nulls by int[] (today)", k => () => k.Sink = MinMaxSkipping(k.Values, k.IntLevels));
         Add("W stats: over the gathered values", k => () => k.Sink = MinMaxDense(k.Dense.AsSpan(0, k.NonNull)));
-        Add("W def RLE: encoder over int[] (today)", k => () => EncodeLevels(k.IntLevels));
-        Add("W def RLE: bitmap bytes as bit-packed", k => () => k.Count = EncodeFromBitmap(k.Bitmap, k.Rows, k.Encoded));
+        // The writer's default (BatchBitPackedRuns = false) heads every 8-value literal group; batching puts up
+        // to 63 groups under one header. Both sides are timed at both settings.
+        Add("W def RLE: encoder over int[] (today, 1 group/header)", k => () => EncodeLevels(k.IntLevels, 1));
+        Add("W def RLE: bitmap bytes as bit-packed, 1 group/header", k => () => k.Count = EncodeFromBitmap(k.Bitmap, k.Rows, k.Encoded, 1));
+        Add("W def RLE: encoder over int[], batched 63", k => () => EncodeLevels(k.IntLevels, RleBitPackedEncoder.MaxLiteralGroups));
+        Add("W def RLE: bitmap bytes as bit-packed, batched 63", k => () => k.Count = EncodeFromBitmap(k.Bitmap, k.Rows, k.Encoded, RleBitPackedEncoder.MaxLiteralGroups));
 
         // ---- read ----
-        Add("R def decode: LevelDecoder (today)", k => () => LevelDecoder.DecodeV2(k.EncodedLevels, 1, k.Rows, k.ByteLevels, out k.Count));
+        Add("R def decode: LevelDecoder (today, 1 group/header)", k => () => LevelDecoder.DecodeV2(k.EncodedLevels, 1, k.Rows, k.ByteLevels, out k.Count));
+        Add("R def decode: LevelDecoder, batched 63", k => () => LevelDecoder.DecodeV2(k.EncodedLevelsBatched, 1, k.Rows, k.ByteLevels, out k.Count));
         Add("R bitmap: BuildFromEquality (today)", k => () => BitmapHelper.BuildFromEquality(k.ByteLevels, k.OutBitmap, k.Rows, 1));
         Add("R scatter: per bit, reverse (today)", k => () => { k.ResetScatter(); ScatterPerBit(k.ScatterValues, k.Bitmap, k.Rows, k.NonNull); });
         Add("R scatter: per byte, early exit", k => () => { k.ResetScatter(); ScatterByByte(k.ScatterValues, k.Bitmap, k.Rows, k.NonNull); });
@@ -80,6 +85,7 @@ internal static class NullableKernelProfile
         public readonly double[] ScatterValues;
         public readonly byte[] OutBitmap;
         public readonly byte[] EncodedLevels;
+        public readonly byte[] EncodedLevelsBatched;
         public readonly byte[] Encoded;
         public int Count;
         public double Sink;
@@ -103,9 +109,8 @@ internal static class NullableKernelProfile
             OutBitmap = new byte[(Rows + 7) / 8 + 8];
             Encoded = new byte[Rows / 4 + 1024];
             NonNull = LevelsFromIsNull(array, IntLevels);
-            var encoder = new RleBitPackedEncoder(1, maxLiteralGroups: RleBitPackedEncoder.MaxLiteralGroups);
-            encoder.Encode(IntLevels);
-            EncodedLevels = encoder.ToArray();
+            EncodedLevels = EncodeLevels(IntLevels, 1);
+            EncodedLevelsBatched = EncodeLevels(IntLevels, RleBitPackedEncoder.MaxLiteralGroups);
             GatherBranchy(Values, IntLevels, Dense);
         }
 
@@ -144,13 +149,18 @@ internal static class NullableKernelProfile
                     Check(a[i] == k.Values[i] && b[i] == k.Values[i], "scatter");
             }
 
-            // The bit-packed copy must decode to the same levels.
-            int len = EncodeFromBitmap(k.Bitmap, k.Rows, k.Encoded);
-            var decoded = new byte[k.Rows];
-            LevelDecoder.DecodeV2(k.Encoded.AsSpan(0, len), 1, k.Rows, decoded, out int m);
-            Check(m == n, "encode count");
-            for (int i = 0; i < k.Rows; i++)
-                Check(decoded[i] == expectInts[i], "encode levels");
+            // The bit-packed copy must decode to the same levels, at either literal batching.
+            foreach (int groups in new[] { 1, RleBitPackedEncoder.MaxLiteralGroups })
+            {
+                int len = EncodeFromBitmap(k.Bitmap, k.Rows, k.Encoded, groups);
+                var decoded = new byte[k.Rows];
+                LevelDecoder.DecodeV2(k.Encoded.AsSpan(0, len), 1, k.Rows, decoded, out int m);
+                Check(m == n, "encode count");
+                for (int i = 0; i < k.Rows; i++)
+                    Check(decoded[i] == expectInts[i], "encode levels");
+                int today = EncodeLevels(expectInts, groups).Length;
+                Console.WriteLine($"  {k.Rows - n} nulls, {groups} group(s)/header: encoder {today:N0} bytes, bitmap copy {len:N0} bytes");
+            }
         }
 
         Console.WriteLine("All alternatives verified against today's output.");
@@ -352,17 +362,18 @@ internal static class NullableKernelProfile
         return min + max;
     }
 
-    private static void EncodeLevels(int[] levels)
+    private static byte[] EncodeLevels(int[] levels, int maxLiteralGroups)
     {
-        var encoder = new RleBitPackedEncoder(1, maxLiteralGroups: RleBitPackedEncoder.MaxLiteralGroups);
+        var encoder = new RleBitPackedEncoder(1, maxLiteralGroups: maxLiteralGroups);
         encoder.Encode(levels);
+        return encoder.ToArray();
     }
 
     /// <summary>
     /// Width-1 levels straight from the validity bitmap: Parquet bit-packs LSB first, as Arrow's bitmap is laid
     /// out, so a literal run is the bitmap's bytes. Runs of 8+ all-set or all-clear bytes become RLE runs.
     /// </summary>
-    private static int EncodeFromBitmap(ReadOnlySpan<byte> bitmap, int rows, Span<byte> output)
+    private static int EncodeFromBitmap(ReadOnlySpan<byte> bitmap, int rows, Span<byte> output, int maxLiteralGroups)
     {
         const int MinRleBytes = 8;
         int pos = 0;
@@ -378,7 +389,7 @@ internal static class NullableKernelProfile
                 while (e < full && bitmap[e] == v) e++;
                 if (e - b >= MinRleBytes)
                 {
-                    pos = EmitLiteral(bitmap, literalStart, b, output, pos);
+                    pos = EmitLiteral(bitmap, literalStart, b, output, pos, maxLiteralGroups);
                     pos = WriteVarint(output, pos, (uint)((e - b) * 8) << 1);
                     output[pos++] = (byte)(v & 1);
                     literalStart = e;
@@ -394,15 +405,15 @@ internal static class NullableKernelProfile
 
         // The tail (and any partial byte) goes in the last literal run; its padding bits are past the count.
         int end = (rows + 7) >> 3;
-        pos = EmitLiteral(bitmap, literalStart, end, output, pos);
+        pos = EmitLiteral(bitmap, literalStart, end, output, pos, maxLiteralGroups);
         return pos;
     }
 
-    private static int EmitLiteral(ReadOnlySpan<byte> bitmap, int start, int end, Span<byte> output, int pos)
+    private static int EmitLiteral(ReadOnlySpan<byte> bitmap, int start, int end, Span<byte> output, int pos, int maxLiteralGroups)
     {
         while (start < end)
         {
-            int groups = Math.Min(end - start, 63);
+            int groups = Math.Min(end - start, maxLiteralGroups);
             output[pos++] = (byte)((groups << 1) | 1);
             bitmap.Slice(start, groups).CopyTo(output.Slice(pos));
             pos += groups;
