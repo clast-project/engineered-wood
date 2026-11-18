@@ -86,12 +86,58 @@ public class RleBitPackedEncoderBatchingTests
         }
         data.Add("mixed", 4, mixed.ToArray());
 
+        // Runs of 1 to 20, as clustered dictionary indices come: a run of 8 to 15 often arrives exactly at a
+        // group boundary with literals still pending, which must go RLE batched or not.
+        data.Add("runs-1-20", 10, RandomRuns(new Random(7), 4096, maxRun: 20, maxValue: 1000));
+
         // Not a multiple of 8 — exercises the padded final group.
         var ragged = new int[1003];
         for (int i = 0; i < ragged.Length; i++) ragged[i] = i % 5;
         data.Add("ragged-length", 3, ragged);
 
         return data;
+    }
+
+    private static int[] RandomRuns(Random random, int count, int maxRun, int maxValue)
+    {
+        var values = new List<int>(count);
+        while (values.Count < count)
+        {
+            int length = random.Next(1, maxRun + 1);
+            int value = random.Next(maxValue);
+            for (int j = 0; j < length && values.Count < count; j++)
+                values.Add(value);
+        }
+
+        return values.ToArray();
+    }
+
+    /// <summary>
+    /// Batching may only drop run headers. Unbatched, the literal buffer is empty at every group boundary;
+    /// batched it is not, and a run of 8 or more arriving there must still go RLE. So each depth must choose
+    /// RLE for exactly the same values as depth 1, which shows as never being larger, across random run
+    /// structures at several widths.
+    /// </summary>
+    [Theory]
+    [InlineData(1, 12)]
+    [InlineData(3, 16)]
+    [InlineData(10, 20)]
+    [InlineData(10, 40)]
+    public void Batching_NeverGrowsRandomRuns(int bitWidth, int maxRun)
+    {
+        for (int seed = 0; seed < 50; seed++)
+        {
+            var values = RandomRuns(new Random(seed), 2_000 + seed, maxRun, 1 << bitWidth);
+            int unbatched = Encode(values, bitWidth, 1).Length;
+            foreach (int groups in new[] { 2, 8, RleBitPackedEncoder.MaxLiteralGroups })
+            {
+                var encoded = Encode(values, bitWidth, groups);
+                Assert.True(encoded.Length <= unbatched,
+                    $"seed {seed}: {groups} groups grew {unbatched} to {encoded.Length} bytes");
+                Assert.True(values.AsSpan().SequenceEqual(Decode(encoded, bitWidth, values.Length)),
+                    $"seed {seed}: {groups} groups did not round-trip");
+            }
+        }
     }
 
     [Theory]

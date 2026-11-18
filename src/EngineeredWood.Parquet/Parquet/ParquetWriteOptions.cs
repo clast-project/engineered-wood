@@ -453,20 +453,22 @@ public sealed record ParquetWriteOptions
     public IReadOnlyDictionary<string, Apache.Arrow.Operations.Shredding.ShredSchema>? VariantShredSchemas { get; init; }
 
     /// <summary>
-    /// Prototype. When <see langword="true"/>, consecutive bit-packed groups in RLE/bit-packed
-    /// hybrid streams — definition levels, repetition levels, and dictionary indices — are batched
-    /// into a single literal run (up to 63 groups) instead of emitting a run header for every
-    /// 8 values. Default: <see langword="false"/>.
+    /// When <see langword="true"/>, consecutive bit-packed groups in RLE/bit-packed hybrid streams —
+    /// definition levels, repetition levels, dictionary indices and RLE booleans — are batched into a
+    /// single literal run (up to 63 groups) instead of emitting a run header for every 8 values.
+    /// Default: <see langword="true"/>.
     /// </summary>
     /// <remarks>
-    /// <para>The output stays fully spec-conformant either way; multi-group literal runs are what
-    /// parquet-mr and arrow already emit, and every reader handles them. Batching shrinks
-    /// bit-packed-heavy streams (most visibly V2 repetition levels, which are stored uncompressed)
-    /// and gives decoders a contiguous block instead of header-interleaved single bytes.</para>
-    /// <para>Prototype flag: this changes the bytes of every file written, so it is opt-in until the
-    /// size and decode-speed trade-off has been measured across representative data.</para>
+    /// <para>The output is spec-conformant either way; multi-group literal runs are what parquet-mr
+    /// and arrow already emit, and every reader handles them (validated against ParquetSharp,
+    /// pyarrow, fastparquet, DuckDB and arrow-rs). Batching only removes run headers: every value
+    /// goes RLE or bit-packed exactly as unbatched, so no stream grows. It shrinks bit-packed-heavy
+    /// streams and gives decoders a contiguous block instead of header-interleaved single bytes,
+    /// which the reader's bulk unpacker needs. See doc/batched-bitpacked-runs.md.</para>
+    /// <para>Set <see langword="false"/> to reproduce the framing written before batching became the
+    /// default, byte for byte.</para>
     /// </remarks>
-    public bool BatchBitPackedRuns { get; init; }
+    public bool BatchBitPackedRuns { get; init; } = true;
 
     /// <summary>
     /// Number of bit-packed groups to batch per literal run, derived from

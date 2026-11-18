@@ -1,7 +1,9 @@
-# Batched bit-packed literal runs (prototype)
+# Batched bit-packed literal runs
 
-A writer-side prototype, separate from the [fixed-length list fast path](fixed-list-fast-path.md)
-but discovered while benchmarking it. Opt-in via `ParquetWriteOptions.BatchBitPackedRuns`.
+A writer-side change, separate from the [fixed-length list fast path](fixed-list-fast-path.md)
+but discovered while benchmarking it. Controlled by `ParquetWriteOptions.BatchBitPackedRuns`, which
+started as an opt-in prototype and has been **on by default** since November 2026 (see
+[Default](#default)). Set it to `false` to write the old framing byte for byte.
 
 ## The problem
 
@@ -149,6 +151,41 @@ the suite: the full Parquet suite passes with `BatchBitPackedRuns` defaulted to 
 falls by a constant ~0.123 bytes per value per RLE stream (12.3% / 6.0% / 1.7% of three
 representative uncompressed V2 files). Size can never grow: the RLE-versus-literal decision in
 `AppendRun` does not consult the batching depth, so batching only ever removes run headers.
+
+## Default
+
+Flipped on in November 2026, after the flag had shipped opt-in through v0.2.0, v0.3.0 and v0.4.0.
+
+**A growth bug came first.** Timing the flip turned up a stream that batching made *larger*:
+dictionary indices in runs of 1 to 20 (1M rows, cardinality 1000) grew 551,110 -> 554,432 bytes.
+`AppendRun` sent a run of 8 or more straight to RLE only when the literal buffer was *empty*.
+Unbatched, the buffer is empty at every group boundary, since each group is flushed as it fills.
+Batched, earlier groups are still pending there, so a run of 8 to 15 arriving at a boundary was
+bit-packed whole instead. `Batching_NeverGrowsTheStream` missed it because none of its shapes
+delivers such a run exactly at a boundary with literals pending. The check is now "at a group
+boundary" (`(_pendingCount & 7) == 0`), with any pending whole groups flushed first. Unbatched,
+that is the same condition as before, so depth-1 output is unchanged. Batched, each value now goes
+RLE or bit-packed exactly as it would unbatched, so batching only ever removes headers.
+`Batching_NeverGrowsRandomRuns` sweeps random run structures across widths 1 to 10 and depths 2,
+8 and 63 to hold that.
+
+**Measured for the flip** (`dotnet run -c Release -f net10.0 -- batched-write`): 1M rows, one
+column, uncompressed, in memory, off and on timed alternately, best of 15. Write and read in ms,
+before the growth fix:
+
+| Column | Write off | Write on | Read off | Read on | Size on/off |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| dict 1000, random | 24.07 | 24.15 | 6.57 | 5.54 | 91.2% |
+| dict 1000, random, 14% null | 26.80 | 27.01 | 8.55 | 7.50 | 88.1% |
+| dict 16, random | 15.47 | 15.14 | 6.09 | 5.12 | 80.5% |
+| dict 1000, runs of 1-20 | 13.35 | 13.44 | 6.18 | 6.08 | 100.6% (the bug) |
+| list<int64> length 3 | 81.70 | 77.79 | 17.58 | 16.74 | 95.8% |
+| list<int64> length 0-5 | 146.85 | 146.44 | 60.46 | 60.46 | 95.4% |
+| bool, 14% null | 20.49 | 19.82 | 8.67 | 8.06 | 61.2% |
+| double, 14% null | 8.33 | 8.79 | 3.56 | 3.29 | 99.1% |
+
+Writes cost the same either way, within run-to-run noise. Reads are equal or faster, and files are
+smaller. The PR that flipped the default records the numbers after the fix.
 
 ## Not covered by the prototype
 
