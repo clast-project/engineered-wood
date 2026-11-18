@@ -298,6 +298,45 @@ public class AdvancedEncoderTests
         Assert.Equal(400, encoded.Length); // 100 * 4 bytes
     }
 
+    /// <summary>
+    /// The null-skipping overloads take the whole Arrow buffer plus an offset into both it and the
+    /// definition levels. Counts past 32 reach the SIMD kernels on every x64 and ARM64 machine.
+    /// </summary>
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(0, 5)]
+    [InlineData(3, 40)]
+    [InlineData(7, 1000)]
+    public void ByteStreamSplit_SkipsNulls(int offset, int numValues)
+    {
+        var random = new Random(offset * 1000 + numValues);
+        int total = offset + numValues + 4;
+        var doubles = new double[total];
+        var floats = new float[total];
+        var defLevels = new int[total];
+        for (int i = 0; i < total; i++)
+        {
+            doubles[i] = random.NextDouble() * 1e6 - 5e5;
+            floats[i] = (float)doubles[i];
+            defLevels[i] = random.Next(4) == 0 ? 0 : 1;
+        }
+
+        var keep = Enumerable.Range(offset, numValues).Where(i => defLevels[i] != 0).ToArray();
+        int nonNullCount = keep.Length;
+
+        var floatDest = new byte[nonNullCount * sizeof(float)];
+        ByteStreamSplitEncoder.EncodeFloatsTo(floats, offset, numValues, nonNullCount, defLevels, floatDest);
+        Assert.Equal(ByteStreamSplitEncoder.EncodeFloats(keep.Select(i => floats[i]).ToArray()), floatDest);
+
+        var doubleDest = new byte[nonNullCount * sizeof(double)];
+        ByteStreamSplitEncoder.EncodeDoublesTo(doubles, offset, numValues, nonNullCount, defLevels, doubleDest);
+        Assert.Equal(ByteStreamSplitEncoder.EncodeDoubles(keep.Select(i => doubles[i]).ToArray()), doubleDest);
+
+        var decoded = new double[nonNullCount];
+        ByteStreamSplitDecoder.DecodeDoubles(doubleDest, decoded, nonNullCount);
+        Assert.Equal(keep.Select(i => doubles[i]), decoded);
+    }
+
     // ── DeltaLengthByteArray ──
 
     [Fact]
