@@ -71,16 +71,6 @@ internal static class DeltaBinaryPackedProfile
                 $"| {name} | {rPlain:F2} | {rDelta:F2} | {decode:F2} | {wPlain:F2} | {wDelta:F2} | {encode:F2} | {filePlain.Length:N0} | {fileDelta.Length:N0} |");
         }
 
-        Console.WriteLine();
-        Console.WriteLine("Prototype kernels, ms per stream (int64 full width left out: widths over 56 take another path).");
-        Console.WriteLine("| Column | Decode shipped | Unpack only | Unpack + sum fused |");
-        Console.WriteLine("|---|---|---|---|");
-        foreach (var (name, long64, values) in Shapes(rows))
-        {
-            if (!(long64 && name.Contains("full width")))
-                DeltaBinaryPackedKernels.Run(name, values, long64);
-        }
-
         return 0;
     }
 

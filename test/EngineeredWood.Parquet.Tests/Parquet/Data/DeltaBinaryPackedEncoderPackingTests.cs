@@ -107,6 +107,110 @@ public class DeltaBinaryPackedEncoderPackingTests
         }
     }
 
+    public static TheoryData<int, int, int> Layouts()
+    {
+        // Block size, miniblocks, width: miniblocks of 32, 64 and 128 values, at widths either side of
+        // the decoder's one-read limit (56) and its full-width two-read path.
+        var data = new TheoryData<int, int, int>();
+        foreach (var (block, miniblocks) in new[] { (128, 4), (64, 2), (96, 3), (256, 4), (128, 1), (512, 16) })
+        {
+            foreach (int width in new[] { 0, 1, 7, 8, 13, 31, 32, 33, 55, 56, 57, 63, 64 })
+                data.Add(block, miniblocks, width);
+        }
+
+        return data;
+    }
+
+    [Theory]
+    [MemberData(nameof(Layouts))]
+    public void Decoder_OtherBlockLayouts(int blockSize, int miniblockCount, int width)
+    {
+        // Streams in layouts other writers may choose, each followed by 0 to 20 bytes of whatever data
+        // comes next in the page: the last miniblock is then read with and without room for whole
+        // 8- and 16-byte reads, and the decoder must stop where the stream ends.
+        var random = new Random(blockSize * 100 + miniblockCount * 10 + width);
+        foreach (int count in new[] { 1, 2, 33, 200, 1000 })
+        {
+            long[] values = Int64s(random, count, () => width);
+            int[] ints = Array.ConvertAll(Int32s(random, count, () => Math.Min(32, width)), v => (int)v);
+            byte[] stream64 = Reference(values, long64: true, blockSize, miniblockCount);
+            byte[] stream32 = Reference(Array.ConvertAll(ints, v => (long)v), long64: false, blockSize, miniblockCount);
+
+            foreach (int trailing in new[] { 0, 1, 7, 8, 9, 15, 16, 20 })
+            {
+                var data64 = new byte[stream64.Length + trailing];
+                stream64.CopyTo(data64, 0);
+                data64.AsSpan(stream64.Length).Fill(0xA5);
+                var decoder64 = new DeltaBinaryPackedDecoder(data64);
+                var longs = new long[count];
+                decoder64.DecodeInt64s(longs);
+                Assert.Equal(values, longs);
+                Assert.Equal(stream64.Length, decoder64.BytesConsumed);
+
+                var data32 = new byte[stream32.Length + trailing];
+                stream32.CopyTo(data32, 0);
+                data32.AsSpan(stream32.Length).Fill(0xA5);
+                var decoder32 = new DeltaBinaryPackedDecoder(data32);
+                var decoded = new int[count];
+                decoder32.DecodeInt32s(decoded);
+                Assert.Equal(ints, decoded);
+                Assert.Equal(stream32.Length, decoder32.BytesConsumed);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A stream claiming one miniblock of 2^30 values at width 32, with 10 values and only the 8 bytes
+    /// of the first two deltas (1 and 2). Its size, 2^32 bytes, wraps to 0 in 32 bits: the decoder then
+    /// took the miniblock as fitting and read the other deltas from past the end of the data. Past the
+    /// end here is 0xFF, outside the span.
+    /// </summary>
+    [Fact]
+    public void Decoder_MiniblockSizeOverflowing32Bits_IsRefused()
+    {
+        byte[] stream = HugeMiniblock(blockSizeVarint: [0x80, 0x80, 0x80, 0x80, 0x04]); // 1 << 30
+        var backing = new byte[stream.Length + 64];
+        stream.CopyTo(backing, 0);
+        backing.AsSpan(stream.Length).Fill(0xFF);
+
+        Assert.Throws<InvalidDataException>(() =>
+            new DeltaBinaryPackedDecoder(backing.AsSpan(0, stream.Length)).DecodeInt32s(new int[10]));
+        Assert.Throws<InvalidDataException>(() =>
+            new DeltaBinaryPackedDecoder(backing.AsSpan(0, stream.Length)).DecodeInt64s(new long[10]));
+    }
+
+    /// <summary>
+    /// As above but 2^20 values, a 4 MiB miniblock that fits 32 bits and not the data: the bytes past
+    /// the end read as zeros, as they always have, so the deltas after the first two are 0.
+    /// </summary>
+    [Fact]
+    public void Decoder_TruncatedMiniblock_ReadsZerosPastTheEnd()
+    {
+        byte[] stream = HugeMiniblock(blockSizeVarint: [0x80, 0x80, 0x40]); // 1 << 20
+        var backing = new byte[stream.Length + 64];
+        stream.CopyTo(backing, 0);
+        backing.AsSpan(stream.Length).Fill(0xFF);
+
+        var ints = new int[10];
+        new DeltaBinaryPackedDecoder(backing.AsSpan(0, stream.Length)).DecodeInt32s(ints);
+        Assert.Equal(new[] { 0, 1, 3, 3, 3, 3, 3, 3, 3, 3 }, ints);
+
+        var longs = new long[10];
+        new DeltaBinaryPackedDecoder(backing.AsSpan(0, stream.Length)).DecodeInt64s(longs);
+        Assert.Equal(new long[] { 0, 1, 3, 3, 3, 3, 3, 3, 3, 3 }, longs);
+    }
+
+    /// <summary>
+    /// One block of one miniblock of the given size, 10 values from 0, min delta 0, width 32, and the
+    /// first two deltas only: 1 and 2.
+    /// </summary>
+    private static byte[] HugeMiniblock(byte[] blockSizeVarint) =>
+    [
+        .. blockSizeVarint, 0x01, 0x0A, 0x00, // block size, 1 miniblock, 10 values, first value 0
+        0x00, 0x20,                           // min delta 0, width 32
+        0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    ];
+
     [Fact]
     public void MixedWidthsPerMiniblock_MatchReference()
     {
@@ -258,16 +362,18 @@ public class DeltaBinaryPackedEncoderPackingTests
 
     /// <summary>
     /// The encoding as written before word packing: each remainder ORed into cleared bytes one byte at a
-    /// time. Deltas wrap at 32 bits for INT32 and at 64 for INT64.
+    /// time. Deltas wrap at 32 bits for INT32 and at 64 for INT64. The block layout defaults to the
+    /// encoder's, 128 values in 4 miniblocks; the decoder tests vary it as other writers may.
     /// </summary>
-    private static byte[] Reference(long[] values, bool long64)
+    private static byte[] Reference(long[] values, bool long64, int blockSize = BlockSize, int miniblockCount = MiniblockCount)
     {
+        int perMiniblock = blockSize / miniblockCount;
         var output = new List<byte>();
         void Varint(ulong v) { for (; v >= 0x80; v >>= 7) output.Add((byte)(v | 0x80)); output.Add((byte)v); }
         void ZigZag(long v) => Varint(unchecked((ulong)((v << 1) ^ (v >> 63))));
 
-        Varint(BlockSize);
-        Varint(MiniblockCount);
+        Varint((ulong)blockSize);
+        Varint((ulong)miniblockCount);
         Varint((ulong)values.Length);
         ZigZag(values[0]);
 
@@ -275,32 +381,32 @@ public class DeltaBinaryPackedEncoderPackingTests
         for (int i = 1; i < values.Length; i++)
             deltas[i - 1] = long64 ? unchecked(values[i] - values[i - 1]) : unchecked((int)values[i] - (int)values[i - 1]);
 
-        for (int s = 0; s < deltas.Length; s += BlockSize)
+        for (int s = 0; s < deltas.Length; s += blockSize)
         {
-            int n = Math.Min(BlockSize, deltas.Length - s);
+            int n = Math.Min(blockSize, deltas.Length - s);
             long min = long.MaxValue;
             for (int i = 0; i < n; i++)
                 min = Math.Min(min, deltas[s + i]);
             ZigZag(min);
 
-            var widths = new int[MiniblockCount];
-            for (int mb = 0; mb < MiniblockCount; mb++)
+            var widths = new int[miniblockCount];
+            for (int mb = 0; mb < miniblockCount; mb++)
             {
                 ulong max = 0;
-                for (int i = mb * PerMiniblock; i < Math.Min(n, (mb + 1) * PerMiniblock); i++)
+                for (int i = mb * perMiniblock; i < Math.Min(n, (mb + 1) * perMiniblock); i++)
                     max = Math.Max(max, unchecked((ulong)(deltas[s + i] - min)));
                 while (widths[mb] < 64 && max >> widths[mb] != 0)
                     widths[mb]++;
                 output.Add((byte)widths[mb]);
             }
 
-            for (int mb = 0; mb < MiniblockCount; mb++)
+            for (int mb = 0; mb < miniblockCount; mb++)
             {
                 int w = widths[mb];
-                var packed = new byte[PerMiniblock * w / 8];
-                for (int i = 0; i < PerMiniblock; i++)
+                var packed = new byte[perMiniblock * w / 8];
+                for (int i = 0; i < perMiniblock; i++)
                 {
-                    int at = mb * PerMiniblock + i;
+                    int at = mb * perMiniblock + i;
                     ulong v = at < n ? unchecked((ulong)(deltas[s + at] - min)) : 0;
                     for (int b = 0; b < w; b++)
                     {
