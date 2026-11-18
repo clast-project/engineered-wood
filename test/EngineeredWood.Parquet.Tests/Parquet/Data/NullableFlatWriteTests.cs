@@ -67,6 +67,48 @@ public class NullableFlatWriteTests : IDisposable
         AssertSame(slice, read);
     }
 
+    /// <summary>
+    /// A list's nullable elements go through the same in-place scatter on read as a flat column's values,
+    /// by the list path's own builder. Null lists and empty lists sit between them.
+    /// </summary>
+    [Theory]
+    [InlineData(0.0)]
+    [InlineData(1.0 / 7)]
+    [InlineData(0.5)]
+    [InlineData(1.0)]
+    public async Task ListOfNullableDoubles_RoundTrips(double nullShare)
+    {
+        var random = new Random(19);
+        var builder = new ListArray.Builder(DoubleType.Default);
+        var elements = (DoubleArray.Builder)builder.ValueBuilder;
+        for (int row = 0; row < 2_003; row++)
+        {
+            if (row % 11 == 0)
+            {
+                builder.AppendNull();
+                continue;
+            }
+
+            builder.Append();
+            int count = random.Next(0, 6);
+            for (int j = 0; j < count; j++)
+            {
+                if (random.NextDouble() < nullShare) elements.AppendNull();
+                else elements.Append(random.Next(500) / 8.0);
+            }
+        }
+
+        var list = builder.Build();
+        var read = (ListArray)await RoundTripAsync(list, Options(dictionary: false));
+        Assert.Equal(list.Length, read.Length);
+        for (int i = 0; i < list.Length; i++)
+        {
+            Assert.True(list.IsNull(i) == read.IsNull(i), $"null list at row {i}");
+            if (!list.IsNull(i))
+                AssertSame(list.GetSlicedValues(i), read.GetSlicedValues(i));
+        }
+    }
+
     [Fact]
     public async Task DeclaredNoNulls_OverClearBits_ReadsAllValid()
     {
