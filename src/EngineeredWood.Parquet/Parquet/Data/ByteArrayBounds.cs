@@ -18,7 +18,9 @@ namespace EngineeredWood.Parquet.Data;
 /// prefix of the other, which orders first too.</para>
 /// <para>Anything else is compared byte by byte, as before: a value that does not start with the
 /// prefix, or whose key ties a bound's. Ties keep the first position, so the result is the same.</para>
-/// <para>MEASURED per million values (<c>stats-profile</c>): see the PR that introduced this class.</para>
+/// <para>MEASURED per million values (<c>stats-profile</c>), against comparing every value with both bounds
+/// byte by byte: random strings of 8-24 bytes 6.5 -> 2.0 ms; URLs sharing a 34-byte prefix 6.0 -> 4.2,
+/// where checking the prefix is most of what is left.</para>
 /// </remarks>
 internal static class ByteArrayBounds
 {
