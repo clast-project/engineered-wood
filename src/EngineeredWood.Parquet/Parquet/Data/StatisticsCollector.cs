@@ -1167,21 +1167,32 @@ internal static class StatisticsCollector
         var valueBuffer = array.Data.Buffers[1].Span;
         int minIdx = -1, maxIdx = -1;
 
-        for (int i = start; i < end; i++)
+        // Unsigned lexicographic and signed big-endian values of up to 16 bytes compare as two words
+        // (decimals to precision 38, UUIDs); the other orders and longer values compare byte by byte.
+        if (typeLength <= FixedLenBounds.MaxLength
+            && order is StatisticsOrder.Default or StatisticsOrder.SignedBigEndian)
         {
-            if (defLevels != null && defLevels[i] == 0) continue;
+            (minIdx, maxIdx) = FixedLenBounds.Find(
+                valueBuffer, typeLength, defLevels, order == StatisticsOrder.SignedBigEndian, start, end);
+        }
+        else
+        {
+            for (int i = start; i < end; i++)
+            {
+                if (defLevels != null && defLevels[i] == 0) continue;
 
-            if (minIdx < 0)
-            {
-                minIdx = maxIdx = i;
-            }
-            else
-            {
-                var val = valueBuffer.Slice(i * typeLength, typeLength);
-                if (CompareFlba(val, valueBuffer.Slice(minIdx * typeLength, typeLength), order) < 0)
-                    minIdx = i;
-                if (CompareFlba(val, valueBuffer.Slice(maxIdx * typeLength, typeLength), order) > 0)
-                    maxIdx = i;
+                if (minIdx < 0)
+                {
+                    minIdx = maxIdx = i;
+                }
+                else
+                {
+                    var val = valueBuffer.Slice(i * typeLength, typeLength);
+                    if (CompareFlba(val, valueBuffer.Slice(minIdx * typeLength, typeLength), order) < 0)
+                        minIdx = i;
+                    if (CompareFlba(val, valueBuffer.Slice(maxIdx * typeLength, typeLength), order) > 0)
+                        maxIdx = i;
+                }
             }
         }
 

@@ -154,6 +154,12 @@ internal static class StatisticsProfile
         var d = new Decimal128Array.Builder(new Decimal128Type(38, 4));
         for (int i = 0; i < rows; i++) d.Append((decimal)random.NextInt64(-1_000_000_000_000, 1_000_000_000_000) / 10_000m);
         yield return ("decimal(38,4)", Batch(d.Build()), PhysicalType.FixedLenByteArray, 16, StatisticsOrder.SignedBigEndian);
+
+        var uuids = new byte[rows * 16];
+        random.NextBytes(uuids);
+        var fsb = new Apache.Arrow.Arrays.FixedSizeBinaryArray(new ArrayData(
+            new FixedSizeBinaryType(16), rows, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(uuids)]));
+        yield return ("fixed_size_binary(16) random", Batch(fsb), PhysicalType.FixedLenByteArray, 16, StatisticsOrder.Default);
     }
 
     private static RecordBatch Batch(IArrowArray array) =>
