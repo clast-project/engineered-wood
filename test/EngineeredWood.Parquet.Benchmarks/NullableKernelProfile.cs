@@ -59,7 +59,8 @@ internal static class NullableKernelProfile
         // to 63 groups under one header. Both sides are timed at both settings.
         Add("W def RLE: encoder over int[] (today, 1 group/header)", k => () => EncodeLevels(k.IntLevels, 1));
         Add("W def RLE: bitmap bytes as bit-packed, 1 group/header", k => () => k.Count = EncodeFromBitmap(k.Bitmap, k.Rows, k.Encoded, 1));
-        Add("W def RLE: encoder over int[], batched 63", k => () => EncodeLevels(k.IntLevels, RleBitPackedEncoder.MaxLiteralGroups));
+        Add("W def RLE: encoder over int[], batched 63, by group (before)", k => () => EncodeLevels(k.IntLevels, RleBitPackedEncoder.MaxLiteralGroups, packWidthOne: false));
+        Add("W def RLE: encoder over int[], batched 63 (shipped, packed)", k => () => EncodeLevels(k.IntLevels, RleBitPackedEncoder.MaxLiteralGroups));
         Add("W def RLE: bitmap bytes as bit-packed, batched 63", k => () => k.Count = EncodeFromBitmap(k.Bitmap, k.Rows, k.Encoded, RleBitPackedEncoder.MaxLiteralGroups));
 
         // ---- read ----
@@ -180,8 +181,13 @@ internal static class NullableKernelProfile
                 Check(m == n, "encode count");
                 for (int i = 0; i < k.Rows; i++)
                     Check(decoded[i] == expectInts[i], "encode levels");
-                int today = EncodeLevels(expectInts, groups).Length;
-                Console.WriteLine($"  {k.Rows - n} nulls, {groups} group(s)/header: encoder {today:N0} bytes, bitmap copy {len:N0} bytes");
+                int byGroup = EncodeLevels(expectInts, groups, packWidthOne: false).Length;
+                byte[] packed = EncodeLevels(expectInts, groups);
+                LevelDecoder.DecodeV2(packed, 1, k.Rows, decoded, out m);
+                Check(m == n, "packed count");
+                for (int i = 0; i < k.Rows; i++)
+                    Check(decoded[i] == expectInts[i], "packed levels");
+                Console.WriteLine($"  {k.Rows - n} nulls, {groups} group(s)/header: encoder by group {byGroup:N0} bytes, packed {packed.Length:N0}, bitmap copy {len:N0}");
             }
         }
 
@@ -548,9 +554,9 @@ internal static class NullableKernelProfile
         return (min, max, !first);
     }
 
-    private static byte[] EncodeLevels(int[] levels, int maxLiteralGroups)
+    private static byte[] EncodeLevels(int[] levels, int maxLiteralGroups, bool packWidthOne = true)
     {
-        var encoder = new RleBitPackedEncoder(1, maxLiteralGroups: maxLiteralGroups);
+        var encoder = new RleBitPackedEncoder(1, maxLiteralGroups: maxLiteralGroups) { PackWidthOne = packWidthOne };
         encoder.Encode(levels);
         return encoder.ToArray();
     }
