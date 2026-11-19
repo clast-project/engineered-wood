@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers.Binary;
+using System.IO.Hashing;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -237,54 +238,30 @@ internal static class DictionaryEncoder
             };
         }
 
-        // Open-addressing hash table with linear probing
-        var table = new BytesHashTable();
-        var uniqueEntries = new List<byte[]>();
+        // The table keeps the distinct values as the dictionary page itself (PLAIN: a 4-byte LE length prefix
+        // per entry), so the page is a copy of what it holds.
+        var table = new BytesHashTable(lengthPrefixed: true);
         var indices = new int[nonNullCount];
         int idx = 0;
-        int totalDictBytes = 0;
 
         for (int i = 0; i < rowCount; i++)
         {
             if (defLevels != null && defLevels[i] == 0) continue;
 
             int start = arrowOffsets[i];
-            int len = arrowOffsets[i + 1] - start;
-            ReadOnlySpan<byte> valueBytes = arrowData.Slice(start, len);
+            ReadOnlySpan<byte> valueBytes = arrowData.Slice(start, arrowOffsets[i + 1] - start);
 
-            int dictIdx = table.GetOrAdd(valueBytes, uniqueEntries.Count, out byte[]? inserted);
-
-            if (inserted is not null)
-            {
-                // New entry — the table's copy becomes the dictionary's, rather than a second one.
-                if (uniqueEntries.Count >= maxCardinality)
-                    return null;
-
-                uniqueEntries.Add(inserted);
-                totalDictBytes += 4 + len;
-
-                if (totalDictBytes > pageSizeLimit)
-                    return null;
-            }
+            int dictIdx = table.GetOrAdd(valueBytes, out bool inserted);
+            if (inserted && (table.Count > maxCardinality || table.ByteCount > pageSizeLimit))
+                return null;
 
             indices[idx++] = dictIdx;
         }
 
-        // Produce PLAIN-encoded dictionary page (4-byte LE length prefix per entry)
-        var dictPage = new byte[totalDictBytes];
-        int pos = 0;
-        foreach (var entry in uniqueEntries)
-        {
-            BinaryPrimitives.WriteInt32LittleEndian(dictPage.AsSpan(pos), entry.Length);
-            pos += 4;
-            entry.CopyTo(dictPage.AsSpan(pos));
-            pos += entry.Length;
-        }
-
         return new DictionaryResult
         {
-            DictionaryPageData = dictPage,
-            DictionaryCount = uniqueEntries.Count,
+            DictionaryPageData = table.ToPage(),
+            DictionaryCount = table.Count,
             Indices = indices,
         };
     }
@@ -333,11 +310,9 @@ internal static class DictionaryEncoder
         // where the per-row arms have nothing to go on and must grow into the right size. Passing it
         // costs nothing and means a column whose bound is tight never rehashes at all.
         int distinctBound = Math.Min(maxCardinality, values.Length) + 1;
-        var table = new BytesHashTable(distinctBound);
-        var uniqueEntries = new List<byte[]>();
+        var table = new BytesHashTable(lengthPrefixed, distinctBound);
         var runIndices = new List<int>();
         var runLengths = new List<int>();
-        int totalDictBytes = 0;
         long countedNonNull = 0;
 
         foreach (var run in RunEndEncoding.EnumerateRuns(array))
@@ -348,19 +323,9 @@ internal static class DictionaryEncoder
             countedNonNull += run.Length;
 
             var valueBytes = RunValueBytes(values, run.PhysicalIndex, lengthPrefixed, slotWidth);
-            int dictIdx = table.GetOrAdd(valueBytes, uniqueEntries.Count, out byte[]? inserted);
-
-            if (inserted is not null)
-            {
-                if (uniqueEntries.Count >= maxCardinality)
-                    return null;
-
-                uniqueEntries.Add(inserted);
-                totalDictBytes += (lengthPrefixed ? 4 : 0) + valueBytes.Length;
-
-                if (totalDictBytes > pageSizeLimit)
-                    return null;
-            }
+            int dictIdx = table.GetOrAdd(valueBytes, out bool inserted);
+            if (inserted && (table.Count > maxCardinality || table.ByteCount > pageSizeLimit))
+                return null;
 
             // Two runs that map to the same entry are one run in the index stream — they are adjacent
             // there whenever the runs between them were null, and the RLE encoder cannot merge what it is
@@ -381,24 +346,10 @@ internal static class DictionaryEncoder
         if (countedNonNull != nonNullCount)
             return null;
 
-        var dictPage = new byte[totalDictBytes];
-        int pos = 0;
-        foreach (var entry in uniqueEntries)
-        {
-            if (lengthPrefixed)
-            {
-                BinaryPrimitives.WriteInt32LittleEndian(dictPage.AsSpan(pos), entry.Length);
-                pos += 4;
-            }
-
-            entry.CopyTo(dictPage.AsSpan(pos));
-            pos += entry.Length;
-        }
-
         return new DictionaryResult
         {
-            DictionaryPageData = dictPage,
-            DictionaryCount = uniqueEntries.Count,
+            DictionaryPageData = table.ToPage(),
+            DictionaryCount = table.Count,
             Indices = null,
             IndexRuns = new DictionaryIndexRuns
             {
@@ -529,8 +480,8 @@ internal static class DictionaryEncoder
 
         var valueBuffer = array.Data.Buffers[1].Span;
 
-        var table = new BytesHashTable();
-        var uniqueEntries = new List<byte[]>();
+        // The page is the values concatenated (PLAIN for FLBA has no length prefix), which the table holds.
+        var table = new BytesHashTable(lengthPrefixed: false);
         var indices = new int[nonNullCount];
         int idx = 0;
 
@@ -539,90 +490,75 @@ internal static class DictionaryEncoder
             if (defLevels != null && defLevels[i] == 0) continue;
 
             ReadOnlySpan<byte> valueBytes = valueBuffer.Slice(i * typeLength, typeLength);
-            int dictIdx = table.GetOrAdd(valueBytes, uniqueEntries.Count, out byte[]? inserted);
-
-            if (inserted is not null)
-            {
-                // New entry — the table's copy becomes the dictionary's, rather than a second one.
-                if (uniqueEntries.Count >= maxCardinality)
-                    return null;
-
-                uniqueEntries.Add(inserted);
-
-                if (uniqueEntries.Count * typeLength > pageSizeLimit)
-                    return null;
-            }
+            int dictIdx = table.GetOrAdd(valueBytes, out bool inserted);
+            if (inserted && (table.Count > maxCardinality || table.ByteCount > pageSizeLimit))
+                return null;
 
             indices[idx++] = dictIdx;
         }
 
-        // Produce PLAIN-encoded dictionary page (concatenated, no length prefix for FLBA)
-        var dictPage = new byte[uniqueEntries.Count * typeLength];
-        int pos = 0;
-        foreach (var entry in uniqueEntries)
-        {
-            entry.CopyTo(dictPage.AsSpan(pos));
-            pos += typeLength;
-        }
-
         return new DictionaryResult
         {
-            DictionaryPageData = dictPage,
-            DictionaryCount = uniqueEntries.Count,
+            DictionaryPageData = table.ToPage(),
+            DictionaryCount = table.Count,
             Indices = indices,
         };
     }
 
     /// <summary>
-    /// Open-addressing hash table with linear probing for byte sequences.
-    /// More cache-friendly than Dictionary&lt;int, List&lt;...&gt;&gt; with collision chains.
-    /// Uses FNV-1a for hashing.
-    ///
-    /// <para><b>Grows geometrically rather than being sized up front.</b> It used to be built from the
-    /// caller's cardinality CAP — a fifth of the row count — so a 1M-row string column allocated 8.4 MB of
-    /// table before hashing a single row, identically whether the column went on to hold twelve distinct
-    /// values or a million. That is per column and concurrent, since the writer runs columns under
-    /// <c>Parallel.For</c>: twenty string columns was ~168 MB of table live at once, independent of the
-    /// data. It now starts at 16 slots and doubles.</para>
-    ///
-    /// <para>The load factor ceiling stays at one half, which is exactly what the old sizing guaranteed
-    /// (<c>maxCardinality * 2</c> rounded up to a power of two, against at most <c>maxCardinality</c>
-    /// entries). Linear probing degrades sharply as a table fills, so holding the same ceiling keeps probe
-    /// lengths what they were rather than trading the memory for lookup cost. The worst case — a column
-    /// that really does reach the cap — ends at the same size it was allocated at before, having paid an
-    /// amortized two moves per entry to get there.</para>
+    /// The distinct values of a column, numbered in the order they first appear, found with an open-addressing
+    /// hash table (linear probing) and kept as the PLAIN dictionary page they will be written as.
     /// </summary>
+    /// <remarks>
+    /// <para><b>The values live in the page.</b> Each new value is appended to one growing buffer in the page's
+    /// layout: a 4-byte little-endian length and then the bytes for BYTE_ARRAY, the bytes alone for
+    /// FIXED_LEN_BYTE_ARRAY. A slot holds the entry's number and its hash, and a lookup compares against the
+    /// entry's bytes in that buffer. The page is a copy of the buffer: no array per entry, and no second pass
+    /// to lay the page out.</para>
+    /// <para><b>XxHash3</b>, eight bytes at a time and vectorised past that, where FNV-1a took a multiply per
+    /// byte. The slot comes from the hash; whether a slot is taken comes from its entry number (0 = empty).
+    /// The table this replaced forced the hash's low bit to mark a slot taken and chose the slot from the same
+    /// bits, so it only ever used the odd slots.</para>
+    /// <para><b>Grows geometrically</b> from 16 slots, with a load factor ceiling of one half: a 1M-row column
+    /// with twelve distinct values allocates no more than one with twelve rows, and linear probing stays short.
+    /// The writer runs columns in parallel, so sizing to a worst case would be paid per column at once.</para>
+    /// <para>MEASURED per million values (<c>dict-profile</c>): see the PR that introduced this table.</para>
+    /// </remarks>
     private sealed class BytesHashTable
     {
         /// <summary>Smallest table. A column with a handful of distinct values never outgrows it.</summary>
         private const int MinimumSize = 16;
 
-        /// <summary>
-        /// Largest table. <c>_hashes.Length &lt;&lt; 1</c> overflows to negative past this, and a table
-        /// this size is 12 GB across the three arrays — long past where the column itself would have
-        /// exhausted memory.
-        /// </summary>
+        /// <summary>Largest table: past this the slot count would overflow when doubled.</summary>
         private const int MaximumSize = 1 << 30;
 
-        // Empty until the constructor's Allocate call, which every path goes through; the initializers
-        // are here only so the nullable analysis can see that they are never null.
-        private int[] _hashes = [];    // 0 = empty slot
-        private byte[]?[] _keys = [];
-        private int[] _values = [];
+        private readonly bool _lengthPrefixed;
+
+        // Per slot: the entry's hash, and its number plus one (0 = empty).
+        private int[] _hashes = [];
+        private int[] _slots = [];
         private int _mask;
-        private int _count;
         private int _growAt;
 
+        // Per entry, in order: where its bytes start in the page, and how many there are.
+        private int[] _starts = new int[MinimumSize];
+        private int[] _lengths = new int[MinimumSize];
+        private int _count;
+
+        private byte[] _page = new byte[256];
+        private int _pageLength;
+
+        /// <param name="lengthPrefixed">Whether the page prefixes each entry with its length (BYTE_ARRAY).</param>
         /// <param name="expectedEntries">
-        /// An upper bound on the distinct values, for a caller that has one — the run-end encoded arm
-        /// does, since a run cannot hold two distinct values. Sizing to it means an exact bound never
-        /// rehashes. Zero (the default) starts at the minimum and grows, which is the right answer for a
-        /// caller that cannot know.
+        /// An upper bound on the distinct values, for a caller that has one, as the run-end encoded arm does: a
+        /// run cannot hold two distinct values. Sizing to it means an exact bound never rehashes. Zero starts at
+        /// the minimum and grows.
         /// </param>
-        public BytesHashTable(int expectedEntries = 0)
+        public BytesHashTable(bool lengthPrefixed, int expectedEntries = 0)
         {
+            _lengthPrefixed = lengthPrefixed;
             int size = MinimumSize;
-            // Two slots per entry, matching the load-factor ceiling below. Compared as long: a bound near
+            // Two slots per entry, matching the load-factor ceiling. Compared as long: a bound near
             // int.MaxValue would otherwise double past the sign bit and spin here.
             while (size < (long)expectedEntries * 2 && size < MaximumSize)
                 size <<= 1;
@@ -630,79 +566,99 @@ internal static class DictionaryEncoder
             Allocate(size);
         }
 
+        /// <summary>The distinct values so far.</summary>
+        public int Count => _count;
+
+        /// <summary>The bytes of the dictionary page so far.</summary>
+        public int ByteCount => _pageLength;
+
+        /// <summary>The PLAIN dictionary page: every entry, in order.</summary>
+        public byte[] ToPage() => _page.AsSpan(0, _pageLength).ToArray();
+
         /// <summary>
-        /// Returns the existing index for the key, or inserts <paramref name="nextIndex"/>
-        /// and returns it if the key is new.
+        /// The number of <paramref name="key"/>'s entry, adding it as the next one when it is new
+        /// (<paramref name="inserted"/>).
         /// </summary>
-        /// <param name="inserted">
-        /// The copy of the key this table now holds, when the key was new; null when it was already
-        /// present. Callers keep their own copy of each distinct value for the dictionary page, and
-        /// handing them this one is what stops every distinct value being copied twice. It is the table's
-        /// comparison key, so a caller that mutated it would corrupt lookups — every caller here only ever
-        /// reads it, on the way into the dictionary page.
-        /// </param>
-        public int GetOrAdd(ReadOnlySpan<byte> key, int nextIndex, out byte[]? inserted)
+        public int GetOrAdd(ReadOnlySpan<byte> key, out bool inserted)
         {
-            uint h = Fnv1a(key);
-            // Ensure hash is non-zero (0 = empty sentinel)
-            int hash = (int)(h | 1);
+            int hash = (int)XxHash3.HashToUInt64(key);
             int slot = hash & _mask;
 
             while (true)
             {
-                if (_hashes[slot] == 0)
+                int entry = _slots[slot] - 1;
+                if (entry < 0)
                 {
-                    // Empty slot — insert
-                    var copy = key.ToArray();
+                    entry = Add(key);
                     _hashes[slot] = hash;
-                    _keys[slot] = copy;
-                    _values[slot] = nextIndex;
-                    inserted = copy;
+                    _slots[slot] = entry + 1;
+                    inserted = true;
 
-                    // Grown AFTER the insert, so the slot this landed in does not have to survive the
-                    // rehash — nothing here returns a slot, only the caller's own index.
-                    if (++_count >= _growAt)
+                    // Grown AFTER the insert, so the slot this landed in does not have to survive the rehash.
+                    if (_count >= _growAt)
                         Grow();
 
-                    return nextIndex;
+                    return entry;
                 }
 
-                if (_hashes[slot] == hash && key.SequenceEqual(_keys[slot]))
+                if (_hashes[slot] == hash && key.SequenceEqual(_page.AsSpan(_starts[entry], _lengths[entry])))
                 {
-                    inserted = null;
-                    return _values[slot];
+                    inserted = false;
+                    return entry;
                 }
 
                 slot = (slot + 1) & _mask;
             }
         }
 
+        /// <summary>Appends <paramref name="key"/> to the page as the next entry.</summary>
+        private int Add(ReadOnlySpan<byte> key)
+        {
+            int needed = _pageLength + (_lengthPrefixed ? 4 : 0) + key.Length;
+            if (needed > _page.Length)
+                System.Array.Resize(ref _page, (int)Math.Min(Math.Max((long)_page.Length * 2, needed), int.MaxValue));
+
+            if (_lengthPrefixed)
+            {
+                BinaryPrimitives.WriteInt32LittleEndian(_page.AsSpan(_pageLength), key.Length);
+                _pageLength += 4;
+            }
+
+            if (_count == _starts.Length)
+            {
+                System.Array.Resize(ref _starts, _count * 2);
+                System.Array.Resize(ref _lengths, _count * 2);
+            }
+
+            _starts[_count] = _pageLength;
+            _lengths[_count] = key.Length;
+            key.CopyTo(_page.AsSpan(_pageLength));
+            _pageLength += key.Length;
+            return _count++;
+        }
+
         private void Allocate(int size)
         {
             _hashes = new int[size];
-            _keys = new byte[]?[size];
-            _values = new int[size];
+            _slots = new int[size];
             _mask = size - 1;
             _growAt = size / 2;
         }
 
         /// <summary>
-        /// Doubles the table and reinserts. The stored hash is reused rather than recomputed — it is the
-        /// full FNV-1a value with the low bit forced, so the wider mask selects the new slot directly and
+        /// Doubles the table and reinserts each entry at the slot its stored hash picks under the wider mask;
         /// no key is hashed twice.
         /// </summary>
         private void Grow()
         {
             var oldHashes = _hashes;
-            var oldKeys = _keys;
-            var oldValues = _values;
+            var oldSlots = _slots;
 
             if (oldHashes.Length >= MaximumSize)
             {
-                // Unreachable in practice — the caller declines at a fifth of the row count long before,
-                // and half a billion live keys would have exhausted memory first. Stated as a failure
-                // rather than left implicit: a table that cannot grow eventually fills, and a full
-                // open-addressed table makes GetOrAdd spin forever rather than return.
+                // Unreachable in practice: the callers decline at a fifth of the row count long before. Stated
+                // as a failure rather than left implicit, because a full open-addressed table makes GetOrAdd
+                // spin forever.
                 throw new InvalidOperationException(
                     $"The dictionary hash table cannot grow past {MaximumSize} slots.");
             }
@@ -711,29 +667,16 @@ internal static class DictionaryEncoder
 
             for (int i = 0; i < oldHashes.Length; i++)
             {
-                int hash = oldHashes[i];
-                if (hash == 0)
+                if (oldSlots[i] == 0)
                     continue;
 
-                int slot = hash & _mask;
-                while (_hashes[slot] != 0)
+                int slot = oldHashes[i] & _mask;
+                while (_slots[slot] != 0)
                     slot = (slot + 1) & _mask;
 
-                _hashes[slot] = hash;
-                _keys[slot] = oldKeys[i];
-                _values[slot] = oldValues[i];
+                _hashes[slot] = oldHashes[i];
+                _slots[slot] = oldSlots[i];
             }
-        }
-
-        private static uint Fnv1a(ReadOnlySpan<byte> data)
-        {
-            uint hash = 2166136261u;
-            for (int i = 0; i < data.Length; i++)
-            {
-                hash ^= data[i];
-                hash *= 16777619u;
-            }
-            return hash;
         }
     }
 }
