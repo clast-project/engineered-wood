@@ -151,10 +151,12 @@ public class BufferedDictionaryLimitTests : IDisposable
     public async Task EachRowGroup_StartsWithADictionaryAgain()
     {
         // The first row group's dictionary passes the limit, so its tail is buffered raw; the second is
-        // low-cardinality throughout and must get a whole dictionary, as each file-writer chunk does.
+        // low-cardinality throughout and must get a whole dictionary, as each file-writer chunk does. It is small
+        // (500 values, 4,000 bytes raw) so that, were it still buffered raw, it would stay under the limit and the
+        // first-page test would decline the "dictionary" of one entry per value.
         var first = Int64Batch(300_000, 200_000, nullable: false);
         var builder = new Int64Array.Builder();
-        for (int i = 0; i < 300_000; i++) builder.Append(i % 100);
+        for (int i = 0; i < 500; i++) builder.Append(i % 100);
         var second = Batch(builder.Build(), nullable: false);
 
         var (direct, buffered) = await WriteBothAsync([first, second], DataPageVersion.V1, Limit);
