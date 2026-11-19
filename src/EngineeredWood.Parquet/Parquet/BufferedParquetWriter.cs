@@ -144,6 +144,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         var dictResults = new DictionaryEncoder.DictionaryResult?[states.Length];
         var useNonDictionary = new bool[states.Length]; // true when the dictionary is not written as built
         var overLimit = new bool[states.Length]; // true when it passed DictionaryPageSizeLimit
+        var pageLengths = new int[states.Length]; // the dictionary page's bytes, which a borrowed buffer exceeds
         int[]?[] defLevelsPerColumn = new int[]?[states.Length];
         int[]?[] repLevelsPerColumn = new int[]?[states.Length];
 
@@ -154,14 +155,6 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             repLevelsPerColumn[i] = s.RepLevels?.ToArray(s.LevelCount);
             if (s.DictionaryCount > 0)
             {
-                var built = new DictionaryEncoder.DictionaryResult
-                {
-                    DictionaryPageData = s.BuildDictionaryPage(),
-                    DictionaryCount = s.DictionaryCount,
-                    Indices = s.Indices!.ToArray(s.NonNullCount),
-                };
-                dictResults[i] = built;
-
                 // Per-column resolution, not the file-wide flag: an option that held for one writer and not the
                 // other would be worse than not having it.
                 bool enabled = _options.GetDictionaryEnabled(s.PathInSchema);
@@ -170,7 +163,33 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 // it filled before the first page decided, else kept for the pages before the cut and the rest
                 // written in the column's own encoding. The column is rebuilt and written through that writer's
                 // own path, so the two writers agree; this costs a second pass of hashing, only for such a column.
-                overLimit[i] = enabled && built.DictionaryPageData.Length > _options.DictionaryPageSizeLimit;
+                overLimit[i] = enabled && s.DictionaryPageLength > _options.DictionaryPageSizeLimit;
+
+                var indices = s.Indices!.ToArray(s.NonNullCount);
+                if ((!enabled || overLimit[i]) && s.TryBorrowPage(out byte[] page))
+                {
+                    // Rebuilt, never written: the rebuild reads the buffered entries where they are, without the
+                    // copy a written page needs. Past the limit they are the values themselves, as large as the
+                    // rebuilt column, so a copy would have been a third instance of it at flush.
+                    dictResults[i] = new DictionaryEncoder.DictionaryResult
+                    {
+                        DictionaryPageData = page,
+                        DictionaryCount = s.DictionaryCount,
+                        Indices = indices,
+                    };
+                    pageLengths[i] = s.DictionaryPageLength;
+                    useNonDictionary[i] = true;
+                    continue;
+                }
+
+                var built = new DictionaryEncoder.DictionaryResult
+                {
+                    DictionaryPageData = s.BuildDictionaryPage(),
+                    DictionaryCount = s.DictionaryCount,
+                    Indices = indices,
+                };
+                dictResults[i] = built;
+                pageLengths[i] = built.DictionaryPageData.Length;
 
                 // Otherwise the file writer's first-page test (DictionaryEncoder.FirstPagePays): a dictionary that
                 // does not pay is declined, and the values are rebuilt and written in the column's own encoding.
@@ -199,7 +218,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             {
                 // Cardinality too high: reconstruct Arrow array from dictionary + indices
                 // and encode via the standard non-dictionary path (delta, BSS, plain, etc.)
-                var array = ReconstructArrowArray(s, dictResults[i]!.Value,
+                var array = ReconstructArrowArray(s, dictResults[i]!.Value, pageLengths[i],
                     PresenceLevels(s, defLevelsPerColumn[i]), s.LevelCount);
                 var options = overLimit[i] ? _options : _options with { DictionaryEnabled = false };
                 columnResults[i] = WriteLeaf(
@@ -471,9 +490,14 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     /// Used at flush time when cardinality exceeds the dictionary threshold and the
     /// column should be written with non-dictionary encoding.
     /// </summary>
+    /// <param name="pageLength">
+    /// The page's bytes in <see cref="DictionaryEncoder.DictionaryResult.DictionaryPageData"/>, which may be a buffer
+    /// borrowed from the column's state and longer (<see cref="BufferedColumnState.TryBorrowPage"/>).
+    /// </param>
     private static IArrowArray ReconstructArrowArray(
         BufferedColumnState state,
         DictionaryEncoder.DictionaryResult dictResult,
+        int pageLength,
         int[]? defLevels,
         int numRows)
     {
@@ -484,7 +508,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             ?? throw new InvalidOperationException(
                 "A buffered column cannot be reconstructed from run-form dictionary indices.");
 
-        byte[] dictPage = dictResult.DictionaryPageData;
+        ReadOnlySpan<byte> dictPage = dictResult.DictionaryPageData.AsSpan(0, pageLength);
         int dictCount = dictResult.DictionaryCount;
 
         return state.ArrowType switch
@@ -527,9 +551,9 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     }
 
     /// <summary>An INT32 dictionary page's entries, each narrowed back to the column's Arrow type.</summary>
-    private static T[] NarrowEntries<T>(byte[] dictPage, Func<int, T> narrow)
+    private static T[] NarrowEntries<T>(ReadOnlySpan<byte> dictPage, Func<int, T> narrow)
     {
-        var entries = MemoryMarshal.Cast<byte, int>(dictPage.AsSpan());
+        var entries = MemoryMarshal.Cast<byte, int>(dictPage);
         var narrowed = new T[entries.Length];
         for (int i = 0; i < entries.Length; i++)
             narrowed[i] = narrow(entries[i]);
@@ -537,9 +561,9 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     }
 
     private static IArrowArray ReconstructFixed<T>(
-        byte[] dictPage, int[] indices, int[]? defLevels, int numRows,
+        ReadOnlySpan<byte> dictPage, int[] indices, int[]? defLevels, int numRows,
         bool isNullable) where T : unmanaged =>
-        ReconstructFixed<T>(MemoryMarshal.Cast<byte, T>(dictPage.AsSpan()), indices, defLevels, numRows, isNullable);
+        ReconstructFixed<T>(MemoryMarshal.Cast<byte, T>(dictPage), indices, defLevels, numRows, isNullable);
 
     private static IArrowArray ReconstructFixed<T>(
         ReadOnlySpan<T> dictValues, int[] indices, int[]? defLevels, int numRows,
@@ -589,7 +613,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     }
 
     private static IArrowArray ReconstructByteArray(
-        byte[] dictPage, int dictCount, int[] indices, int[]? defLevels, int numRows,
+        ReadOnlySpan<byte> dictPage, int dictCount, int[] indices, int[]? defLevels, int numRows,
         bool isNullable, bool isString)
     {
         // Parse dictionary entries from PLAIN format: [4-byte len][data]...
@@ -597,7 +621,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         int pos = 0;
         for (int d = 0; d < dictCount; d++)
         {
-            int len = BinaryPrimitives.ReadInt32LittleEndian(dictPage.AsSpan(pos));
+            int len = BinaryPrimitives.ReadInt32LittleEndian(dictPage.Slice(pos));
             pos += 4;
             entries[d] = (pos, len);
             pos += len;
@@ -630,7 +654,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         {
             if (defLevels != null && defLevels[row] == 0) continue;
             var (entryOff, entryLen) = entries[indices[idx++]];
-            dictPage.AsSpan(entryOff, entryLen).CopyTo(data.AsSpan(offsets[row]));
+            dictPage.Slice(entryOff, entryLen).CopyTo(data.AsSpan(offsets[row]));
         }
 
         var nullBitmap = isNullable ? new byte[(numRows + 7) / 8] : null;
@@ -672,7 +696,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     /// narrower than its Arrow slot (#504).</param>
     /// <param name="byteWidth">The Arrow slot width of <paramref name="arrowType"/>.</param>
     private static IArrowArray ReconstructFixedLenByteArray(
-        byte[] dictPage, int[] indices, int[]? defLevels, int numRows,
+        ReadOnlySpan<byte> dictPage, int[] indices, int[]? defLevels, int numRows,
         bool isNullable, int entryWidth, int byteWidth, Apache.Arrow.Types.IArrowType arrowType)
     {
         bool decimalFlba = IsFlbaDecimal(arrowType);
@@ -686,7 +710,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 continue;
 
             int dictIdx = indices[idx++];
-            var entry = dictPage.AsSpan(dictIdx * entryWidth, entryWidth);
+            var entry = dictPage.Slice(dictIdx * entryWidth, entryWidth);
 
             // The page holds a decimal big-endian at the column's width, as Parquet stores it; the rebuilt array
             // goes back through ColumnChunkWriter, which expects Arrow's little-endian slot and narrows it again.
@@ -760,6 +784,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 DictionaryCount = 0,
                 Indices = [],
             },
+            0,
             PresenceLevels(state, defLevels),
             state.LevelCount);
 
@@ -820,6 +845,12 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         /// <summary>Whether values are appended raw rather than looked up.</summary>
         private bool Raw => _dictionaryFull || !DictionaryEnabled;
+
+        // Raw, the fixed-width arms still deduplicate against a small cache of recent values (the byte-keyed arms'
+        // is in BytesHashTable.AppendRecent): per slot, the value's bits and its entry's number plus one.
+        private const int RecentSlots = 1024;
+        private ulong[]? _recentKeys;
+        private int[]? _recentEntries;
 
         // Running dictionary: maps a value's BIT PATTERN → index. The float and double dictionaries are
         // keyed on uint/ulong rather than on the value because a dictionary entry is a set of BYTES, and
@@ -1051,10 +1082,13 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 // For the integers the key IS the INT32 value, so it is also what the entry holds.
                 int key = asInt32 ? Int32Value(val) : Widen(val);
                 bool raw = Raw;
-                if (raw || !_fixedDict.TryGetValue(key, out int idx))
+                int idx, slot = 0;
+                if (raw ? !TryRecent(unchecked((uint)key), out idx, out slot) : !_fixedDict.TryGetValue(key, out idx))
                 {
                     var bytes = NewEntry(entrySize, out idx);
-                    if (!raw)
+                    if (raw)
+                        Remember(slot, unchecked((uint)key), idx);
+                    else
                         _fixedDict[key] = idx;
 
                     if (asInt32)
@@ -1096,10 +1130,13 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 if (!IsValue(LevelCount + i)) continue;
                 int val = valueBuffer[srcOffset + i];
                 bool raw = Raw;
-                if (raw || !_fixedDict.TryGetValue(val, out int idx))
+                int idx, slot = 0;
+                if (raw ? !TryRecent(unchecked((uint)val), out idx, out slot) : !_fixedDict.TryGetValue(val, out idx))
                 {
                     var bytes = NewEntry(4, out idx);
-                    if (!raw)
+                    if (raw)
+                        Remember(slot, unchecked((uint)val), idx);
+                    else
                         _fixedDict[val] = idx;
                     BinaryPrimitives.WriteInt32LittleEndian(bytes, val);
                 }
@@ -1116,10 +1153,13 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 if (!IsValue(LevelCount + i)) continue;
                 long val = valueBuffer[srcOffset + i];
                 bool raw = Raw;
-                if (raw || !_longDict.TryGetValue(val, out int idx))
+                int idx, slot = 0;
+                if (raw ? !TryRecent(unchecked((ulong)val), out idx, out slot) : !_longDict.TryGetValue(val, out idx))
                 {
                     var bytes = NewEntry(8, out idx);
-                    if (!raw)
+                    if (raw)
+                        Remember(slot, unchecked((ulong)val), idx);
+                    else
                         _longDict[val] = idx;
                     BinaryPrimitives.WriteInt64LittleEndian(bytes, val);
                 }
@@ -1138,10 +1178,13 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 if (!IsValue(LevelCount + i)) continue;
                 uint bits = bitBuffer[srcOffset + i];
                 bool raw = Raw;
-                if (raw || !_floatDict.TryGetValue(bits, out int idx))
+                int idx, slot = 0;
+                if (raw ? !TryRecent(bits, out idx, out slot) : !_floatDict.TryGetValue(bits, out idx))
                 {
                     var bytes = NewEntry(4, out idx);
-                    if (!raw)
+                    if (raw)
+                        Remember(slot, bits, idx);
+                    else
                         _floatDict[bits] = idx;
                     BinaryPrimitives.WriteUInt32LittleEndian(bytes, bits);
                 }
@@ -1160,10 +1203,13 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 if (!IsValue(LevelCount + i)) continue;
                 ulong bits = bitBuffer[srcOffset + i];
                 bool raw = Raw;
-                if (raw || !_doubleDict.TryGetValue(bits, out int idx))
+                int idx, slot = 0;
+                if (raw ? !TryRecent(bits, out idx, out slot) : !_doubleDict.TryGetValue(bits, out idx))
                 {
                     var bytes = NewEntry(8, out idx);
-                    if (!raw)
+                    if (raw)
+                        Remember(slot, bits, idx);
+                    else
                         _doubleDict[bits] = idx;
                     BinaryPrimitives.WriteUInt64LittleEndian(bytes, bits);
                 }
@@ -1193,13 +1239,58 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         }
 
         /// <summary>
+        /// Whether a raw value with bits <paramref name="key"/> is the one last cached in its slot, whose entry it
+        /// then shares (<paramref name="index"/>). <paramref name="slot"/> is where <see cref="Remember"/> caches a new
+        /// one. Bounded: repeats of a small working set cost one entry each, as they did when every value was looked
+        /// up, without the lookup table growing.
+        /// </summary>
+        private bool TryRecent(ulong key, out int index, out int slot)
+        {
+            _recentKeys ??= new ulong[RecentSlots];
+            _recentEntries ??= new int[RecentSlots];
+            slot = (int)((key * 0x9E3779B97F4A7C15UL) >> 54); // the top 10 bits: RecentSlots = 1 << 10
+            index = _recentEntries[slot] - 1;
+            return index >= 0 && _recentKeys[slot] == key;
+        }
+
+        private void Remember(int slot, ulong key, int index)
+        {
+            _recentKeys![slot] = key;
+            _recentEntries![slot] = index + 1;
+        }
+
+        /// <summary>The bytes of the dictionary page as buffered (before a decimal's entries are reversed).</summary>
+        public int DictionaryPageLength => _bytesTable?.ByteCount ?? _dictPageSize;
+
+        /// <summary>
+        /// The buffered entries in place, for a column rebuilt at flush rather than written with its dictionary:
+        /// the first <see cref="DictionaryPageLength"/> bytes of <paramref name="page"/>. False for a decimal, whose
+        /// entries a written page reverses and the rebuild expects reversed, and for the byte-keyed arms, whose table
+        /// keeps its buffer private; those take <see cref="BuildDictionaryPage"/>.
+        /// </summary>
+        public bool TryBorrowPage(out byte[] page)
+        {
+            page = _fixedPage;
+            return _bytesTable is null && !IsFlbaDecimal(ArrowType);
+        }
+
+        /// <summary>
         /// A new fixed-width entry of <paramref name="size"/> bytes at the end of the page, numbered
         /// <paramref name="index"/>, for the caller to fill. Marks the dictionary full once it passes the limit.
         /// </summary>
         private Span<byte> NewEntry(int size, out int index)
         {
-            if (_dictPageSize + size > _fixedPage.Length)
-                System.Array.Resize(ref _fixedPage, Math.Max(256, Math.Max(_fixedPage.Length * 2, _dictPageSize + size)));
+            // In long: doubling past 1 GiB wraps an int, and growing by one entry each time after that copied the
+            // whole page per value.
+            long needed = (long)_dictPageSize + size;
+            if (needed > _fixedPage.Length)
+            {
+                if (needed > DictionaryEncoder.BytesHashTable.MaxArrayLength)
+                    throw new InvalidOperationException(
+                        "A column's values in one row group exceed the largest array .NET can allocate; flush row groups sooner.");
+                System.Array.Resize(ref _fixedPage, (int)Math.Min(DictionaryEncoder.BytesHashTable.MaxArrayLength,
+                    Math.Max(256, Math.Max((long)_fixedPage.Length * 2, needed))));
+            }
 
             var entry = _fixedPage.AsSpan(_dictPageSize, size);
             _dictPageSize += size;
@@ -1217,8 +1308,10 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         {
             if (Raw)
             {
-                DictionaryCount++;
-                return _bytesTable!.Append(valueBytes);
+                int entry = _bytesTable!.AppendRecent(valueBytes, out bool added);
+                if (added)
+                    DictionaryCount++;
+                return entry;
             }
 
             int idx = _bytesTable!.GetOrAdd(valueBytes, out bool inserted);
@@ -1297,6 +1390,12 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             _bytesTable = null;
             _dictPageSize = 0;
             _dictionaryFull = false;
+            // A page that held raw values is as large as the column was; keep one the size of a dictionary for
+            // reuse, and release a larger one rather than root it for the writer's lifetime.
+            if (_fixedPage.Length > DictionaryLimit)
+                _fixedPage = [];
+            if (_recentEntries is not null)
+                System.Array.Clear(_recentEntries, 0, _recentEntries.Length);
             DictionaryCount = 0;
             Indices?.Reset();
             DefLevels?.Reset();

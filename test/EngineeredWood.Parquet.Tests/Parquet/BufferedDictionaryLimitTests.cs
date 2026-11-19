@@ -176,6 +176,61 @@ public class BufferedDictionaryLimitTests : IDisposable
             s => Assert.Equal(Encoding.RleDictionary, s.Encoding));
     }
 
+    [Fact]
+    public async Task RepetitiveValues_Raw_TakeAnEntryEach()
+    {
+        // Without a dictionary every value is buffered raw, but against a small cache of recent values: four
+        // distinct 4 KiB strings over 100,000 rows are four entries, not 410 MB.
+        var big = Enumerable.Range(0, 4).Select(k => new string((char)('a' + k), 4096)).ToArray();
+        var builder = new StringArray.Builder();
+        for (int i = 0; i < 100_000; i++)
+            builder.Append(big[i % 4]);
+        var batch = Batch(builder.Build(), nullable: false);
+
+        var options = ParquetWriteOptions.Default with { DictionaryEnabled = false, RowGroupMaxRows = 1_000_000 };
+        await using (var writer = new BufferedParquetWriter(new LocalSequentialFile(Path.Combine(_tempDir, "repetitive.parquet")), ownsFile: true, options))
+        {
+#if NET8_0_OR_GREATER
+            long before = GC.GetAllocatedBytesForCurrentThread();
+#endif
+            for (int start = 0; start < batch.Length; start += 10_000)
+                await writer.AppendAsync(batch.Slice(start, 10_000));
+#if NET8_0_OR_GREATER
+            // Levels and indices are a few bytes a row; the values would be 410 MB.
+            Assert.InRange(GC.GetAllocatedBytesForCurrentThread() - before, 0, 50L << 20);
+#endif
+            await writer.CloseAsync();
+        }
+
+        var (direct, buffered) = await WriteBothAsync(batch, DataPageVersion.V1, Limit, dictionary: false);
+        await AssertSameChunksAsync(direct, buffered);
+        await AssertSameRowsAsync(batch, buffered);
+    }
+
+    [Fact]
+    public async Task ResetReleasesARawPage()
+    {
+        // A page that held a row group's raw values is as large as the column was; once the row group is flushed
+        // it must not stay rooted for the writer's lifetime. Read through reflection: the state is private.
+        var options = ParquetWriteOptions.Default with { DictionaryEnabled = false, RowGroupMaxRows = 1_000_000 };
+        await using var writer = new BufferedParquetWriter(
+            new LocalSequentialFile(Path.Combine(_tempDir, "reset.parquet")), ownsFile: true, options);
+        await writer.AppendAsync(Int64Batch(300_000, 0, nullable: false)); // all distinct: 2.4 MB raw
+        Assert.True(FixedPageLength(writer) > options.DictionaryPageSizeLimit);
+
+        await writer.FlushRowGroupAsync();
+        Assert.Equal(0, FixedPageLength(writer));
+        await writer.CloseAsync();
+    }
+
+    private static int FixedPageLength(BufferedParquetWriter writer)
+    {
+        var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+        var states = (System.Array)typeof(BufferedParquetWriter).GetField("_columnStates", flags)!.GetValue(writer)!;
+        var state = states.GetValue(0)!;
+        return ((byte[])state.GetType().GetField("_fixedPage", flags)!.GetValue(state)!).Length;
+    }
+
     private static RecordBatch Int64Batch(int rows, int lowRows, bool nullable)
     {
         var builder = new Int64Array.Builder();
