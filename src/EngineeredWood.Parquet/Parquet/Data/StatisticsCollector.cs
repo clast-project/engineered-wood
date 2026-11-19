@@ -774,6 +774,10 @@ internal static class StatisticsCollector
     /// <summary>The bounds and NaN count of <paramref name="values"/>, every one of them present.</summary>
     private static (byte[]?, byte[]?, long) FloatMinMax(ReadOnlySpan<float> values, bool totalOrder)
     {
+        if (FloatBounds.TryFloat(values, out int minBits, out int maxBits, out long count))
+            return (Int32BitsToBytes(minBits), Int32BitsToBytes(maxBits), count);
+
+        // Every value is NaN, or there is none: the scan below gives the NaN bounds total order records.
         var bitsBuffer = MemoryMarshal.Cast<float, int>(values);
         bool first = true;
         float min = 0, max = 0;
@@ -900,6 +904,10 @@ internal static class StatisticsCollector
     /// <summary>The bounds and NaN count of <paramref name="values"/>, every one of them present.</summary>
     private static (byte[]?, byte[]?, long) DoubleMinMax(ReadOnlySpan<double> values, bool totalOrder)
     {
+        if (FloatBounds.TryDouble(values, out long minBits, out long maxBits, out long count))
+            return (Int64BitsToBytes(minBits), Int64BitsToBytes(maxBits), count);
+
+        // Every value is NaN, or there is none: the scan below gives the NaN bounds total order records.
         var bitsBuffer = MemoryMarshal.Cast<double, long>(values);
         bool first = true;
         double min = 0, max = 0;
