@@ -31,8 +31,8 @@ internal static class DeltaStatsProfile
         string root = Path.Combine(Path.GetTempPath(), "ew-delta-stats-" + Guid.NewGuid().ToString("N"));
 
         Console.WriteLine($"{rows:N0} rows, one column; best of {rounds} (ms).");
-        Console.WriteLine("| Column | Delta stats alone | Append, stats on | Append, stats off |");
-        Console.WriteLine("|---|---|---|---|");
+        Console.WriteLine("| Column | Delta stats alone | Delta stats, caches flushed | Append, stats on | Append, stats off |");
+        Console.WriteLine("|---|---|---|---|---|");
         try
         {
             int n = 0;
@@ -53,11 +53,22 @@ internal static class DeltaStatsProfile
                     collect = Math.Min(collect, clock.Elapsed.TotalMilliseconds);
                 }
 
+                // The same, with the batch pushed out of every cache first, as it is by the time a write that
+                // buffers a row group gets to it: a 64 MB sweep, more than any L3 here.
+                double cold = double.MaxValue;
+                for (int i = 0; i < rounds; i++)
+                {
+                    Flush();
+                    var clock = Stopwatch.StartNew();
+                    StatsCollector.Collect(batch);
+                    cold = Math.Min(cold, clock.Elapsed.TotalMilliseconds);
+                }
+
                 double on = await AppendAsync(Path.Combine(root, $"{n}-on"), batch, rounds, null);
                 double off = await AppendAsync(Path.Combine(root, $"{n}-off"), batch, rounds,
                     new Dictionary<string, string> { ["delta.dataSkippingNumIndexedCols"] = "0" });
                 n++;
-                Console.WriteLine($"| {name} | {collect:F2} | {on:F2} | {off:F2} |");
+                Console.WriteLine($"| {name} | {collect:F2} | {cold:F2} | {on:F2} | {off:F2} |");
             }
         }
         finally
@@ -66,6 +77,22 @@ internal static class DeltaStatsProfile
         }
 
         return 0;
+    }
+
+    private static readonly byte[] Sweep = new byte[64 << 20];
+    private static long _sink;
+
+    /// <summary>Reads and writes a buffer larger than the caches, evicting whatever they held.</summary>
+    private static void Flush()
+    {
+        long sum = 0;
+        for (int i = 0; i < Sweep.Length; i += 64)
+        {
+            Sweep[i]++;
+            sum += Sweep[i];
+        }
+
+        _sink += sum;
     }
 
     private static async Task<double> AppendAsync(
