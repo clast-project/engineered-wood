@@ -38,13 +38,18 @@ internal static class DeltaStatsProfile
             int n = 0;
             foreach (var (name, batch) in Shapes(rows))
             {
+                // Warm for at least 300 ms first: tiered compilation swaps in optimised code only after a
+                // call-counting delay (100 ms by default), which a few rounds of a 1 ms scan never reach. The
+                // first version of this harness timed tier-0 code: DOUBLE read 2.1 ms where it takes 0.43.
+                for (var warm = Stopwatch.StartNew(); warm.ElapsedMilliseconds < 300;)
+                    StatsCollector.Collect(batch);
+
                 double collect = double.MaxValue;
-                for (int i = -3; i < rounds; i++)
+                for (int i = 0; i < rounds; i++)
                 {
                     var clock = Stopwatch.StartNew();
                     StatsCollector.Collect(batch);
-                    double ms = clock.Elapsed.TotalMilliseconds;
-                    if (i >= 0) collect = Math.Min(collect, ms);
+                    collect = Math.Min(collect, clock.Elapsed.TotalMilliseconds);
                 }
 
                 double on = await AppendAsync(Path.Combine(root, $"{n}-on"), batch, rounds, null);
