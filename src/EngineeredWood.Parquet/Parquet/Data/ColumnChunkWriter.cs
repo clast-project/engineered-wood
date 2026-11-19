@@ -750,12 +750,27 @@ internal static class ColumnChunkWriter
         int bytesPerIndex = Math.Max(1, (bitWidth + 7) / 8);
         int valuesPerPage = Math.Max(1, options.DataPageSize / bytesPerIndex);
 
-        var output = new ColumnChunkOutput(
-            EstimateDictionaryColumnSize(
-                dictResult.DictionaryPageData.Length, rowCount,
-                LayOutPages(repLevels, rowCount, valuesPerPage, options.DataPageRowCountLimit),
-                bitWidth, maxDefLevel, maxRepLevel, options.Compression),
-            options);
+        int capacity = EstimateDictionaryColumnSize(
+            dictResult.DictionaryPageData.Length, rowCount,
+            LayOutPages(repLevels, rowCount, valuesPerPage, options.DataPageRowCountLimit),
+            bitWidth, maxDefLevel, maxRepLevel, options.Compression);
+        if (dictionaryEnd < rowCount)
+        {
+            // The pages after the cut are the column's own encoding, sized as a chunk without a dictionary is (for
+            // the whole chunk, which over-allows the part before the cut). Left at the dictionary estimate, a
+            // partial string chunk grew its buffer by doubling: 4 ms more per 1M values than declining it whole.
+            int nonNullCount = maxDefLevel > 0 ? CountNonNull(defLevels!, 0, rowCount, maxDefLevel) : rowCount;
+            long plain = EstimateColumnSize(
+                rowCount, nonNullCount, PlainValueBytes(array!, nonNullCount, physicalType, typeLength),
+                LayOutPages(repLevels, rowCount,
+                    Math.Max(1, EstimateValuesPerPage(array!, physicalType, typeLength, options.DataPageSize)),
+                    options.DataPageRowCountLimit),
+                physicalType, typeLength, maxDefLevel, maxRepLevel,
+                options.ByteArrayEncoding == ByteArrayEncoding.DeltaByteArray, options.Compression);
+            capacity = (int)Math.Min(int.MaxValue, (long)capacity + plain);
+        }
+
+        var output = new ColumnChunkOutput(capacity, options);
 
         // 1. Encode dictionary page
         int dictionaryPageSize = WriteDictionaryPage(output, dictResult, options);
