@@ -238,7 +238,7 @@ internal static class PageMapBuilder
             throw new ArgumentOutOfRangeException(nameof(windowBytes));
 
         var scan = new Scan(column, columnMeta, validateCrc);
-        var (chunkUncompressed, maxPage) = PageReader.UncompressedLimits(columnMeta, maxPageUncompressedSize);
+        var limits = PageReader.UncompressedLimits(columnMeta, maxPageUncompressedSize);
         try
         {
             long position = 0;
@@ -255,7 +255,7 @@ internal static class PageMapBuilder
                            .ConfigureAwait(false))
                 {
                     next = ScanWindow(
-                        scan, window.Memory.Span, position, chunk.Length, last, canGrow, chunkUncompressed, maxPage,
+                        scan, window.Memory.Span, position, chunk.Length, last, canGrow, limits,
                         ref ordinal, out side);
                 }
 
@@ -310,8 +310,7 @@ internal static class PageMapBuilder
         long chunkLength,
         bool last,
         bool canGrow,
-        long chunkUncompressed,
-        int? maxPage,
+        UncompressedSizeLimits limits,
         ref int ordinal,
         out SidePage? side)
     {
@@ -325,7 +324,7 @@ internal static class PageMapBuilder
             try
             {
                 header = PageReader.ReadHeader(
-                    window.Slice(at), position, chunkLength - position, scan.Column, chunkUncompressed, maxPage, ordinal,
+                    window.Slice(at), position, chunkLength - position, scan.Column, limits, ordinal,
                     out headerSize);
             }
             catch (ParquetFormatException) when (!last && (at > 0 || canGrow))

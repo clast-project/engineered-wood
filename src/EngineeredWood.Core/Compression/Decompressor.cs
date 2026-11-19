@@ -553,4 +553,45 @@ internal static class Decompressor
                 "Use the uncompressed page size from the page header instead."),
         };
     }
+
+    /// <summary>
+    /// The most bytes any <paramref name="compressedLength"/> bytes of <paramref name="codec"/> can decompress to,
+    /// whatever they hold; null for a codec whose format sets no useful bound. A size declared beside compressed
+    /// data (a Parquet page header's) sizes the buffer it is decompressed into before a byte of it is read, so a
+    /// declared size past this bound can only be a lie, and refusing it keeps a few stored bytes from claiming
+    /// gigabytes. Each bound is the format's worst case per stored byte, rounded up:
+    /// <list type="bullet">
+    /// <item>Snappy: 64 per 3. A copy with a two-byte offset is three bytes and copies at most 64; a copy with a
+    /// one-byte offset is two bytes for at most 11, one with a four-byte offset five bytes for at most 64, and a
+    /// literal writes no more than it stores. The length preamble writes nothing.</item>
+    /// <item>LZ4, raw or in any of the framings <see cref="CompressionCodec.Lz4Hadoop"/> accepts: 255 per byte. A
+    /// sequence's token and offset take three bytes for at most 19 bytes of match, and each further byte of match
+    /// length adds at most 255; literals write no more than they store, and framing writes nothing.</item>
+    /// <item>Gzip and Deflate: 1032 per byte. A match writes at most 258 bytes, and its length and distance codes
+    /// take at least one bit each: the literal/length code always holds end-of-block beside the length, and a
+    /// distance code of one symbol is still sent in one bit.</item>
+    /// <item>Zstd: 32768 per byte. A block writes at most 128 KiB and takes a three-byte header and at least one
+    /// byte of content; frame headers, checksums and skippable frames write nothing. This holds for RFC 8878
+    /// frames, not for the legacy formats before zstd 0.8.</item>
+    /// <item>Brotli: none. A prefix code of one symbol is sent in no bits at all, so a command can cost only its
+    /// extra bits, and one copy can write megabytes from a few bytes of them.</item>
+    /// </list>
+    /// </summary>
+    internal static long? MaxDecompressedLength(CompressionCodec codec, long compressedLength)
+    {
+        if (compressedLength < 0)
+            throw new ArgumentOutOfRangeException(nameof(compressedLength), compressedLength, "Must not be negative.");
+        // A Parquet page's stored bytes are an int; past that, the products below could overflow.
+        if (compressedLength > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(compressedLength), compressedLength, "Must fit an int.");
+
+        return codec switch
+        {
+            CompressionCodec.Snappy => (compressedLength * 64 + 2) / 3,
+            CompressionCodec.Lz4 or CompressionCodec.Lz4Hadoop => compressedLength * 255,
+            CompressionCodec.Gzip or CompressionCodec.Deflate => compressedLength * 1032,
+            CompressionCodec.Zstd => compressedLength * 32768,
+            _ => null,
+        };
+    }
 }
