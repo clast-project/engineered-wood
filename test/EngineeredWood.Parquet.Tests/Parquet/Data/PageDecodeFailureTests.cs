@@ -258,6 +258,57 @@ public class PageDecodeFailureTests : IDisposable
     }
 
     /// <summary>
+    /// An all-null V2 page whose value section is a compressed empty stream, as EngineeredWood writes one, reads.
+    /// One whose header declares more than that stream can decompress to is refused from its header, although
+    /// its levels would have shown that nothing needs decompressing (#935 review): the header lies, and pyarrow
+    /// and DuckDB refuse the same page as they decompress it (DataFusion reads it). Checking every page's header
+    /// in one place is worth refusing a page no honest writer produces.
+    /// </summary>
+    [Fact]
+    public void AnAllNullV2PagesCompressedEmptySection_IsHeldToItsCodecsBound()
+    {
+        // Four nulls: one RLE run of four 0 definition levels (V2 levels carry no length prefix).
+        byte[] levels = [4 << 1, 0];
+        byte[] empty = new byte[Compressor.GetMaxCompressedLength(CompressionCodec.Snappy, 0)];
+        empty = empty.AsSpan(0, Compressor.Compress(CompressionCodec.Snappy, [], empty)).ToArray();
+        long most = Decompressor.MaxDecompressedLength(CompressionCodec.Snappy, empty.Length)!.Value;
+
+        var honest = AllNull(declaredValueBytes: 0);
+        var whole = ReadWhole(honest);
+        Assert.Equal(4, whole.NullCount);
+        var batched = ReadBatched(honest);
+        Assert.Equal(4, batched.NullCount);
+        GC.KeepAlive(whole);
+        GC.KeepAlive(batched);
+
+        AssertRefused(AllNull(declaredValueBytes: checked((int)most + 1)),
+            $"declares {most + 1} bytes decompressed from {empty.Length} Snappy bytes, more than Snappy can expand them to ({most}).");
+
+        TestChunk AllNull(int declaredValueBytes)
+        {
+            byte[] payload = [.. levels, .. empty];
+            var header = new PageHeader
+            {
+                Type = PageType.DataPageV2,
+                UncompressedPageSize = levels.Length + declaredValueBytes,
+                CompressedPageSize = payload.Length,
+                DataPageHeaderV2 = new DataPageHeaderV2
+                {
+                    NumValues = 4,
+                    NumNulls = 4,
+                    NumRows = 4,
+                    Encoding = Encoding.Plain,
+                    DefinitionLevelsByteLength = levels.Length,
+                    RepetitionLevelsByteLength = 0,
+                    IsCompressed = true,
+                },
+            };
+            return Chunk(PhysicalType.Int32, CompressionCodec.Snappy, numValues: 4, typeLength: null, nullable: true,
+                (header, payload));
+        }
+    }
+
+    /// <summary>
     /// An uncompressed chunk's pages are read in place, so their uncompressed size is not read; a
     /// wrong one is not refused, as other readers do not refuse it.
     /// </summary>
@@ -439,6 +490,11 @@ public class PageDecodeFailureTests : IDisposable
 
     private static TestChunk Chunk(
         PhysicalType type, CompressionCodec codec, long numValues, int? typeLength,
+        params (PageHeader Header, byte[] Payload)[] pages) =>
+        Chunk(type, codec, numValues, typeLength, nullable: false, pages);
+
+    private static TestChunk Chunk(
+        PhysicalType type, CompressionCodec codec, long numValues, int? typeLength, bool nullable,
         params (PageHeader Header, byte[] Payload)[] pages)
     {
         var bytes = new List<byte>();
@@ -454,7 +510,11 @@ public class PageDecodeFailureTests : IDisposable
         var column = new SchemaDescriptor(
         [
             new SchemaElement { Name = "schema", NumChildren = 1 },
-            new SchemaElement { Name = "n", Type = type, TypeLength = typeLength, RepetitionType = FieldRepetitionType.Required },
+            new SchemaElement
+            {
+                Name = "n", Type = type, TypeLength = typeLength,
+                RepetitionType = nullable ? FieldRepetitionType.Optional : FieldRepetitionType.Required,
+            },
         ]).Columns[0];
         var meta = new ColumnMetaData
         {
@@ -476,7 +536,7 @@ public class PageDecodeFailureTests : IDisposable
             PhysicalType.FixedLenByteArray => new FixedSizeBinaryType(typeLength!.Value),
             _ => BinaryType.Default,
         };
-        return new TestChunk([.. bytes], column, meta, new Field("n", arrowType, nullable: false));
+        return new TestChunk([.. bytes], column, meta, new Field("n", arrowType, nullable));
     }
 
     private static PageHeader DataPage(int values, Encoding encoding, int size, int? uncompressed = null) => new()
