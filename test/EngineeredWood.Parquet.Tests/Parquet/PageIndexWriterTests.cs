@@ -703,7 +703,9 @@ public class PageIndexWriterTests : IDisposable
         var (bytes, metadata) = ReadFile(path);
         var chunks = metadata.RowGroups.SelectMany(rg => rg.Columns).ToList();
 
-        long lastChunkEnd = chunks.Max(c => c.MetaData!.DataPageOffset + c.MetaData.TotalCompressedSize);
+        // A chunk starts at its dictionary page when it has one, and its compressed size counts that page.
+        long lastChunkEnd = chunks.Max(c =>
+            (c.MetaData!.DictionaryPageOffset ?? c.MetaData.DataPageOffset) + c.MetaData.TotalCompressedSize);
         long footerStart = bytes.Length - 8 - BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(bytes.Length - 8));
 
         var columnIndexes = chunks.Where(c => c.ColumnIndexOffset is not null).ToList();

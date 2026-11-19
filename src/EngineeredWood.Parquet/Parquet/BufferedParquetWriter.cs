@@ -153,35 +153,21 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             repLevelsPerColumn[i] = s.RepLevels?.ToArray(s.LevelCount);
             if (s.DictionaryCount > 0)
             {
-                // Check cardinality threshold: if too many distinct values, fall back to
-                // non-dictionary encoding at flush time (reconstruct values from dict + indices)
-                float cardinality = s.NonNullCount > 0
-                    ? (float)s.DictionaryCount / s.NonNullCount
-                    : 0;
+                var built = new DictionaryEncoder.DictionaryResult
+                {
+                    DictionaryPageData = s.BuildDictionaryPage(),
+                    DictionaryCount = s.DictionaryCount,
+                    Indices = s.Indices!.ToArray(s.NonNullCount),
+                };
+                dictResults[i] = built;
 
-                // Per-column resolution, not the file-wide flag: an option that held for one writer and
-                // not the other would be worse than not having it.
-                if (_options.GetDictionaryEnabled(s.PathInSchema)
-                    && cardinality <= DictionaryEncoder.CardinalityThreshold)
-                {
-                    dictResults[i] = new DictionaryEncoder.DictionaryResult
-                    {
-                        DictionaryPageData = s.BuildDictionaryPage(),
-                        DictionaryCount = s.DictionaryCount,
-                        Indices = s.Indices!.ToArray(s.NonNullCount),
-                    };
-                }
-                else
-                {
-                    // Cardinality too high — will reconstruct and use non-dictionary encoding
-                    useNonDictionary[i] = true;
-                    dictResults[i] = new DictionaryEncoder.DictionaryResult
-                    {
-                        DictionaryPageData = s.BuildDictionaryPage(),
-                        DictionaryCount = s.DictionaryCount,
-                        Indices = s.Indices!.ToArray(s.NonNullCount),
-                    };
-                }
+                // The file writer's test (DictionaryEncoder.FirstPagePays): a dictionary that does not pay on
+                // the first page is declined, and the values are reconstructed from it and written in the
+                // column's own encoding. Per-column resolution, not the file-wide flag: an option that held for
+                // one writer and not the other would be worse than not having it.
+                useNonDictionary[i] = !_options.GetDictionaryEnabled(s.PathInSchema)
+                    || !DictionaryEncoder.FirstPagePays(
+                        built, s.NonNullCount, s.PhysicalType, s.TypeLength, DictionaryEncoder.FirstPageBytes);
             }
         }
 
