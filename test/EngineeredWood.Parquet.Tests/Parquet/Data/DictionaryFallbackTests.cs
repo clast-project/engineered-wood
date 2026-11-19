@@ -141,8 +141,10 @@ public class DictionaryFallbackTests : IDisposable
     private const int ListRows = 100_000;
     private const int ListLowRows = 70_000;
 
+    // 101 entries before the switch, so the 8 KiB dictionary (1,024 entries) fills 923 values into the distinct
+    // ones: in the middle of a record (923 = 3 * 307 + 2), which the cut must move back from.
     private static long ListElement(int row, int k) =>
-        row < ListLowRows ? (row * 3 + k) % 100 : 10_000_000L + row * 3 + k;
+        row < ListLowRows ? (row * 3 + k) % 101 : 10_000_000L + row * 3 + k;
 
     [Theory]
     [InlineData(DataPageVersion.V1)]
@@ -180,13 +182,21 @@ public class DictionaryFallbackTests : IDisposable
                 Assert.Equal(new long?[] { ListElement(r, 0), ListElement(r, 1), ListElement(r, 2) }, lists[r]);
         }
 
-        // Every page starts a record: its first row index times 3 is its first value.
+        // Every page starts a record: the values before it are three times its first row index.
         var bytes = File.ReadAllBytes(path);
         var meta = await ReadMetadataAsync(path);
         var c = meta.RowGroups[0].Columns[0];
         var offsetIndex = MetadataDecoder.DecodeOffsetIndex(bytes.AsSpan(checked((int)c.OffsetIndexOffset!.Value), c.OffsetIndexLength!.Value));
         Assert.True(offsetIndex.PageLocations.Count > 1);
-        Assert.All(offsetIndex.PageLocations, p => Assert.True(p.FirstRowIndex >= 0));
+        long valuesBefore = 0;
+        foreach (var page in offsetIndex.PageLocations)
+        {
+            Assert.Equal(3 * page.FirstRowIndex, valuesBefore);
+            var header = PageHeaderDecoder.Decode(bytes.AsSpan(checked((int)page.Offset)), out _);
+            valuesBefore += header.DataPageHeader?.NumValues ?? header.DataPageHeaderV2!.NumValues;
+        }
+
+        Assert.Equal(3L * ListRows, valuesBefore);
     }
 
     // ---- Declined whole ----
@@ -200,6 +210,20 @@ public class DictionaryFallbackTests : IDisposable
             builder.Append(i % 100);
 
         string path = await WriteAsync("small-limit", builder.Build(), Int64Type.Default, false, DataPageVersion.V1, limit: 512);
+        var chunk = (await ReadMetadataAsync(path)).RowGroups[0].Columns[0].MetaData!;
+        Assert.Null(chunk.DictionaryPageOffset);
+        Assert.DoesNotContain(Encoding.RleDictionary, chunk.Encodings);
+    }
+
+    [Fact]
+    public async Task StringDictionaryFullBeforeTheFirstPageDecides_IsDeclinedWhole()
+    {
+        // 200 distinct 12-byte strings are 3,200 bytes of dictionary: over a 2 KiB limit long before 1 MiB of values.
+        var builder = new StringArray.Builder();
+        for (int i = 0; i < 50_000; i++)
+            builder.Append("value-" + (i % 200).ToString("D6", System.Globalization.CultureInfo.InvariantCulture));
+
+        string path = await WriteAsync("small-limit-string", builder.Build(), StringType.Default, false, DataPageVersion.V1, limit: 2048);
         var chunk = (await ReadMetadataAsync(path)).RowGroups[0].Columns[0].MetaData!;
         Assert.Null(chunk.DictionaryPageOffset);
         Assert.DoesNotContain(Encoding.RleDictionary, chunk.Encodings);
@@ -240,6 +264,12 @@ public class DictionaryFallbackTests : IDisposable
         Assert.Contains(dataPages, s => s.Encoding == Encoding.RleDictionary && s.Count > 0);
         Assert.Contains(dataPages, s => s.Encoding != Encoding.RleDictionary && s.Count > 0);
         Assert.False(MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(chunk));
+
+        // The entry that would have passed the limit is not in the page.
+        var bytes = File.ReadAllBytes(path);
+        var dictionary = PageHeaderDecoder.Decode(bytes.AsSpan(checked((int)chunk.DictionaryPageOffset!.Value)), out _);
+        Assert.Equal(PageType.DictionaryPage, dictionary.Type);
+        Assert.InRange(dictionary.UncompressedPageSize, 1, DictionaryLimit);
         return chunk;
     }
 
