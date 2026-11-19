@@ -38,10 +38,11 @@ internal static class DeltaStatsProfile
             int n = 0;
             foreach (var (name, batch) in Shapes(rows))
             {
-                // Warm for at least 300 ms first: tiered compilation swaps in optimised code only after a
-                // call-counting delay (100 ms by default), which a few rounds of a 1 ms scan never reach. The
-                // first version of this harness timed tier-0 code: DOUBLE read 2.1 ms where it takes 0.43.
-                for (var warm = Stopwatch.StartNew(); warm.ElapsedMilliseconds < 300;)
+                // Warm for 3 s first, to time the code a long-running writer runs. Tiered compilation swaps in
+                // optimised code only after a call-counting delay, and a method called once per batch that loops
+                // over thousands of chunks runs as an on-stack-replacement compile for a long while: after 300 ms
+                // DOUBLE still read 2.1 ms and INT64 with nulls 2.4, against 0.42 and 0.68 at steady state.
+                for (var warm = Stopwatch.StartNew(); warm.ElapsedMilliseconds < 3000;)
                     StatsCollector.Collect(batch);
 
                 double collect = double.MaxValue;
