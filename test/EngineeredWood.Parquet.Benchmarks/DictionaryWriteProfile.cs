@@ -29,8 +29,8 @@ internal static class DictionaryWriteProfile
         int rows = args.Length > 2 ? int.Parse(args[2], CultureInfo.InvariantCulture) : 1_000_000;
 
         Console.WriteLine($"{rows:N0} rows, one column, uncompressed, in memory; best of {rounds} after a 3 s warm-up (ms).");
-        Console.WriteLine("| Column | Dictionary? | Write, dict on | Write, dict off | TryEncode alone | Hash alone | Bytes, dict on |");
-        Console.WriteLine("|---|---|---|---|---|---|---|");
+        Console.WriteLine("| Column | Dictionary? | Write, dict on | Write, dict off | Buffered write, dict on | TryEncode alone | Hash alone | Bytes, dict on |");
+        Console.WriteLine("|---|---|---|---|---|---|---|---|");
 
         foreach (var (name, batch, physical) in Shapes(rows))
         {
@@ -42,13 +42,24 @@ internal static class DictionaryWriteProfile
 
             double wOn = Time(rounds, () => NullableColumnProfile.DiscardWriteAsync(batch, on).GetAwaiter().GetResult());
             double wOff = Time(rounds, () => NullableColumnProfile.DiscardWriteAsync(batch, off).GetAwaiter().GetResult());
+            double buffered = Time(rounds, () => BufferedWriteAsync(batch, on).GetAwaiter().GetResult());
             double encode = Time(rounds, () => DictionaryEncoder.TryEncode(array, physical, 0, null, array.Length, on));
             string hash = physical == PhysicalType.ByteArray ? Time(rounds, () => HashAll(array)).ToString("F2", CultureInfo.InvariantCulture) : "-";
 
-            Console.WriteLine($"| {name} | {(built ? "kept" : "abandoned")} | {wOn:F2} | {wOff:F2} | {encode:F2} | {hash} | {file.Length:N0} |");
+            Console.WriteLine($"| {name} | {(built ? "kept" : "abandoned")} | {wOn:F2} | {wOff:F2} | {buffered:F2} | {encode:F2} | {hash} | {file.Length:N0} |");
         }
 
         return 0;
+    }
+
+    /// <summary>The batch through <see cref="BufferedParquetWriter"/>, in 100,000-row appends, discarding the bytes.</summary>
+    private static async Task BufferedWriteAsync(RecordBatch batch, ParquetWriteOptions options)
+    {
+        await using var writer = new BufferedParquetWriter(new CountingSequentialFile(), ownsFile: true,
+            options with { RowGroupMaxRows = batch.Length });
+        for (int start = 0; start < batch.Length; start += 100_000)
+            await writer.AppendAsync(batch.Slice(start, Math.Min(100_000, batch.Length - start)));
+        await writer.CloseAsync();
     }
 
     private static double Time(int rounds, Action action)
