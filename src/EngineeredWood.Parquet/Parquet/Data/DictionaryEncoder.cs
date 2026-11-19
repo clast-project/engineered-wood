@@ -738,17 +738,7 @@ internal static class DictionaryEncoder
             // A key of at most 16 bytes is two words, hashed and compared as such; a longer one is hashed with
             // XxHash3 and compared byte by byte.
             bool shortKey = key.Length <= ShortKey;
-            ulong w0 = 0, w1 = 0;
-            int hash;
-            if (shortKey)
-            {
-                Words(key, out w0, out w1);
-                hash = Mix(w0, w1, key.Length);
-            }
-            else
-            {
-                hash = (int)XxHash3.HashToUInt64(key);
-            }
+            int hash = Hash(key, out ulong w0, out ulong w1);
 
             int slot = hash & _mask;
             while (true)
@@ -828,12 +818,76 @@ internal static class DictionaryEncoder
 
         private static ulong RotateLeft(ulong value, int offset) => (value << offset) | (value >> (64 - offset));
 
+        /// <summary>Slots in the bounded cache <see cref="AppendRecent"/> deduplicates against.</summary>
+        private const int RecentSlots = 1024;
+
+        // Per recent slot: the entry's number plus one (0 = empty), and its hash.
+        private int[]? _recentEntries;
+        private int[]? _recentHashes;
+
+        /// <summary>
+        /// The number of <paramref name="key"/>'s entry for a caller that has stopped deduplicating fully (the buffered
+        /// writer, once a column's dictionary passes the page size limit, or has none): the entry of an equal key
+        /// among the last that hashed to its slot in a small cache (<see cref="RecentSlots"/> slots), else a new entry
+        /// appended without a slot in the table, which no longer grows. Repeats of a small working set of values then
+        /// cost one entry each, as they did when every value was looked up, and the memory spent finding them is
+        /// bounded.
+        /// </summary>
+        public int AppendRecent(ReadOnlySpan<byte> key, out bool added)
+        {
+            _recentEntries ??= new int[RecentSlots];
+            _recentHashes ??= new int[RecentSlots];
+
+            int hash = Hash(key, out _, out _);
+            int slot = (int)((uint)hash * 0x9E3779B9u >> 22); // the top 10 bits: RecentSlots = 1 << 10
+            int entry = _recentEntries[slot] - 1;
+            if (entry >= 0 && _recentHashes[slot] == hash && EntryLength(entry) == key.Length
+                && key.SequenceEqual(_page.AsSpan(_starts[entry], key.Length)))
+            {
+                added = false;
+                return entry;
+            }
+
+            entry = Add(key);
+            _recentEntries[slot] = entry + 1;
+            _recentHashes[slot] = hash;
+            added = true;
+            return entry;
+        }
+
+        /// <summary>Entry <paramref name="entry"/>'s length in bytes, from where it and the next one start.</summary>
+        private int EntryLength(int entry) =>
+            (entry + 1 < _count ? _starts[entry + 1] - (_lengthPrefixed ? 4 : 0) : _pageLength) - _starts[entry];
+
+        /// <summary>The hash a key is found by, and for a short key its words (see <see cref="Words"/>).</summary>
+        private static int Hash(ReadOnlySpan<byte> key, out ulong w0, out ulong w1)
+        {
+            if (key.Length <= ShortKey)
+            {
+                Words(key, out w0, out w1);
+                return Mix(w0, w1, key.Length);
+            }
+
+            w0 = w1 = 0;
+            return (int)XxHash3.HashToUInt64(key);
+        }
+
+        /// <summary>The largest array .NET allocates (<c>Array.MaxLength</c>, which netstandard2.0 lacks).</summary>
+        internal const int MaxArrayLength = 0x7FFFFFC7;
+
         /// <summary>Appends <paramref name="key"/> to the page as the next entry.</summary>
         private int Add(ReadOnlySpan<byte> key)
         {
-            int needed = _pageLength + (_lengthPrefixed ? 4 : 0) + key.Length;
+            // In long: past 2 GiB the int sum wraps. The file writer stops at the dictionary page size limit; the
+            // buffered writer's appends past it do not.
+            long needed = (long)_pageLength + (_lengthPrefixed ? 4 : 0) + key.Length;
             if (needed > _page.Length)
-                System.Array.Resize(ref _page, (int)Math.Min(Math.Max((long)_page.Length * 2, needed), int.MaxValue));
+            {
+                if (needed > MaxArrayLength)
+                    throw new InvalidOperationException(
+                        "A column's values in one row group exceed the largest array .NET can allocate; flush row groups sooner.");
+                System.Array.Resize(ref _page, (int)Math.Min(MaxArrayLength, Math.Max((long)_page.Length * 2, needed)));
+            }
 
             if (_lengthPrefixed)
             {
