@@ -142,7 +142,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         // Build DictionaryResult for each column, and decide encoding strategy
         var dictResults = new DictionaryEncoder.DictionaryResult?[states.Length];
-        var useNonDictionary = new bool[states.Length]; // true if cardinality too high → plain encoding
+        var useNonDictionary = new bool[states.Length]; // true when the dictionary is not written as built
+        var overLimit = new bool[states.Length]; // true when it passed DictionaryPageSizeLimit
         int[]?[] defLevelsPerColumn = new int[]?[states.Length];
         int[]?[] repLevelsPerColumn = new int[]?[states.Length];
 
@@ -161,11 +162,20 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 };
                 dictResults[i] = built;
 
-                // The file writer's test (DictionaryEncoder.FirstPagePays): a dictionary that does not pay on
-                // the first page is declined, and the values are reconstructed from it and written in the
-                // column's own encoding. Per-column resolution, not the file-wide flag: an option that held for
-                // one writer and not the other would be worse than not having it.
-                useNonDictionary[i] = !_options.GetDictionaryEnabled(s.PathInSchema)
+                // Per-column resolution, not the file-wide flag: an option that held for one writer and not the
+                // other would be worse than not having it.
+                bool enabled = _options.GetDictionaryEnabled(s.PathInSchema);
+
+                // A dictionary over the page size limit is one ParquetFileWriter would have cut short: declined if
+                // it filled before the first page decided, else kept for the pages before the cut and the rest
+                // written in the column's own encoding. The column is rebuilt and written through that writer's
+                // own path, so the two writers agree; this costs a second pass of hashing, only for such a column.
+                overLimit[i] = enabled && built.DictionaryPageData.Length > _options.DictionaryPageSizeLimit;
+
+                // Otherwise the file writer's first-page test (DictionaryEncoder.FirstPagePays): a dictionary that
+                // does not pay is declined, and the values are rebuilt and written in the column's own encoding.
+                useNonDictionary[i] = !enabled
+                    || overLimit[i]
                     || !DictionaryEncoder.FirstPagePays(
                         built, s.NonNullCount, s.PhysicalType, s.TypeLength, DictionaryEncoder.FirstPageBytes);
             }
@@ -191,9 +201,9 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 // and encode via the standard non-dictionary path (delta, BSS, plain, etc.)
                 var array = ReconstructArrowArray(s, dictResults[i]!.Value,
                     PresenceLevels(s, defLevelsPerColumn[i]), s.LevelCount);
-                var nonDictOptions = _options with { DictionaryEnabled = false };
+                var options = overLimit[i] ? _options : _options with { DictionaryEnabled = false };
                 columnResults[i] = WriteLeaf(
-                    s, array, defLevelsPerColumn[i], repLevelsPerColumn[i], nonDictOptions);
+                    s, array, defLevelsPerColumn[i], repLevelsPerColumn[i], options);
             }
             else if (s.BooleanValues != null)
             {
@@ -798,7 +808,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         private Dictionary<long, int>? _longDict;
         private Dictionary<uint, int>? _floatDict;
         private Dictionary<ulong, int>? _doubleDict;
-        private BytesDictionary? _bytesDict;
+        // BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY: the file writer's table, which keeps the entries as the PLAIN page.
+        private DictionaryEncoder.BytesHashTable? _bytesTable;
 
         // Accumulated indices (compact, non-null only)
         public GrowableIntList? Indices { get; private set; }
@@ -812,7 +823,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         // Accumulated boolean values (for Boolean columns that can't be dictionary-encoded)
         public GrowableIntList? BooleanValues { get; private set; }
 
-        // Dictionary page data (built lazily on flush)
+        // The fixed-width arms' entries, for the dictionary page (built on flush); the byte-keyed arms' are in
+        // _bytesTable.
         private List<byte[]>? _dictEntries;
         private int _dictPageSize;
 
@@ -1150,8 +1162,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         private void EncodeByteArray(ArrayData data, int srcOffset, int rowCount)
         {
-            _bytesDict ??= new BytesDictionary();
-            _dictEntries ??= new List<byte[]>();
+            _bytesTable ??= new DictionaryEncoder.BytesHashTable(lengthPrefixed: true);
             ReadOnlySpan<int> arrowOffsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
             ReadOnlySpan<byte> arrowData = data.Buffers[2].Span;
 
@@ -1162,13 +1173,9 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 int len = arrowOffsets[srcOffset + i + 1] - start;
                 ReadOnlySpan<byte> valueBytes = arrowData.Slice(start, len);
 
-                int idx = _bytesDict.GetOrAdd(valueBytes, DictionaryCount);
-                if (idx == DictionaryCount)
-                {
+                int idx = _bytesTable.GetOrAdd(valueBytes, out bool inserted);
+                if (inserted)
                     DictionaryCount++;
-                    _dictEntries.Add(valueBytes.ToArray());
-                    _dictPageSize += 4 + len; // 4-byte length prefix for BYTE_ARRAY
-                }
                 Indices!.Add(idx);
             }
 
@@ -1195,8 +1202,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         private void EncodeFixedLenByteArray(
             ReadOnlySpan<byte> valueBuffer, int srcOffset, int rowCount, int byteWidth, int entryWidth)
         {
-            _bytesDict ??= new BytesDictionary();
-            _dictEntries ??= new List<byte[]>();
+            _bytesTable ??= new DictionaryEncoder.BytesHashTable(lengthPrefixed: false);
 
             // A decimal's entries are kept little-endian at the column's width; BuildDictionaryPage reverses them.
             byte[]? narrowed = entryWidth < byteWidth ? new byte[entryWidth] : null;
@@ -1211,19 +1217,28 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                     valueBytes = narrowed;
                 }
 
-                int idx = _bytesDict.GetOrAdd(valueBytes, DictionaryCount);
-                if (idx == DictionaryCount)
-                {
+                int idx = _bytesTable.GetOrAdd(valueBytes, out bool inserted);
+                if (inserted)
                     DictionaryCount++;
-                    _dictEntries.Add(valueBytes.ToArray());
-                    _dictPageSize += entryWidth; // no length prefix for FLBA
-                }
                 Indices!.Add(idx);
             }
         }
 
         public byte[] BuildDictionaryPage()
         {
+            if (_bytesTable is not null)
+            {
+                // Already the PLAIN page. A decimal's entries are little-endian at the column's width: reverse each.
+                var table = _bytesTable.ToPage();
+                if (IsFlbaDecimal(ArrowType))
+                {
+                    for (int at = 0; at + TypeLength <= table.Length; at += TypeLength)
+                        table.AsSpan(at, TypeLength).Reverse();
+                }
+
+                return table;
+            }
+
             if (_dictEntries == null || _dictEntries.Count == 0)
                 return [];
 
@@ -1254,7 +1269,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             _longDict?.Clear();
             _floatDict?.Clear();
             _doubleDict?.Clear();
-            _bytesDict = null;
+            _bytesTable = null;
             _dictEntries?.Clear();
             _dictPageSize = 0;
             DictionaryCount = 0;
@@ -1308,91 +1323,5 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         }
 
         public void Reset() => _count = 0;
-    }
-
-    /// <summary>
-    /// Open-addressing hash table for byte sequences (same as DictionaryEncoder.BytesHashTable).
-    /// </summary>
-    private sealed class BytesDictionary
-    {
-        private int[] _hashes;
-        private byte[]?[] _keys;
-        private int[] _values;
-        private int _mask;
-        private int _count;
-
-        public BytesDictionary(int capacity = 256)
-        {
-            int size = 1;
-            while (size < capacity) size <<= 1;
-            _hashes = new int[size];
-            _keys = new byte[]?[size];
-            _values = new int[size];
-            _mask = size - 1;
-        }
-
-        public int GetOrAdd(ReadOnlySpan<byte> key, int nextIndex)
-        {
-            // Grow if >50% full
-            if (_count > _mask / 2)
-                Grow();
-
-            uint h = Fnv1a(key);
-            int hash = (int)(h | 1);
-            int slot = hash & _mask;
-
-            while (true)
-            {
-                if (_hashes[slot] == 0)
-                {
-                    _hashes[slot] = hash;
-                    _keys[slot] = key.ToArray();
-                    _values[slot] = nextIndex;
-                    _count++;
-                    return nextIndex;
-                }
-
-                if (_hashes[slot] == hash && key.SequenceEqual(_keys[slot]))
-                    return _values[slot];
-
-                slot = (slot + 1) & _mask;
-            }
-        }
-
-        private void Grow()
-        {
-            int newSize = (_mask + 1) * 2;
-            var newHashes = new int[newSize];
-            var newKeys = new byte[]?[newSize];
-            var newValues = new int[newSize];
-            int newMask = newSize - 1;
-
-            for (int i = 0; i <= _mask; i++)
-            {
-                if (_hashes[i] == 0) continue;
-                int slot = _hashes[i] & newMask;
-                while (newHashes[slot] != 0)
-                    slot = (slot + 1) & newMask;
-                newHashes[slot] = _hashes[i];
-                newKeys[slot] = _keys[i];
-                newValues[slot] = _values[i];
-            }
-
-            _hashes = newHashes;
-            _keys = newKeys;
-            _values = newValues;
-            _mask = newMask;
-        }
-
-        private static uint Fnv1a(ReadOnlySpan<byte> data)
-        {
-            uint hash = 2166136261u;
-            for (int i = 0; i < data.Length; i++)
-            {
-                hash ^= data[i];
-                hash *= 16777619u;
-            }
-            return hash;
-        }
     }
 }

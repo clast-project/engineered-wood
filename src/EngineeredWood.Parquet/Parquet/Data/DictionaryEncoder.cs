@@ -664,7 +664,7 @@ internal static class DictionaryEncoder
     /// differ only in trailing zero bytes share words, and a long key's byte comparison would otherwise read past
     /// a shorter entry.</para>
     /// </remarks>
-    private sealed class BytesHashTable
+    internal sealed class BytesHashTable
     {
         /// <summary>Smallest table. A column with a handful of distinct values never outgrows it.</summary>
         private const int MinimumSize = 16;
