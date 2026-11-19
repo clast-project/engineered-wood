@@ -68,8 +68,7 @@ internal ref struct PageReader
 {
     private readonly ReadOnlySpan<byte> _data;
     private readonly ColumnDescriptor _column;
-    private readonly long _chunkUncompressedSize;
-    private readonly int? _maxUncompressedPageSize;
+    private readonly UncompressedSizeLimits _limits;
     private int _position;
     private int _nextOrdinal;
 
@@ -98,7 +97,7 @@ internal ref struct PageReader
     {
         _data = data;
         _column = column;
-        (_chunkUncompressedSize, _maxUncompressedPageSize) = UncompressedLimits(chunk, maxUncompressedPageSize);
+        _limits = UncompressedLimits(chunk, maxUncompressedPageSize);
         _position = 0;
         _nextOrdinal = firstOrdinal;
     }
@@ -123,8 +122,8 @@ internal ref struct PageReader
         }
 
         var header = ReadHeader(
-            _data.Slice(_position), _position, _data.Length - _position, _column, _chunkUncompressedSize,
-            _maxUncompressedPageSize, _nextOrdinal, out int headerSize);
+            _data.Slice(_position), _position, _data.Length - _position, _column, _limits, _nextOrdinal,
+            out int headerSize);
         int payloadOffset = _position + headerSize;
 
         int ordinal = header.Type is PageType.DataPage or PageType.DataPageV2 ? _nextOrdinal++ : -1;
@@ -135,19 +134,21 @@ internal ref struct PageReader
     }
 
     /// <summary>
-    /// The bounds <see cref="ReadHeader"/> checks a page's uncompressed size against: the chunk's own total and the
-    /// caller's limit. An uncompressed chunk's pages are read in place, so their uncompressed size sizes nothing
-    /// and is not read; other readers ignore it there, and so is a wrong one here. A footer that records no size
-    /// checks nothing, rather than refusing every page.
+    /// The bounds <see cref="ReadHeader"/> checks a page's uncompressed size against: the chunk's own total, the
+    /// caller's limit, and what the chunk's codec can expand the page's stored bytes to. An uncompressed chunk's
+    /// pages are read in place, so their uncompressed size sizes nothing and is not read; other readers ignore it
+    /// there, and so is a wrong one here. A footer that records no size checks nothing against it, rather than
+    /// refusing every page, and a walk that is given no chunk knows no codec to bound by.
     /// </summary>
-    internal static (long ChunkUncompressedSize, int? MaxUncompressedPageSize) UncompressedLimits(
+    internal static UncompressedSizeLimits UncompressedLimits(
         Metadata.ColumnMetaData? chunk, int? maxUncompressedPageSize)
     {
         bool decompressed = chunk?.Codec != CompressionCodec.Uncompressed;
         long chunkSize = decompressed && chunk is { TotalUncompressedSize: > 0 } meta
             ? meta.TotalUncompressedSize
             : long.MaxValue;
-        return (chunkSize, decompressed ? maxUncompressedPageSize : null);
+        return new UncompressedSizeLimits(
+            chunkSize, decompressed ? maxUncompressedPageSize : null, decompressed ? chunk?.Codec : null);
     }
 
     /// <summary>
@@ -163,11 +164,11 @@ internal ref struct PageReader
         long position,
         long available,
         ColumnDescriptor column,
-        long chunkUncompressedSize,
-        int? maxUncompressedPageSize,
+        UncompressedSizeLimits limits,
         int nextOrdinal,
         out int headerSize)
     {
+        var (chunkUncompressedSize, maxUncompressedPageSize, codec) = limits;
         PageHeader header;
         try
         {
@@ -213,8 +214,49 @@ internal ref struct PageReader
                 $"{header.UncompressedPageSize} uncompressed bytes, more than the " +
                 $"{maxUncompressedPageSize} that MaxPageUncompressedSize allows.");
         }
+        // Both of those come from the file. The page's stored bytes do not lie about how many there are, and its
+        // codec can expand them only so far: a page declaring more than that would be refused once decompressed
+        // anyway, but only after a buffer of the declared size was rented for it.
+        if (codec is { } compressedWith
+            && Decompressed(header) is ({ } stored, { } declared)
+            && Decompressor.MaxDecompressedLength(compressedWith, stored) is { } most
+            && declared > most)
+        {
+            throw new ParquetFormatException(
+                $"Column '{column.DottedPath}': the {header.Type} at byte offset {position} declares " +
+                $"{declared} bytes decompressed from {stored} {compressedWith} bytes, more than {compressedWith} " +
+                $"can expand them to ({most}).");
+        }
 
         return header;
+    }
+
+    /// <summary>
+    /// What part of the page the reader decompresses: its stored bytes and the size they are declared to
+    /// decompress to. Null for a page none of which is decompressed: a V2 data page or a symbol table page
+    /// flagged as stored uncompressed, a V2 data page whose value section is empty (its levels are stored
+    /// uncompressed, so nothing is left to decompress), and the page types the reader skips.
+    /// </summary>
+    private static (long Stored, long Declared)? Decompressed(PageHeader header)
+    {
+        switch (header.Type)
+        {
+            case PageType.DataPage:
+            case PageType.DictionaryPage:
+                return (header.CompressedPageSize, header.UncompressedPageSize);
+
+            case PageType.DataPageV2 when header.DataPageHeaderV2 is { IsCompressed: true } v2:
+                // Validate has checked that the levels fit in both sizes.
+                long levels = (long)v2.RepetitionLevelsByteLength + v2.DefinitionLevelsByteLength;
+                long stored = header.CompressedPageSize - levels;
+                return stored > 0 ? (stored, header.UncompressedPageSize - levels) : null;
+
+            case PageType.SymbolTablePage when header.SymbolTablePageHeader is { IsCompressed: true }:
+                return (header.CompressedPageSize, header.UncompressedPageSize);
+
+            default:
+                return null;
+        }
     }
 
     /// <summary>
@@ -288,3 +330,15 @@ internal ref struct PageReader
         return null;
     }
 }
+
+/// <summary>
+/// The bounds <see cref="PageReader.ReadHeader"/> checks a page's uncompressed size against
+/// (<see cref="PageReader.UncompressedLimits"/>).
+/// </summary>
+/// <param name="ChunkUncompressedSize">The chunk's <c>total_uncompressed_size</c>, or <see cref="long.MaxValue"/>
+/// for none.</param>
+/// <param name="MaxUncompressedPageSize">The caller's limit
+/// (<see cref="ParquetReadOptions.MaxPageUncompressedSize"/>), or null for none.</param>
+/// <param name="Codec">The codec whose expansion bounds a page's decompressed bytes, or null for none.</param>
+internal readonly record struct UncompressedSizeLimits(
+    long ChunkUncompressedSize, int? MaxUncompressedPageSize, CompressionCodec? Codec);

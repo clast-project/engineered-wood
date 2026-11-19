@@ -162,6 +162,153 @@ public class PageDecodeFailureTests : IDisposable
     }
 
     /// <summary>
+    /// A compressed page declaring more than its codec can expand its stored bytes to is refused from its header,
+    /// before a buffer of the declared size is rented, even where its chunk's total, which the file also states,
+    /// allows it. A page declaring exactly the bound passes that check and is refused only once decompressed, for
+    /// decompressing to less: the bound is not a byte tighter than the formula.
+    /// </summary>
+    [Theory]
+    [InlineData(CompressionCodec.Snappy)]
+    [InlineData(CompressionCodec.Gzip)]
+    [InlineData(CompressionCodec.Zstd)]
+    [InlineData(CompressionCodec.Lz4)]
+    [InlineData(CompressionCodec.Lz4Hadoop)]
+    public void ACompressedPageDeclaringMoreThanItsCodecCanExpandTo_IsRefused(CompressionCodec codec)
+    {
+        // Lz4Hadoop reads a raw LZ4 block too, which is what the test compressor writes for it.
+        var chunk = PlainCompressedChunk(
+            codec == CompressionCodec.Lz4Hadoop ? CompressionCodec.Lz4 : codec, declaredUncompressed: 16,
+            chunkUncompressed: int.MaxValue);
+        chunk = chunk with { Meta = Copy(chunk.Meta, int.MaxValue, codec) };
+        int stored = PageHeaderDecoder.Decode(chunk.Bytes, out _).CompressedPageSize;
+        long most = Decompressor.MaxDecompressedLength(codec, stored)!.Value;
+
+        var refused = chunk with { Bytes = Rewrite(chunk.Bytes, uncompressed: checked((int)most + 1)) };
+        AssertRefused(refused,
+            $"declares {most + 1} bytes decompressed from {stored} {codec} bytes, more than {codec} can expand them to ({most}).");
+
+        var atTheBound = chunk with { Bytes = Rewrite(chunk.Bytes, uncompressed: (int)most) };
+        foreach (var ex in AssertRefused(atTheBound, $"a page declares {most} uncompressed bytes, but its data decompresses to"))
+            Assert.DoesNotContain("can expand them to", ex.Message);
+    }
+
+    /// <summary>
+    /// The most compressible page there is, a megabyte and more of zeros, compressed by each codec's encoder, reads:
+    /// no encoder EngineeredWood writes with expands its data past the bound the reader holds it to. Brotli has no
+    /// bound and reads too.
+    /// </summary>
+    [Theory]
+    [InlineData(CompressionCodec.Snappy)]
+    [InlineData(CompressionCodec.Gzip)]
+    [InlineData(CompressionCodec.Zstd)]
+    [InlineData(CompressionCodec.Lz4)]
+    [InlineData(CompressionCodec.Brotli)]
+    public void TheMostCompressiblePage_ReadsUnderItsCodecsBound(CompressionCodec codec)
+    {
+        const int values = 1 << 20;
+        byte[] plain = new byte[values * 4];
+        byte[] compressed = new byte[Compressor.GetMaxCompressedLength(codec, plain.Length)];
+        compressed = compressed.AsSpan(0, Compressor.Compress(codec, plain, compressed)).ToArray();
+        var chunk = Chunk(PhysicalType.Int32, codec, numValues: values,
+            (DataPage(values, Encoding.Plain, compressed.Length, plain.Length), compressed));
+
+        var whole = (Int32Array)ReadWhole(chunk);
+        Assert.Equal(values, whole.Length);
+        Assert.True(whole.Values.ToArray().All(v => v == 0));
+        var batched = (Int32Array)ReadBatched(chunk);
+        Assert.Equal(values, batched.Length);
+        Assert.True(batched.Values.ToArray().All(v => v == 0));
+        GC.KeepAlive(whole);
+        GC.KeepAlive(batched);
+    }
+
+    /// <summary>
+    /// A V2 page whose value section is stored uncompressed in a compressed chunk decompresses nothing, so its
+    /// uncompressed size sizes nothing and is not held to the codec's bound, as an uncompressed chunk's is not.
+    /// </summary>
+    [Fact]
+    public void AV2PageStoredUncompressed_IsNotHeldToItsCodecsBound()
+    {
+        byte[] payload = Plain(1, 2, 3, 4);
+        var header = new PageHeader
+        {
+            Type = PageType.DataPageV2,
+            UncompressedPageSize = 50_000,
+            CompressedPageSize = payload.Length,
+            DataPageHeaderV2 = new DataPageHeaderV2
+            {
+                NumValues = 4,
+                NumNulls = 0,
+                NumRows = 4,
+                Encoding = Encoding.Plain,
+                DefinitionLevelsByteLength = 0,
+                RepetitionLevelsByteLength = 0,
+                IsCompressed = false,
+            },
+        };
+        var chunk = Chunk(PhysicalType.Int32, CompressionCodec.Snappy, numValues: 4, (header, payload));
+        Assert.True(50_000 > Decompressor.MaxDecompressedLength(CompressionCodec.Snappy, payload.Length));
+
+        var whole = (Int32Array)ReadWhole(chunk);
+        Assert.Equal([1, 2, 3, 4], whole.Values.ToArray());
+        var batched = (Int32Array)ReadBatched(chunk);
+        Assert.Equal([1, 2, 3, 4], batched.Values.ToArray());
+        GC.KeepAlive(whole);
+        GC.KeepAlive(batched);
+    }
+
+    /// <summary>
+    /// An all-null V2 page whose value section is a compressed empty stream, as EngineeredWood writes one, reads.
+    /// One whose header declares more than that stream can decompress to is refused from its header, although
+    /// its levels would have shown that nothing needs decompressing (#935 review): the header lies, and pyarrow
+    /// and DuckDB refuse the same page as they decompress it (DataFusion reads it). Checking every page's header
+    /// in one place is worth refusing a page no honest writer produces.
+    /// </summary>
+    [Fact]
+    public void AnAllNullV2PagesCompressedEmptySection_IsHeldToItsCodecsBound()
+    {
+        // Four nulls: one RLE run of four 0 definition levels (V2 levels carry no length prefix).
+        byte[] levels = [4 << 1, 0];
+        byte[] empty = new byte[Compressor.GetMaxCompressedLength(CompressionCodec.Snappy, 0)];
+        empty = empty.AsSpan(0, Compressor.Compress(CompressionCodec.Snappy, [], empty)).ToArray();
+        long most = Decompressor.MaxDecompressedLength(CompressionCodec.Snappy, empty.Length)!.Value;
+
+        var honest = AllNull(declaredValueBytes: 0);
+        var whole = ReadWhole(honest);
+        Assert.Equal(4, whole.NullCount);
+        var batched = ReadBatched(honest);
+        Assert.Equal(4, batched.NullCount);
+        GC.KeepAlive(whole);
+        GC.KeepAlive(batched);
+
+        AssertRefused(AllNull(declaredValueBytes: checked((int)most + 1)),
+            $"declares {most + 1} bytes decompressed from {empty.Length} Snappy bytes, more than Snappy can expand them to ({most}).");
+
+        TestChunk AllNull(int declaredValueBytes)
+        {
+            byte[] payload = [.. levels, .. empty];
+            var header = new PageHeader
+            {
+                Type = PageType.DataPageV2,
+                UncompressedPageSize = levels.Length + declaredValueBytes,
+                CompressedPageSize = payload.Length,
+                DataPageHeaderV2 = new DataPageHeaderV2
+                {
+                    NumValues = 4,
+                    NumNulls = 4,
+                    NumRows = 4,
+                    Encoding = Encoding.Plain,
+                    DefinitionLevelsByteLength = levels.Length,
+                    RepetitionLevelsByteLength = 0,
+                    IsCompressed = true,
+                },
+            };
+            return Chunk(PhysicalType.Int32, CompressionCodec.Snappy, numValues: 4, typeLength: null, nullable: true,
+                (header, payload));
+        }
+    }
+
+    /// <summary>
     /// An uncompressed chunk's pages are read in place, so their uncompressed size is not read; a
     /// wrong one is not refused, as other readers do not refuse it.
     /// </summary>
@@ -343,6 +490,11 @@ public class PageDecodeFailureTests : IDisposable
 
     private static TestChunk Chunk(
         PhysicalType type, CompressionCodec codec, long numValues, int? typeLength,
+        params (PageHeader Header, byte[] Payload)[] pages) =>
+        Chunk(type, codec, numValues, typeLength, nullable: false, pages);
+
+    private static TestChunk Chunk(
+        PhysicalType type, CompressionCodec codec, long numValues, int? typeLength, bool nullable,
         params (PageHeader Header, byte[] Payload)[] pages)
     {
         var bytes = new List<byte>();
@@ -358,7 +510,11 @@ public class PageDecodeFailureTests : IDisposable
         var column = new SchemaDescriptor(
         [
             new SchemaElement { Name = "schema", NumChildren = 1 },
-            new SchemaElement { Name = "n", Type = type, TypeLength = typeLength, RepetitionType = FieldRepetitionType.Required },
+            new SchemaElement
+            {
+                Name = "n", Type = type, TypeLength = typeLength,
+                RepetitionType = nullable ? FieldRepetitionType.Optional : FieldRepetitionType.Required,
+            },
         ]).Columns[0];
         var meta = new ColumnMetaData
         {
@@ -380,7 +536,7 @@ public class PageDecodeFailureTests : IDisposable
             PhysicalType.FixedLenByteArray => new FixedSizeBinaryType(typeLength!.Value),
             _ => BinaryType.Default,
         };
-        return new TestChunk([.. bytes], column, meta, new Field("n", arrowType, nullable: false));
+        return new TestChunk([.. bytes], column, meta, new Field("n", arrowType, nullable));
     }
 
     private static PageHeader DataPage(int values, Encoding encoding, int size, int? uncompressed = null) => new()
@@ -411,12 +567,12 @@ public class PageDecodeFailureTests : IDisposable
         return [.. encoded, .. chunk.AsSpan(headerSize)];
     }
 
-    private static ColumnMetaData Copy(ColumnMetaData m, long totalUncompressed) => new()
+    private static ColumnMetaData Copy(ColumnMetaData m, long totalUncompressed, CompressionCodec? codec = null) => new()
     {
         Type = m.Type,
         Encodings = m.Encodings,
         PathInSchema = m.PathInSchema,
-        Codec = m.Codec,
+        Codec = codec ?? m.Codec,
         NumValues = m.NumValues,
         TotalUncompressedSize = totalUncompressed,
         TotalCompressedSize = m.TotalCompressedSize,
