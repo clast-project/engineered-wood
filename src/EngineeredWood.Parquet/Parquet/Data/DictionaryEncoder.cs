@@ -828,6 +828,13 @@ internal static class DictionaryEncoder
 
         private static ulong RotateLeft(ulong value, int offset) => (value << offset) | (value >> (64 - offset));
 
+        /// <summary>
+        /// Appends <paramref name="key"/> to the page as the next entry without making it findable: no hash, no slot,
+        /// so a later equal key adds an entry of its own. For a caller that has stopped deduplicating (the buffered
+        /// writer, once a column's dictionary passes the page size limit) and keeps the page only as the values.
+        /// </summary>
+        public int Append(ReadOnlySpan<byte> key) => Add(key);
+
         /// <summary>Appends <paramref name="key"/> to the page as the next entry.</summary>
         private int Add(ReadOnlySpan<byte> key)
         {

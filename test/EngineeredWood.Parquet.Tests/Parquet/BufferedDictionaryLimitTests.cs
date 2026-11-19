@@ -90,6 +90,90 @@ public class BufferedDictionaryLimitTests : IDisposable
         await AssertSameRowsAsync(batch, buffered);
     }
 
+    public static TheoryData<string> Types() => new() { "int8", "int32", "int64", "float", "double", "string", "decimal", "list" };
+
+    [Theory]
+    [MemberData(nameof(Types))]
+    public async Task DictionaryOff_MatchesTheFileWriter(string type)
+    {
+        // A column without a dictionary is buffered raw from its first value (no lookups), rebuilt at flush and
+        // written as the file writer writes it.
+        const int rows = 40_000;
+        var random = new Random(7);
+        IArrowArray array;
+        switch (type)
+        {
+            case "int8":
+                var i8 = new Int8Array.Builder();
+                for (int i = 0; i < rows; i++) i8.Append((sbyte)random.Next(-128, 128));
+                array = i8.Build();
+                break;
+            case "int32":
+                var i32 = new Int32Array.Builder();
+                for (int i = 0; i < rows; i++) i32.Append(random.Next(100));
+                array = i32.Build();
+                break;
+            case "int64":
+                array = Int64Batch(rows, rows / 2, nullable: true).Column(0);
+                break;
+            case "float":
+                var f = new FloatArray.Builder();
+                for (int i = 0; i < rows; i++) f.Append(i % 10 == 0 ? -0f : (float)random.NextDouble());
+                array = f.Build();
+                break;
+            case "double":
+                var d = new DoubleArray.Builder();
+                for (int i = 0; i < rows; i++) d.Append(i % 10 == 0 ? double.NaN : random.NextDouble());
+                array = d.Build();
+                break;
+            case "string":
+                array = StringBatch(rows, rows / 2, nullable: true).Column(0);
+                break;
+            case "decimal":
+                var m = new Decimal128Array.Builder(new Decimal128Type(30, 2));
+                for (int i = 0; i < rows; i++) m.Append((i % 300 - 150) * 1.25m);
+                array = m.Build();
+                break;
+            default:
+                array = ListBatch(rows / 4, rows / 8, nullable: true).Column(0);
+                break;
+        }
+
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema([new Field("c", array.Data.DataType, array.NullCount > 0)], null), [array], array.Length);
+        var (direct, buffered) = await WriteBothAsync(batch, DataPageVersion.V1, Limit, dictionary: false);
+        var chunk = await AssertSameChunksAsync(direct, buffered);
+        Assert.Null(chunk.DictionaryPageOffset);
+        await AssertSameRowsAsync(batch, buffered);
+    }
+
+    [Fact]
+    public async Task EachRowGroup_StartsWithADictionaryAgain()
+    {
+        // The first row group's dictionary passes the limit, so its tail is buffered raw; the second is
+        // low-cardinality throughout and must get a whole dictionary, as each file-writer chunk does.
+        var first = Int64Batch(300_000, 200_000, nullable: false);
+        var builder = new Int64Array.Builder();
+        for (int i = 0; i < 300_000; i++) builder.Append(i % 100);
+        var second = Batch(builder.Build(), nullable: false);
+
+        var (direct, buffered) = await WriteBothAsync([first, second], DataPageVersion.V1, Limit);
+        var d = await ReadMetadataAsync(direct);
+        var b = await ReadMetadataAsync(buffered);
+        Assert.Equal(2, b.RowGroups.Count);
+        for (int g = 0; g < 2; g++)
+        {
+            var dc = d.RowGroups[g].Columns[0].MetaData!;
+            var bc = b.RowGroups[g].Columns[0].MetaData!;
+            Assert.Equal(ChunkBytes(direct, dc), ChunkBytes(buffered, bc));
+        }
+
+        var whole = b.RowGroups[1].Columns[0].MetaData!;
+        Assert.NotNull(whole.DictionaryPageOffset);
+        Assert.All(whole.EncodingStats!.Where(s => s.PageType is PageType.DataPage or PageType.DataPageV2),
+            s => Assert.Equal(Encoding.RleDictionary, s.Encoding));
+    }
+
     private static RecordBatch Int64Batch(int rows, int lowRows, bool nullable)
     {
         var builder = new Int64Array.Builder();
@@ -137,31 +221,46 @@ public class BufferedDictionaryLimitTests : IDisposable
     private static RecordBatch Batch(IArrowArray array, bool nullable) =>
         new(new Apache.Arrow.Schema([new Field("c", array.Data.DataType, nullable)], null), [array], array.Length);
 
-    private async Task<(string Direct, string Buffered)> WriteBothAsync(RecordBatch batch, DataPageVersion version, int limit)
+    private Task<(string Direct, string Buffered)> WriteBothAsync(
+        RecordBatch batch, DataPageVersion version, int limit, bool dictionary = true) =>
+        WriteBothAsync([batch], version, limit, dictionary);
+
+    /// <summary>
+    /// Each batch as one row group through ParquetFileWriter, and through BufferedParquetWriter in several appends
+    /// (so its dictionary accumulates across them), flushed at each batch's end.
+    /// </summary>
+    private async Task<(string Direct, string Buffered)> WriteBothAsync(
+        RecordBatch[] groups, DataPageVersion version, int limit, bool dictionary = true)
     {
         var options = ParquetWriteOptions.Default with
         {
             DataPageVersion = version,
             DictionaryPageSizeLimit = limit,
-            RowGroupMaxRows = batch.Length,
+            DictionaryEnabled = dictionary,
+            RowGroupMaxRows = groups.Max(g => g.Length),
         };
 
         string direct = Path.Combine(_tempDir, $"direct-{Guid.NewGuid():N}.parquet");
         await using (var file = new LocalSequentialFile(direct))
         await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
         {
-            await writer.WriteRowGroupAsync(batch);
+            foreach (var group in groups)
+                await writer.WriteRowGroupAsync(group);
             await writer.CloseAsync();
         }
 
-        // In several batches, so the dictionary accumulates across them.
         string buffered = Path.Combine(_tempDir, $"buffered-{Guid.NewGuid():N}.parquet");
         await using (var file = new LocalSequentialFile(buffered))
         await using (var writer = new BufferedParquetWriter(file, ownsFile: false, options))
         {
             const int Slice = 37_000;
-            for (int start = 0; start < batch.Length; start += Slice)
-                await writer.AppendAsync(batch.Slice(start, Math.Min(Slice, batch.Length - start)));
+            foreach (var group in groups)
+            {
+                for (int start = 0; start < group.Length; start += Slice)
+                    await writer.AppendAsync(group.Slice(start, Math.Min(Slice, group.Length - start)));
+                await writer.FlushRowGroupAsync();
+            }
+
             await writer.CloseAsync();
         }
 
@@ -209,6 +308,10 @@ public class BufferedDictionaryLimitTests : IDisposable
     {
         Int64Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
         StringArray a => a.GetString(i),
+        Int8Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        Int32Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        FloatArray a => BitConverter.ToInt32(BitConverter.GetBytes(a.GetValue(i)!.Value), 0).ToString(System.Globalization.CultureInfo.InvariantCulture),
+        DoubleArray a => BitConverter.DoubleToInt64Bits(a.GetValue(i)!.Value).ToString(System.Globalization.CultureInfo.InvariantCulture),
         Decimal128Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
         ListArray a => string.Join(",", Enumerable.Range(a.ValueOffsets[i], a.GetValueLength(i))
             .Select(k => ((Int64Array)a.Values).GetValue(k))),
