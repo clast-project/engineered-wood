@@ -512,11 +512,15 @@ internal static class DictionaryEncoder
     /// <remarks>
     /// <para><b>The values live in the page.</b> Each new value is appended to one growing buffer in the page's
     /// layout: a 4-byte little-endian length and then the bytes for BYTE_ARRAY, the bytes alone for
-    /// FIXED_LEN_BYTE_ARRAY. A slot holds the entry's number and its hash, and a lookup compares against the
-    /// entry's bytes in that buffer. The page is a copy of the buffer: no array per entry, and no second pass
+    /// FIXED_LEN_BYTE_ARRAY. A slot is 32 bytes holding everything a lookup compares (hash, length, entry number,
+    /// and a short key's words), so a probe reads one cache line; only a long key is compared against its bytes
+    /// in the page. The page is a copy of the buffer: no array per entry, and no second pass
     /// to lay the page out.</para>
-    /// <para><b>XxHash3</b>, eight bytes at a time and vectorised past that, where FNV-1a took a multiply per
-    /// byte. The slot comes from the hash; whether a slot is taken comes from its entry number (0 = empty).
+    /// <para><b>Short keys are two words.</b> A key of at most 16 bytes (codes, categories, most dictionary
+    /// columns) is read into two words, hashed with a multiply-and-mix of them, and compared as them, kept beside
+    /// the entry: no call per value and no read of the page. Longer keys are hashed with <b>XxHash3</b> and
+    /// compared byte by byte. Either replaces FNV-1a, a multiply per byte. The slot comes from the hash; whether a
+    /// slot is taken comes from its entry number (0 = empty).
     /// The table this replaced forced the hash's low bit to mark a slot taken and chose the slot from the same
     /// bits, so it only ever used the odd slots.</para>
     /// <para><b>Grows geometrically</b> from 16 slots, with a load factor ceiling of one half: a 1M-row column
@@ -534,15 +538,24 @@ internal static class DictionaryEncoder
 
         private readonly bool _lengthPrefixed;
 
-        // Per slot: the entry's hash, and its number plus one (0 = empty).
-        private int[] _hashes = [];
-        private int[] _slots = [];
+        /// <summary>
+        /// One slot: everything a lookup compares, in 32 bytes, so a probe reads one cache line rather than
+        /// following the entry number into arrays of its own.
+        /// </summary>
+        private struct Slot
+        {
+            public ulong Word0, Word1; // a key of at most 16 bytes (see Words); unused for a longer one
+            public int Hash;
+            public int Entry;          // the entry's number plus one; 0 = empty
+            public int Length;
+        }
+
+        private Slot[] _table = [];
         private int _mask;
         private int _growAt;
 
-        // Per entry, in order: where its bytes start in the page, and how many there are.
+        // Per entry, in order: where its bytes start in the page.
         private int[] _starts = new int[MinimumSize];
-        private int[] _lengths = new int[MinimumSize];
         private int _count;
 
         private byte[] _page = new byte[256];
@@ -581,17 +594,33 @@ internal static class DictionaryEncoder
         /// </summary>
         public int GetOrAdd(ReadOnlySpan<byte> key, out bool inserted)
         {
-            int hash = (int)XxHash3.HashToUInt64(key);
-            int slot = hash & _mask;
+            // A key of at most 16 bytes is two words, hashed and compared as such; a longer one is hashed with
+            // XxHash3 and compared byte by byte.
+            bool shortKey = key.Length <= ShortKey;
+            ulong w0 = 0, w1 = 0;
+            int hash;
+            if (shortKey)
+            {
+                Words(key, out w0, out w1);
+                hash = Mix(w0, w1, key.Length);
+            }
+            else
+            {
+                hash = (int)XxHash3.HashToUInt64(key);
+            }
 
+            int slot = hash & _mask;
             while (true)
             {
-                int entry = _slots[slot] - 1;
-                if (entry < 0)
+                ref Slot s = ref _table[slot];
+                if (s.Entry == 0)
                 {
-                    entry = Add(key);
-                    _hashes[slot] = hash;
-                    _slots[slot] = entry + 1;
+                    int entry = Add(key);
+                    s.Word0 = w0;
+                    s.Word1 = w1;
+                    s.Hash = hash;
+                    s.Length = key.Length;
+                    s.Entry = entry + 1;
                     inserted = true;
 
                     // Grown AFTER the insert, so the slot this landed in does not have to survive the rehash.
@@ -601,15 +630,62 @@ internal static class DictionaryEncoder
                     return entry;
                 }
 
-                if (_hashes[slot] == hash && key.SequenceEqual(_page.AsSpan(_starts[entry], _lengths[entry])))
+                if (s.Hash == hash && s.Length == key.Length
+                    && (shortKey
+                        ? s.Word0 == w0 && s.Word1 == w1
+                        : key.SequenceEqual(_page.AsSpan(_starts[s.Entry - 1], key.Length))))
                 {
                     inserted = false;
-                    return entry;
+                    return s.Entry - 1;
                 }
 
                 slot = (slot + 1) & _mask;
             }
         }
+
+        /// <summary>The longest key compared as words.</summary>
+        private const int ShortKey = 16;
+
+        /// <summary>
+        /// A key of at most 16 bytes as two words. For a given length the mapping is one to one: every byte
+        /// lands in some word at a position fixed by the length (reads may overlap, never miss), and the callers
+        /// compare lengths too. Only bytes of the key are read.
+        /// </summary>
+        private static void Words(ReadOnlySpan<byte> key, out ulong w0, out ulong w1)
+        {
+            int n = key.Length;
+            if (n >= 8)
+            {
+                w0 = BinaryPrimitives.ReadUInt64LittleEndian(key);
+                // Bytes 8 .. n-1: the last eight bytes, shifted so the ones before byte 8 fall off.
+                w1 = n == 8 ? 0 : BinaryPrimitives.ReadUInt64LittleEndian(key.Slice(n - 8)) >> (8 * (16 - n));
+            }
+            else if (n >= 4)
+            {
+                w0 = BinaryPrimitives.ReadUInt32LittleEndian(key)
+                    | ((ulong)BinaryPrimitives.ReadUInt32LittleEndian(key.Slice(n - 4)) << 32);
+                w1 = 0;
+            }
+            else
+            {
+                w0 = 0;
+                for (int i = 0; i < n; i++)
+                    w0 |= (ulong)key[i] << (8 * i);
+                w1 = 0;
+            }
+        }
+
+        /// <summary>A 32-bit hash of a short key's words and length (multiply, rotate, and a final avalanche).</summary>
+        private static int Mix(ulong w0, ulong w1, int length)
+        {
+            ulong h = (w0 * 0x9E3779B97F4A7C15UL) ^ RotateLeft(w1 * 0xC2B2AE3D27D4EB4FUL, 31) ^ (ulong)length;
+            h ^= h >> 33;
+            h *= 0xFF51AFD7ED558CCDUL;
+            h ^= h >> 33;
+            return (int)h;
+        }
+
+        private static ulong RotateLeft(ulong value, int offset) => (value << offset) | (value >> (64 - offset));
 
         /// <summary>Appends <paramref name="key"/> to the page as the next entry.</summary>
         private int Add(ReadOnlySpan<byte> key)
@@ -625,13 +701,9 @@ internal static class DictionaryEncoder
             }
 
             if (_count == _starts.Length)
-            {
                 System.Array.Resize(ref _starts, _count * 2);
-                System.Array.Resize(ref _lengths, _count * 2);
-            }
 
             _starts[_count] = _pageLength;
-            _lengths[_count] = key.Length;
             key.CopyTo(_page.AsSpan(_pageLength));
             _pageLength += key.Length;
             return _count++;
@@ -639,8 +711,7 @@ internal static class DictionaryEncoder
 
         private void Allocate(int size)
         {
-            _hashes = new int[size];
-            _slots = new int[size];
+            _table = new Slot[size];
             _mask = size - 1;
             _growAt = size / 2;
         }
@@ -651,10 +722,9 @@ internal static class DictionaryEncoder
         /// </summary>
         private void Grow()
         {
-            var oldHashes = _hashes;
-            var oldSlots = _slots;
+            var old = _table;
 
-            if (oldHashes.Length >= MaximumSize)
+            if (old.Length >= MaximumSize)
             {
                 // Unreachable in practice: the callers decline at a fifth of the row count long before. Stated
                 // as a failure rather than left implicit, because a full open-addressed table makes GetOrAdd
@@ -663,19 +733,18 @@ internal static class DictionaryEncoder
                     $"The dictionary hash table cannot grow past {MaximumSize} slots.");
             }
 
-            Allocate(oldHashes.Length << 1);
+            Allocate(old.Length << 1);
 
-            for (int i = 0; i < oldHashes.Length; i++)
+            for (int i = 0; i < old.Length; i++)
             {
-                if (oldSlots[i] == 0)
+                if (old[i].Entry == 0)
                     continue;
 
-                int slot = oldHashes[i] & _mask;
-                while (_slots[slot] != 0)
+                int slot = old[i].Hash & _mask;
+                while (_table[slot].Entry != 0)
                     slot = (slot + 1) & _mask;
 
-                _hashes[slot] = oldHashes[i];
-                _slots[slot] = oldSlots[i];
+                _table[slot] = old[i];
             }
         }
     }
