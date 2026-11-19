@@ -372,11 +372,15 @@ internal static class StatsCollector
     {
         switch (array)
         {
+            // INT32/INT64, dates, timestamps, floats, strings and DECIMAL128 find their bounds with the Parquet
+            // writer's statistics kernels (StatsBounds); the rest a value at a time.
             case Int64Array int64:
-                CollectNumericMinMax(name, int64, minValues, maxValues);
+                if (StatsBounds.TryInt64(int64, out long lMin, out long lMax))
+                    MergeNumeric(name, lMin, lMax, minValues, maxValues);
                 break;
             case Int32Array int32:
-                CollectNumericMinMax(name, int32, minValues, maxValues);
+                if (StatsBounds.TryInt32(int32, out int iMin, out int iMax))
+                    MergeNumeric(name, iMin, iMax, minValues, maxValues);
                 break;
             case Int16Array int16:
                 CollectNumericMinMax(name, int16, minValues, maxValues);
@@ -387,10 +391,12 @@ internal static class StatsCollector
             // The floating cases pass an isNaN test, because a NaN does not belong where
             // T.CompareTo puts it -- see CollectNumericMinMax.
             case DoubleArray dbl:
-                CollectNumericMinMax(name, dbl, minValues, maxValues, double.IsNaN);
+                if (StatsBounds.TryDouble(dbl, out double dMin, out double dMax))
+                    MergeNumeric(name, dMin, dMax, minValues, maxValues, double.IsNaN);
                 break;
             case FloatArray flt:
-                CollectNumericMinMax(name, flt, minValues, maxValues, float.IsNaN);
+                if (StatsBounds.TryFloat(flt, out float fMin, out float fMax))
+                    MergeNumeric(name, fMin, fMax, minValues, maxValues, float.IsNaN);
                 break;
             case StringArray str:
                 CollectStringMinMax(name, str, minValues, maxValues);
@@ -459,31 +465,40 @@ internal static class StatsCollector
             if (max is null || Compare(val, max.Value, isNaN) > 0) max = val;
         }
 
-        // Merge with existing values from previous batches
         if (min is not null)
-        {
-            if (minValues.TryGetValue(name, out var existingMin) && existingMin is T em)
-                min = Compare(min.Value, em, isNaN) < 0 ? min : em;
-            minValues[name] = min;
-        }
-        if (max is not null)
-        {
-            if (maxValues.TryGetValue(name, out var existingMax) && existingMax is T ex)
-                max = Compare(max.Value, ex, isNaN) > 0 ? max : ex;
-            maxValues[name] = max;
-        }
+            MergeNumeric(name, min.Value, max!.Value, minValues, maxValues, isNaN);
+    }
 
-        static int Compare(T a, T b, Func<T, bool>? isNaN)
-        {
-            if (isNaN is null)
-                return a.CompareTo(b);
+    /// <summary>
+    /// Merges one batch's bounds into the file's, in the order <see cref="CollectNumericMinMax{T}"/> describes:
+    /// NaN, when <paramref name="isNaN"/> is given, above every value.
+    /// </summary>
+    private static void MergeNumeric<T>(
+        string name, T min, T max,
+        Dictionary<string, object?> minValues,
+        Dictionary<string, object?> maxValues,
+        Func<T, bool>? isNaN = null)
+        where T : struct, IComparable<T>
+    {
+        if (minValues.TryGetValue(name, out var existingMin) && existingMin is T em)
+            min = Compare(min, em, isNaN) < 0 ? min : em;
+        minValues[name] = min;
+        if (maxValues.TryGetValue(name, out var existingMax) && existingMax is T ex)
+            max = Compare(max, ex, isNaN) > 0 ? max : ex;
+        maxValues[name] = max;
+    }
 
-            bool aNaN = isNaN(a);
-            bool bNaN = isNaN(b);
-            if (aNaN || bNaN)
-                return aNaN && bNaN ? 0 : aNaN ? 1 : -1;
+    private static int Compare<T>(T a, T b, Func<T, bool>? isNaN)
+        where T : IComparable<T>
+    {
+        if (isNaN is null)
             return a.CompareTo(b);
-        }
+
+        bool aNaN = isNaN(a);
+        bool bNaN = isNaN(b);
+        if (aNaN || bNaN)
+            return aNaN && bNaN ? 0 : aNaN ? 1 : -1;
+        return a.CompareTo(b);
     }
 
     // String min/max is found over the UTF-8 BYTES, decoding only the two winners: for well-formed UTF-8, byte
@@ -505,22 +520,7 @@ internal static class StatsCollector
             return;
         }
 
-        int min = -1, max = -1;
-        ReadOnlySpan<byte> minBytes = default, maxBytes = default;
-        for (int i = 0; i < array.Length; i++)
-        {
-            if (array.IsNull(i)) continue;
-            ReadOnlySpan<byte> val = array.GetBytes(i);
-            if (min < 0)
-            {
-                min = max = i;
-                minBytes = maxBytes = val;
-                continue;
-            }
-            if (val.SequenceCompareTo(minBytes) < 0) { min = i; minBytes = val; }
-            else if (val.SequenceCompareTo(maxBytes) > 0) { max = i; maxBytes = val; }
-        }
-
+        var (min, max) = StatsBounds.FindString(array);
         if (min >= 0)
             MergeStringMinMax(name, array.GetString(min), array.GetString(max), minValues, maxValues);
     }
@@ -716,25 +716,13 @@ internal static class StatsCollector
         Dictionary<string, object?> minValues,
         Dictionary<string, object?> maxValues)
     {
-        // TimestampArray stores values as long (microseconds since epoch)
-        long? min = null;
-        long? max = null;
-
-        for (int i = 0; i < array.Length; i++)
+        // TimestampArray stores values as long, in the type's unit.
+        if (StatsBounds.TryInt64(array, out long min, out long max))
         {
-            if (array.IsNull(i)) continue;
-            long val = array.GetValue(i)!.Value;
-
-            if (min is null || val < min.Value) min = val;
-            if (max is null || val > max.Value) max = val;
-        }
-
-        // Delta stats stores timestamps as ISO 8601 strings
-        if (min.HasValue)
-        {
+            // Delta stats stores timestamps as ISO 8601 strings
             var tsType = (Apache.Arrow.Types.TimestampType)array.Data.DataType;
-            string minStr = FormatTimestamp(min.Value, tsType, isMax: false);
-            string maxStr = FormatTimestamp(max!.Value, tsType, isMax: true);
+            string minStr = FormatTimestamp(min, tsType, isMax: false);
+            string maxStr = FormatTimestamp(max, tsType, isMax: true);
             MergeStringMinMax(name, minStr, maxStr, minValues, maxValues);
         }
     }
@@ -783,29 +771,14 @@ internal static class StatsCollector
         // Date32 is a day count since the Unix epoch; compare on the integer (monotonic with the date) and
         // format to Spark's "yyyy-MM-dd" only at serialization. Delta stats decode a date bound from that
         // string, so emitting a raw number (as CollectNumericMinMax would) is not decodable and never prunes.
-        int? min = null;
-        int? max = null;
-        for (int i = 0; i < array.Length; i++)
+        if (StatsBounds.TryInt32(array, out int min, out int max))
         {
-            if (array.IsNull(i)) continue;
-            int day = array.GetValue(i)!.Value;
-            if (min is null || day < min.Value) min = day;
-            if (max is null || day > max.Value) max = day;
-        }
-
-        if (min is not null)
-        {
-            int m = min.Value;
             if (minValues.TryGetValue(name, out var em) && em is DateStat eMin)
-                m = Math.Min(m, eMin.Days);
-            minValues[name] = new DateStat(m);
-        }
-        if (max is not null)
-        {
-            int m = max.Value;
+                min = Math.Min(min, eMin.Days);
+            minValues[name] = new DateStat(min);
             if (maxValues.TryGetValue(name, out var ex) && ex is DateStat eMax)
-                m = Math.Max(m, eMax.Days);
-            maxValues[name] = new DateStat(m);
+                max = Math.Max(max, eMax.Days);
+            maxValues[name] = new DateStat(max);
         }
     }
 
@@ -879,12 +852,25 @@ internal static class StatsCollector
         // slot 0 took the bounds from the wrong rows, and a bound that misses the real values lets pruning skip
         // a file holding matching rows.
         int offset = array.Data.Offset;
-        for (int i = 0; i < array.Length; i++)
+        if (array is Decimal128Array d128)
         {
-            if (array.IsNull(i)) continue;
-            BigInteger u = ToBigInteger(valueBuffer.Span.Slice((offset + i) * width, width));
-            if (min is null || u < min.Value) min = u;
-            if (max is null || u > max.Value) max = u;
+            // A BigInteger per value was an allocation per value: compare the 16 bytes as two words instead.
+            var (lo, hi) = StatsBounds.FindDecimal128(d128);
+            if (lo >= 0)
+            {
+                min = ToBigInteger(valueBuffer.Span.Slice((offset + lo) * width, width));
+                max = ToBigInteger(valueBuffer.Span.Slice((offset + hi) * width, width));
+            }
+        }
+        else
+        {
+            for (int i = 0; i < array.Length; i++)
+            {
+                if (array.IsNull(i)) continue;
+                BigInteger u = ToBigInteger(valueBuffer.Span.Slice((offset + i) * width, width));
+                if (min is null || u < min.Value) min = u;
+                if (max is null || u > max.Value) max = u;
+            }
         }
 
         if (min is not null)
