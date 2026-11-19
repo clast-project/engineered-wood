@@ -173,6 +173,24 @@ public class StatsBoundsTests
     }
 
     [Fact]
+    public void AllNaN_BoundsAreNaN()
+    {
+        // Every present value NaN, around nulls and across a chunk boundary: Spark writes min = max = "NaN".
+        var doubles = new DoubleArray.Builder();
+        var floats = new FloatArray.Builder();
+        for (int i = 0; i < 5000; i++)
+        {
+            if (i % 3 == 0) { doubles.AppendNull(); floats.AppendNull(); }
+            else { doubles.Append(double.NaN); floats.Append(float.NaN); }
+        }
+
+        Assert.True(StatsBounds.TryDouble(doubles.Build(), out double dMin, out double dMax));
+        Assert.True(double.IsNaN(dMin) && double.IsNaN(dMax));
+        Assert.True(StatsBounds.TryFloat(floats.Build(), out float fMin, out float fMax));
+        Assert.True(float.IsNaN(fMin) && float.IsNaN(fMax));
+    }
+
+    [Fact]
     public void Double_BothZeros_LeastIsNegativeGreatestPositive()
     {
         var array = new DoubleArray.Builder().Append(0.0).Append(-0.0).Append(0.0).Build();
