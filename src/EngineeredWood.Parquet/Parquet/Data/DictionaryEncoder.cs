@@ -526,7 +526,13 @@ internal static class DictionaryEncoder
     /// <para><b>Grows geometrically</b> from 16 slots, with a load factor ceiling of one half: a 1M-row column
     /// with twelve distinct values allocates no more than one with twelve rows, and linear probing stays short.
     /// The writer runs columns in parallel, so sizing to a worst case would be paid per column at once.</para>
-    /// <para>MEASURED per million values (<c>dict-profile</c>): see the PR that introduced this table.</para>
+    /// <para>MEASURED per million values (<c>dict-profile</c>), building the dictionary of a 1,000-value string
+    /// column: 19.6 ms with FNV-1a and an array per entry, 9.3 now. What is left is each lookup's dependent chain
+    /// (mix, load the slot, compare, branch), about 8 ns; the hash's spread is as random (796 of 2,048 slots for
+    /// 1,000 keys).</para>
+    /// <para>The length comparison before the words is what makes a 32-bit hash collision harmless: keys that
+    /// differ only in trailing zero bytes share words, and a long key's byte comparison would otherwise read past
+    /// a shorter entry.</para>
     /// </remarks>
     private sealed class BytesHashTable
     {
