@@ -135,17 +135,19 @@ public class DictionaryTableTests
     }
 
     [Theory]
-    [InlineData(0)]
-    [InlineData(1)]
-    public void CardinalityCap_ExactlyAndOneOver(int over)
+    [InlineData(843, true)]
+    [InlineData(844, false)]
+    public void FirstPage_KeptOnlyWhenSmallerThanPlain(int distinct, bool kept)
     {
-        // A fifth of the non-null values may be distinct: 1000 rows allow 200.
+        // 1,000 four-byte strings, 8 bytes each plain (with the length prefix): 8,000, all of it the first page.
+        // With d distinct (513..1,024, so 10-bit indices: 1,250 bytes) the dictionary costs 8d + 1,250: 7,994 at
+        // d = 843, under 8,000, and 8,002 at 844, not.
         var builder = new StringArray.Builder();
         for (int i = 0; i < 1000; i++)
-            builder.Append("k" + (i % (200 + over)));
+            builder.Append((i % distinct).ToString("D4", System.Globalization.CultureInfo.InvariantCulture));
 
         var result = DictionaryEncoder.TryEncode(builder.Build(), PhysicalType.ByteArray, 0, null, 1000, Options);
-        Assert.Equal(over == 0, result is not null);
+        Assert.Equal(kept, result is not null);
     }
 
     [Theory]

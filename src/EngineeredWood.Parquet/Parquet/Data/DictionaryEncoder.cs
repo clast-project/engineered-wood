@@ -16,7 +16,27 @@ namespace EngineeredWood.Parquet.Data;
 /// </summary>
 internal static class DictionaryEncoder
 {
+    /// <summary>
+    /// The share of distinct values above which the run-end encoded arm declines a dictionary. The per-row
+    /// arms and the buffered writer decide on the first page instead (<see cref="FirstPagePays"/>).
+    /// </summary>
     internal const float CardinalityThreshold = 0.20f;
+
+    /// <summary>
+    /// The sample the per-row arms decide on, as parquet-mr decides on its first page: the values up to this many
+    /// bytes written plain (parquet-mr's default page size), or all of them. If the dictionary page and those
+    /// values' bit-packed indices are no smaller than the values written plain, the dictionary is declined for the
+    /// whole chunk. Past that only the dictionary page size limit stops it, and then partway
+    /// (<see cref="DictionaryResult.PartialLength"/>).
+    /// </summary>
+    /// <remarks>
+    /// Fixed rather than <see cref="ParquetWriteOptions.DataPageSize"/>, so that a small page setting does not
+    /// shrink the sample to a few values that are all distinct. And in bytes rather than EW's 20,000-row pages:
+    /// for 100,000 distinct INT32 values in random order, 20,000 values are nearly all distinct and the test
+    /// fails, where over the chunk the dictionary is 2.5 MB against 4 MB plain; 1 MiB (262,144 values) sees that
+    /// it pays.
+    /// </remarks>
+    internal const int FirstPageBytes = 1 << 20;
 
     internal readonly struct DictionaryResult
     {
@@ -38,6 +58,15 @@ internal static class DictionaryEncoder
         /// column exists to avoid, and the page encoder consumes runs directly.
         /// </summary>
         public DictionaryIndexRuns? IndexRuns { get; init; }
+
+        /// <summary>
+        /// Null when the dictionary covers the whole chunk. Otherwise the dictionary page filled up at this
+        /// level position: the positions before it are dictionary-encoded and <see cref="Indices"/> holds their
+        /// non-null values' indices (only those; the array may be longer), and the rest of the chunk is written
+        /// in the column's own encoding, as parquet-cpp and parquet-mr write a column whose dictionary fills.
+        /// The writer moves it back to a record boundary.
+        /// </summary>
+        public int? PartialLength { get; init; }
     }
 
     /// <summary>
@@ -89,12 +118,12 @@ internal static class DictionaryEncoder
         {
             // The type argument is the BIT PATTERN of a value slot, not the value — see TryEncodeFixed.
             // FLOAT and DOUBLE go in as uint/ulong so that the dictionary is keyed on bits.
-            PhysicalType.Int32 => TryEncodeFixed<int>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
-            PhysicalType.Int64 => TryEncodeFixed<long>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
-            PhysicalType.Float => TryEncodeFixed<uint>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
-            PhysicalType.Double => TryEncodeFixed<ulong>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
-            PhysicalType.ByteArray => TryEncodeByteArray(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit),
-            PhysicalType.FixedLenByteArray => TryEncodeFixedLenByteArray(array, defLevels, nonNullCount, typeLength, options.DictionaryPageSizeLimit),
+            PhysicalType.Int32 => TryEncodeFixed<int>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit, FirstPageBytes),
+            PhysicalType.Int64 => TryEncodeFixed<long>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit, FirstPageBytes),
+            PhysicalType.Float => TryEncodeFixed<uint>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit, FirstPageBytes),
+            PhysicalType.Double => TryEncodeFixed<ulong>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit, FirstPageBytes),
+            PhysicalType.ByteArray => TryEncodeByteArray(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit, FirstPageBytes),
+            PhysicalType.FixedLenByteArray => TryEncodeFixedLenByteArray(array, defLevels, nonNullCount, typeLength, options.DictionaryPageSizeLimit, FirstPageBytes),
             _ => null,
         };
 
@@ -135,12 +164,13 @@ internal static class DictionaryEncoder
     /// </para>
     /// </remarks>
     private static DictionaryResult? TryEncodeFixed<TBits>(
-        IArrowArray array, int[]? defLevels, int nonNullCount, int pageSizeLimit)
+        IArrowArray array, int[]? defLevels, int nonNullCount, int pageSizeLimit, int firstPageBytes)
         where TBits : unmanaged, IEquatable<TBits>
     {
         int rowCount = array.Length;
-        int maxCardinality = Math.Max(1, (int)(nonNullCount * CardinalityThreshold));
         int elementSize = Marshal.SizeOf<TBits>();
+        // The values the first page holds written plain, or all of them.
+        int firstPage = (int)Math.Min(nonNullCount, Math.Max(1, ((long)firstPageBytes + elementSize - 1) / elementSize));
 
         // The fixed-width twin of the constant probe in TryEncodeByteArray, and cheaper: every value slot is
         // the same width, so "all rows equal" is exactly "the value buffer is periodic with period
@@ -167,6 +197,7 @@ internal static class DictionaryEncoder
         var indices = new int[nonNullCount];
         var valueBuffer = MemoryMarshal.Cast<byte, TBits>(array.Data.Buffers[1].Span);
         int idx = 0;
+        int? partialAt = null;
 
         for (int i = 0; i < rowCount; i++)
         {
@@ -175,16 +206,23 @@ internal static class DictionaryEncoder
             TBits value = valueBuffer[i];
             if (!dict.TryGetValue(value, out int dictIdx))
             {
-                if (dict.Count >= maxCardinality)
-                    return null;
-
                 dictIdx = dict.Count;
                 dict[value] = dictIdx;
 
                 if (dict.Count * elementSize > pageSizeLimit)
-                    return null;
+                {
+                    // Full before the first page decided: decline. After: keep what is encoded.
+                    if (idx < firstPage)
+                        return null;
+                    dict.Remove(value);
+                    partialAt = i;
+                    break;
+                }
             }
+
             indices[idx++] = dictIdx;
+            if (idx == firstPage && !Pays(dict.Count * (long)elementSize, idx, dict.Count, idx * (long)elementSize))
+                return null;
         }
 
         // Produce PLAIN-encoded dictionary page: values in index order
@@ -200,14 +238,72 @@ internal static class DictionaryEncoder
             DictionaryPageData = dictPage,
             DictionaryCount = dict.Count,
             Indices = indices,
+            PartialLength = partialAt,
         };
     }
 
+    /// <summary>
+    /// The first-page test the per-row arms apply as they build a dictionary, applied to one already built: by
+    /// the buffered writer, which accumulates its dictionary as rows arrive and decides at flush. Entries are
+    /// numbered in order of first appearance there too, so the entries the first page's values use are the first
+    /// (highest index among them + 1).
+    /// </summary>
+    internal static bool FirstPagePays(
+        DictionaryResult dictionary, int nonNullCount, PhysicalType physicalType, int typeLength, int firstPageBytes)
+    {
+        var indices = dictionary.Indices;
+        if (indices is null || nonNullCount == 0)
+            return true;
+
+        ReadOnlySpan<byte> page = dictionary.DictionaryPageData;
+        int width = physicalType switch
+        {
+            PhysicalType.Int32 or PhysicalType.Float => 4,
+            PhysicalType.Int64 or PhysicalType.Double => 8,
+            PhysicalType.Int96 => 12,
+            PhysicalType.FixedLenByteArray => typeLength,
+            _ => 0, // BYTE_ARRAY: each entry's length is in the page
+        };
+
+        int[]? lengths = null;
+        if (width == 0)
+        {
+            lengths = new int[dictionary.DictionaryCount];
+            for (int e = 0, pos = 0; e < lengths.Length; e++)
+            {
+                lengths[e] = BinaryPrimitives.ReadInt32LittleEndian(page.Slice(pos));
+                pos += 4 + lengths[e];
+            }
+        }
+
+        long plainBytes = 0;
+        int values = 0, entries = 0;
+        while (values < nonNullCount && plainBytes < firstPageBytes)
+        {
+            int index = indices[values++];
+            plainBytes += width == 0 ? 4 + lengths![index] : width;
+            entries = Math.Max(entries, index + 1);
+        }
+
+        long dictionaryBytes = 0;
+        for (int e = 0; e < entries; e++)
+            dictionaryBytes += width == 0 ? 4 + lengths![e] : width;
+
+        return Pays(dictionaryBytes, values, entries, plainBytes);
+    }
+
+    /// <summary>
+    /// Whether a dictionary pays on the first page: its page of <paramref name="dictionaryBytes"/> and the
+    /// <paramref name="values"/> indices bit-packed at the width <paramref name="entries"/> needs, against those
+    /// values written plain (<paramref name="plainBytes"/>). This is parquet-mr's test.
+    /// </summary>
+    private static bool Pays(long dictionaryBytes, int values, int entries, long plainBytes) =>
+        dictionaryBytes + ((long)values * GetIndexBitWidth(entries) + 7) / 8 < plainBytes;
+
     private static DictionaryResult? TryEncodeByteArray(
-        IArrowArray array, int[]? defLevels, int nonNullCount, int pageSizeLimit)
+        IArrowArray array, int[]? defLevels, int nonNullCount, int pageSizeLimit, int firstPageBytes)
     {
         int rowCount = array.Length;
-        int maxCardinality = Math.Max(1, (int)(nonNullCount * CardinalityThreshold));
 
         var data = array.Data;
         ReadOnlySpan<int> arrowOffsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
@@ -243,6 +339,9 @@ internal static class DictionaryEncoder
         var table = new BytesHashTable(lengthPrefixed: true);
         var indices = new int[nonNullCount];
         int idx = 0;
+        long plainBytes = 0;
+        bool decided = false;
+        int? partialAt = null;
 
         for (int i = 0; i < rowCount; i++)
         {
@@ -252,17 +351,37 @@ internal static class DictionaryEncoder
             ReadOnlySpan<byte> valueBytes = arrowData.Slice(start, arrowOffsets[i + 1] - start);
 
             int dictIdx = table.GetOrAdd(valueBytes, out bool inserted);
-            if (inserted && (table.Count > maxCardinality || table.ByteCount > pageSizeLimit))
-                return null;
+            if (inserted && table.ByteCount > pageSizeLimit)
+            {
+                // Full before the first page decided: decline. After: keep what is encoded.
+                if (!decided)
+                    return null;
+                partialAt = i;
+                break;
+            }
 
             indices[idx++] = dictIdx;
+            if (!decided)
+            {
+                // The first page: the values up to its size written plain, or all of them.
+                plainBytes += 4 + valueBytes.Length;
+                if (plainBytes >= firstPageBytes || idx == nonNullCount)
+                {
+                    if (!Pays(table.ByteCount, idx, table.Count, plainBytes))
+                        return null;
+                    decided = true;
+                }
+            }
         }
 
+        // The entry that overflowed is not part of a partial dictionary.
+        int entries = partialAt is null ? table.Count : table.Count - 1;
         return new DictionaryResult
         {
-            DictionaryPageData = table.ToPage(),
-            DictionaryCount = table.Count,
+            DictionaryPageData = table.ToPage(entries),
+            DictionaryCount = entries,
             Indices = indices,
+            PartialLength = partialAt,
         };
     }
 
@@ -473,10 +592,10 @@ internal static class DictionaryEncoder
     }
 
     private static DictionaryResult? TryEncodeFixedLenByteArray(
-        IArrowArray array, int[]? defLevels, int nonNullCount, int typeLength, int pageSizeLimit)
+        IArrowArray array, int[]? defLevels, int nonNullCount, int typeLength, int pageSizeLimit, int firstPageBytes)
     {
         int rowCount = array.Length;
-        int maxCardinality = Math.Max(1, (int)(nonNullCount * CardinalityThreshold));
+        int firstPage = (int)Math.Min(nonNullCount, Math.Max(1, ((long)firstPageBytes + typeLength - 1) / typeLength));
 
         var valueBuffer = array.Data.Buffers[1].Span;
 
@@ -484,6 +603,7 @@ internal static class DictionaryEncoder
         var table = new BytesHashTable(lengthPrefixed: false);
         var indices = new int[nonNullCount];
         int idx = 0;
+        int? partialAt = null;
 
         for (int i = 0; i < rowCount; i++)
         {
@@ -491,17 +611,27 @@ internal static class DictionaryEncoder
 
             ReadOnlySpan<byte> valueBytes = valueBuffer.Slice(i * typeLength, typeLength);
             int dictIdx = table.GetOrAdd(valueBytes, out bool inserted);
-            if (inserted && (table.Count > maxCardinality || table.ByteCount > pageSizeLimit))
-                return null;
+            if (inserted && table.ByteCount > pageSizeLimit)
+            {
+                // Full before the first page decided: decline. After: keep what is encoded.
+                if (idx < firstPage)
+                    return null;
+                partialAt = i;
+                break;
+            }
 
             indices[idx++] = dictIdx;
+            if (idx == firstPage && !Pays(table.ByteCount, idx, table.Count, idx * (long)typeLength))
+                return null;
         }
 
+        int entries = partialAt is null ? table.Count : table.Count - 1;
         return new DictionaryResult
         {
-            DictionaryPageData = table.ToPage(),
-            DictionaryCount = table.Count,
+            DictionaryPageData = table.ToPage(entries),
+            DictionaryCount = entries,
             Indices = indices,
+            PartialLength = partialAt,
         };
     }
 
@@ -593,6 +723,11 @@ internal static class DictionaryEncoder
 
         /// <summary>The PLAIN dictionary page: every entry, in order.</summary>
         public byte[] ToPage() => _page.AsSpan(0, _pageLength).ToArray();
+
+        /// <summary>The PLAIN dictionary page of the first <paramref name="entries"/> entries.</summary>
+        public byte[] ToPage(int entries) => entries == _count
+            ? ToPage()
+            : _page.AsSpan(0, _starts[entries] - (_lengthPrefixed ? 4 : 0)).ToArray();
 
         /// <summary>
         /// The number of <paramref name="key"/>'s entry, adding it as the next one when it is new

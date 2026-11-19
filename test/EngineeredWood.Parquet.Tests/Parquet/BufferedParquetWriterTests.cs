@@ -388,7 +388,13 @@ public class BufferedParquetWriterTests : IDisposable
         var b = (await reader.ReadMetadataAsync()).RowGroups[0].Columns[0].MetaData!;
         var d = (await directReader.ReadMetadataAsync()).RowGroups[0].Columns[0].MetaData!;
 
-        Assert.Equal(!highCardinality, b.Encodings.Contains(Encoding.RleDictionary));
+        // Both writers keep a dictionary only if it pays on the first page (DictionaryEncoder.FirstPagePays). An
+        // 8-bit column's always does here: at most 256 four-byte entries and 8-bit indices, against four plain
+        // bytes a value over 545 values. A 16-bit column's high-cardinality values do not repeat, so it falls back
+        // to rebuilding the column from the dictionary.
+        bool dictionary = !highCardinality || type is "int8" or "uint8";
+        Assert.Equal(dictionary, b.Encodings.Contains(Encoding.RleDictionary));
+        Assert.Equal(dictionary, d.Encodings.Contains(Encoding.RleDictionary));
         Assert.Equal(d.Statistics?.MinValue, b.Statistics?.MinValue);
         Assert.Equal(d.Statistics?.MaxValue, b.Statistics?.MaxValue);
         Assert.Equal(d.Statistics?.NullCount, b.Statistics?.NullCount);
