@@ -83,6 +83,12 @@ if (args.Length > 0 && args[0] == "nullable-kernels")
     return;
 }
 
+if (args.Length > 0 && args[0] == "dict-profile")
+{
+    Environment.ExitCode = await DictionaryWriteProfile.RunAsync(args);
+    return;
+}
+
 if (args.Length > 0 && args[0] == "stats-profile")
 {
     Environment.ExitCode = await StatisticsProfile.RunAsync(args);
