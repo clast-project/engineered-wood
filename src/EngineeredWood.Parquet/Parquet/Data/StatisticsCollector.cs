@@ -1137,28 +1137,7 @@ internal static class StatisticsCollector
         var data = array.Data;
         ReadOnlySpan<int> offsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
         ReadOnlySpan<byte> rawData = data.Buffers[2].Span;
-
-        int minIdx = -1, maxIdx = -1;
-
-        for (int i = start; i < end; i++)
-        {
-            if (defLevels != null && defLevels[i] == 0) continue;
-
-            if (minIdx < 0)
-            {
-                minIdx = maxIdx = i;
-            }
-            else
-            {
-                var val = rawData.Slice(offsets[i], offsets[i + 1] - offsets[i]);
-                if (val.SequenceCompareTo(rawData.Slice(offsets[minIdx], offsets[minIdx + 1] - offsets[minIdx])) < 0)
-                    minIdx = i;
-                if (val.SequenceCompareTo(rawData.Slice(offsets[maxIdx], offsets[maxIdx + 1] - offsets[maxIdx])) > 0)
-                    maxIdx = i;
-            }
-        }
-
-        return (minIdx, maxIdx);
+        return ByteArrayBounds.Find(offsets, rawData, defLevels, start, end);
     }
 
     private static (byte[]?, byte[]?) ComputeFlbaMinMax(
