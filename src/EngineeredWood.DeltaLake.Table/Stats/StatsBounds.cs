@@ -89,8 +89,9 @@ internal static class StatsBounds
     /// <summary>
     /// The bounds of a DOUBLE array in Delta's order, where NaN is the greatest value (as Spark writes it): the
     /// least non-NaN value, or NaN when every present value is NaN; and NaN when any present value is, else the
-    /// greatest. A zero bound is -0 for the least and +0 for the greatest when the array holds both zeros.
-    /// False when every value is null.
+    /// greatest. A zero bound takes the sign of the first zero in the array, as comparing with
+    /// <see cref="double.CompareTo(double)"/> (which ties the zeros) value by value did. False when every value
+    /// is null.
     /// </summary>
     public static bool TryDouble(DoubleArray array, out double min, out double max)
     {
@@ -135,6 +136,13 @@ internal static class StatsBounds
             return false;
         min = nans == present ? double.NaN : BitConverter.Int64BitsToDouble(DoubleKey(minKey));
         max = nans > 0 ? double.NaN : BitConverter.Int64BitsToDouble(DoubleKey(maxKey));
+        if (min == 0 || max == 0)
+        {
+            double zero = FirstZero(array);
+            if (min == 0) min = zero;
+            if (max == 0) max = zero;
+        }
+
         return true;
     }
 
@@ -183,6 +191,13 @@ internal static class StatsBounds
             return false;
         min = nans == present ? float.NaN : Int32BitsToSingle(FloatKey(minKey));
         max = nans > 0 ? float.NaN : Int32BitsToSingle(FloatKey(maxKey));
+        if (min == 0 || max == 0)
+        {
+            float zero = (float)FirstZero(array);
+            if (min == 0) min = zero;
+            if (max == 0) max = zero;
+        }
+
         return true;
     }
 
@@ -274,6 +289,25 @@ internal static class StatsBounds
         }
 
         return (minIdx, maxIdx);
+    }
+
+    /// <summary>
+    /// The first present zero of a FLOAT or DOUBLE array, keeping its sign: a zero bound is that zero, since the
+    /// kernels order -0 below +0 and the value-by-value comparison this replaced kept the first of two that tie.
+    /// Called only when a bound is zero.
+    /// </summary>
+    private static double FirstZero(IArrowArray array)
+    {
+        for (int i = 0; i < array.Length; i++)
+        {
+            if (array.IsNull(i))
+                continue;
+            double v = array is DoubleArray d ? d.GetValue(i)!.Value : ((FloatArray)array).GetValue(i)!.Value;
+            if (v == 0)
+                return v;
+        }
+
+        return 0;
     }
 
     /// <summary>Levels for <paramref name="levels"/>.Length rows of <paramref name="array"/> from

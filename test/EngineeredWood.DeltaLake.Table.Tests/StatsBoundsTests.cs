@@ -190,18 +190,21 @@ public class StatsBoundsTests
         Assert.True(float.IsNaN(fMin) && float.IsNaN(fMax));
     }
 
-    [Fact]
-    public void Double_BothZeros_LeastIsNegativeGreatestPositive()
+    [Theory]
+    [InlineData(0.0, -0.0)]
+    [InlineData(-0.0, 0.0)]
+    public void Double_BothZeros_TakeTheFirstZerosSign(double first, double second)
     {
-        var array = new DoubleArray.Builder().Append(0.0).Append(-0.0).Append(0.0).Build();
+        // A zero bound is the first zero seen, as the value-by-value CompareTo (which ties the zeros) kept it.
+        var array = new DoubleArray.Builder().AppendNull().Append(first).Append(second).Append(first).Build();
         Assert.True(StatsBounds.TryDouble(array, out double min, out double max));
-        Assert.Equal(BitConverter.DoubleToInt64Bits(-0.0), BitConverter.DoubleToInt64Bits(min));
-        Assert.Equal(BitConverter.DoubleToInt64Bits(0.0), BitConverter.DoubleToInt64Bits(max));
+        Assert.Equal(BitConverter.DoubleToInt64Bits(first), BitConverter.DoubleToInt64Bits(min));
+        Assert.Equal(BitConverter.DoubleToInt64Bits(first), BitConverter.DoubleToInt64Bits(max));
     }
 
     /// <summary>
-    /// Delta's bounds: NaN is the greatest (so the least is NaN only when every value is), and of two zeros the
-    /// least is -0 and the greatest +0.
+    /// Delta's bounds as the value-by-value scan found them: NaN the greatest (so the least is NaN only when every
+    /// value is), and a zero bound the first zero seen.
     /// </summary>
     private static (double Min, double Max) DeltaBounds(List<double> values)
     {
@@ -210,10 +213,9 @@ public class StatsBoundsTests
             return (double.NaN, double.NaN);
 
         double min = numbers.Min(), max = numbers.Max();
-        if (min == 0 && numbers.Any(v => v == 0 && IsNegative(v))) min = -0.0;
-        if (max == 0 && numbers.Any(v => v == 0 && !IsNegative(v))) max = 0.0;
-        if (min == 0 && !numbers.Any(v => v == 0 && IsNegative(v))) min = 0.0;
-        if (max == 0 && !numbers.Any(v => v == 0 && !IsNegative(v))) max = -0.0;
+        double firstZero = numbers.FirstOrDefault(v => v == 0);
+        if (min == 0) min = firstZero;
+        if (max == 0) max = firstZero;
         return (min, values.Count > numbers.Count ? double.NaN : max);
     }
 
@@ -253,8 +255,6 @@ public class StatsBoundsTests
         random.NextBytes(bytes);
         return BitConverter.ToInt64(bytes, 0);
     }
-
-    private static bool IsNegative(double v) => BitConverter.DoubleToInt64Bits(v) < 0;
 
     private static string RandomText(Random random)
     {
