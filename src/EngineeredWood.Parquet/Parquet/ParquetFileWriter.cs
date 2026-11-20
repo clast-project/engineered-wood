@@ -133,7 +133,9 @@ public sealed partial class ParquetFileWriter : IAsyncDisposable, IDisposable
         {
             batch = PrepareBatch(batch);
             int maxRows = _options.RowGroupMaxRows;
-            if (batch.Length > maxRows)
+            // Checked before the open row group (held rows and all) is written for it: a refused batch leaves it as it
+            // was (#945 review). A batch written whole is otherwise checked as it is written.
+            if (batch.Length > maxRows || _open is not null || _held is { Rows: > 0 })
                 EnsureWholeBatchMatches(batch);
             await WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
             await EncodeHeldAsync(cancellationToken).ConfigureAwait(false);
@@ -267,14 +269,16 @@ public sealed partial class ParquetFileWriter : IAsyncDisposable, IDisposable
         EnsureWritable();
         cancellationToken.ThrowIfCancellationRequested();
 
-        // A small batch is held, copied, and encoded with the next (#941). One that cannot be has the rows held before
-        // it encoded first; if they fill a row group, a caller stopping at one takes none of this batch yet.
+        // A small batch is held, copied, and encoded with the next (#941). One that cannot be is checked, then has the
+        // rows held before it encoded first; if they fill a row group, a caller stopping at one takes none of it yet.
+        RecordBatch? prepared = null;
         if (batch.Length > 0)
         {
             if (TryHold(batch))
                 return batch.Length;
             if (_held is { Rows: > 0 })
             {
+                prepared = PrepareAndCheckBeforeHeld(batch);
                 if (await EncodeHeldAsync(cancellationToken).ConfigureAwait(false) && stopAfterRowGroup)
                     return 0;
                 if (TryHold(batch))
@@ -285,7 +289,7 @@ public sealed partial class ParquetFileWriter : IAsyncDisposable, IDisposable
         var source = batch;
         try
         {
-            batch = PrepareBatch(batch);
+            batch = prepared ?? PrepareBatch(batch);
 
             // An empty batch adds no rows, but its schema is captured, or checked against the captured one, as any
             // other batch's is: otherwise a file whose first batch was empty took a later batch of another shape.

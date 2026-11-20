@@ -25,8 +25,6 @@ internal sealed class HeldRows
 {
     private readonly Apache.Arrow.Schema _schema;
     private readonly Column[] _columns;
-    private int _markRows;
-    private long _markBytes;
 
     private HeldRows(Apache.Arrow.Schema schema, Column[] columns)
     {
@@ -39,6 +37,9 @@ internal sealed class HeldRows
 
     /// <summary>The bytes the held rows take in Arrow's layout: what the buffers hold of them.</summary>
     public long Bytes { get; private set; }
+
+    /// <summary>The bytes of the buffers, held rows or not: for tests.</summary>
+    internal long BufferBytes => _columns.Sum(c => c.BufferBytes);
 
     /// <summary>Buffers for batches of <paramref name="batch"/>'s layout, or null if it has a column not held.</summary>
     public static HeldRows? For(RecordBatch batch)
@@ -76,28 +77,30 @@ internal sealed class HeldRows
         return true;
     }
 
-    /// <summary>Copies the rows of <paramref name="batch"/>, which <see cref="Takes"/>, after those held.</summary>
-    public void Append(RecordBatch batch)
+    /// <summary>
+    /// The bytes holding <paramref name="batch"/>, which <see cref="Takes"/>, would add to <see cref="Bytes"/>: known
+    /// before anything of it is copied, so a batch too large to hold grows no buffer (#945 review).
+    /// </summary>
+    public long BytesFor(RecordBatch batch)
     {
-        _markRows = Rows;
-        _markBytes = Bytes;
         long bytes = 0;
-        foreach (var column in _columns)
-            column.Mark();
         for (int i = 0; i < _columns.Length; i++)
-            bytes += _columns[i].Append(batch.Column(i), Rows);
+            bytes += _columns[i].BytesFor(batch.Column(i), Rows);
+        GC.KeepAlive(batch); // binary offsets are read as raw spans of its buffers
+        return bytes;
+    }
+
+    /// <summary>
+    /// Copies the rows of <paramref name="batch"/>, which <see cref="Takes"/>, after those held; <paramref name="bytes"/>
+    /// is its <see cref="BytesFor"/>.
+    /// </summary>
+    public void Append(RecordBatch batch, long bytes)
+    {
+        for (int i = 0; i < _columns.Length; i++)
+            _columns[i].Append(batch.Column(i), Rows);
         Rows += batch.Length;
         Bytes += bytes;
         GC.KeepAlive(batch); // the copies read raw spans of its buffers
-    }
-
-    /// <summary>Takes back the last <see cref="Append"/>.</summary>
-    public void Undo()
-    {
-        foreach (var column in _columns)
-            column.Undo();
-        Rows = _markRows;
-        Bytes = _markBytes;
     }
 
     /// <summary>The held rows as one batch, over these buffers: valid until <see cref="Clear"/> or the next append.</summary>
@@ -116,8 +119,6 @@ internal sealed class HeldRows
             column.Clear();
         Rows = 0;
         Bytes = 0;
-        _markRows = 0;
-        _markBytes = 0;
     }
 
     private static bool SameFields(IReadOnlyList<Field> a, IReadOnlyList<Field> b)
@@ -166,9 +167,6 @@ internal sealed class HeldRows
         private byte[]? _validity; // null while every held row is valid
         private int _nulls;
 
-        private int _markValueBytes;
-        private int _markNulls;
-
         private Column(Layout layout, ArrowTypeId typeId, int width)
         {
             _layout = layout;
@@ -195,6 +193,8 @@ internal sealed class HeldRows
             _ => null,
         };
 
+        public long BufferBytes => _values.Length + _offsets.Length + (_validity?.Length ?? 0);
+
         public bool Takes(IArrowArray array)
         {
             if (array is not Apache.Arrow.Array)
@@ -205,21 +205,6 @@ internal sealed class HeldRows
             return _layout != Layout.Fixed || (type is FixedWidthType f && f.BitWidth == _width * 8);
         }
 
-        public void Mark()
-        {
-            _markValueBytes = _valueBytes;
-            _markNulls = _nulls;
-        }
-
-        // Validity and value bits past the held rows are written over by the next append.
-        public void Undo()
-        {
-            _valueBytes = _markValueBytes;
-            _nulls = _markNulls;
-            if (_nulls == 0)
-                _validity = null; // it was allocated by the append taken back
-        }
-
         public void Clear()
         {
             _valueBytes = 0;
@@ -227,13 +212,40 @@ internal sealed class HeldRows
             _validity = null;
         }
 
-        /// <summary>Copies <paramref name="array"/> after the <paramref name="rows"/> held; returns the bytes added.</summary>
-        public long Append(IArrowArray array, int rows)
+        /// <summary>
+        /// The bytes appending <paramref name="array"/> after <paramref name="rows"/> held rows adds: its values and
+        /// offsets, and its validity bits, or every held row's once its first null takes a bitmap.
+        /// </summary>
+        public long BytesFor(IArrowArray array, int rows)
+        {
+            int length = array.Length;
+            long bitmapGrowth = (rows + length + 7) / 8 - (rows + 7) / 8;
+            long bytes = _layout switch
+            {
+                Layout.Bits => bitmapGrowth,
+                Layout.Fixed => (long)length * _width,
+                _ => BinaryBytes(array) + 4L * length,
+            };
+            if (_validity is not null)
+                bytes += bitmapGrowth;
+            else if (length > 0 && array.NullCount > 0)
+                bytes += (rows + length + 7) / 8;
+            return bytes;
+        }
+
+        private static long BinaryBytes(IArrowArray array)
+        {
+            var data = array.Data;
+            var offsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span).Slice(data.Offset, array.Length + 1);
+            return offsets[array.Length] - offsets[0];
+        }
+
+        /// <summary>Copies <paramref name="array"/> after the <paramref name="rows"/> held.</summary>
+        public void Append(IArrowArray array, int rows)
         {
             var data = array.Data;
             int length = array.Length;
             int offset = data.Offset;
-            long added = 0;
 
             int nulls = length == 0 ? 0 : array.NullCount;
             if (nulls > 0 && _validity is null)
@@ -249,7 +261,6 @@ internal sealed class HeldRows
                 else
                     SetBits(_validity, rows, length);
                 _nulls += nulls;
-                added += (rows + length + 7) / 8 - (rows + 7) / 8;
             }
 
             switch (_layout)
@@ -257,7 +268,6 @@ internal sealed class HeldRows
                 case Layout.Bits:
                     Grow(ref _values, (rows + length + 7) / 8);
                     CopyBits(data.Buffers[1].Span, offset, _values, rows, length);
-                    added += (rows + length + 7) / 8 - (rows + 7) / 8;
                     break;
 
                 case Layout.Fixed:
@@ -266,7 +276,6 @@ internal sealed class HeldRows
                     Grow(ref _values, _valueBytes + source.Length);
                     source.CopyTo(_values.AsSpan(_valueBytes));
                     _valueBytes += source.Length;
-                    added += source.Length;
                     break;
                 }
 
@@ -284,12 +293,9 @@ internal sealed class HeldRows
                     Grow(ref _values, _valueBytes + source.Length);
                     source.CopyTo(_values.AsSpan(_valueBytes));
                     _valueBytes += source.Length;
-                    added += source.Length + 4L * length;
                     break;
                 }
             }
-
-            return added;
         }
 
         public IArrowArray Build(IArrowType type, int rows)

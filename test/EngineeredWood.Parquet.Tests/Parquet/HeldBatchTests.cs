@@ -460,6 +460,114 @@ public class HeldBatchTests : IDisposable
         Assert.Equal(4, rows.Count);
     }
 
+    /// <summary>
+    /// A refused batch leaves the open row group as it was, held rows and all: checked before the held rows are
+    /// encoded, which can write the row group they fill (#945 review). WriteRowGroupAsync wrote the open row group
+    /// before checking its batch, held rows or not.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ARefusedBatch_DoesNotEncodeOrWriteTheHeldRows(bool wholeRowGroup)
+    {
+        // A first row group of constants measures a few bytes a row, so a thousand rows of 100-byte strings are held
+        // within a 64 KiB limit they exceed once encoded.
+        var options = new ParquetWriteOptions { RowGroupMaxRows = int.MaxValue, RowGroupMaxBytes = 64 << 10 };
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("v", Int64Type.Default, nullable: false))
+            .Field(new Field("s", StringType.Default, nullable: false))
+            .Build();
+        var random = new Random(21);
+        RecordBatch Rows(int count, bool constant)
+        {
+            var v = new Int64Array.Builder();
+            var s = new StringArray.Builder();
+            for (int i = 0; i < count; i++)
+            {
+                v.Append(constant ? 7 : random.Next());
+                s.Append(constant ? "" : new string((char)('a' + random.Next(26)), 100) + random.Next());
+            }
+            return new RecordBatch(schema, [v.Build(), s.Build()], count);
+        }
+        var other = new RecordBatch(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field("v", Int64Type.Default, nullable: false))
+                .Field(new Field("s", Int32Type.Default, nullable: false))
+                .Build(),
+            [new Int64Array.Builder().Append(1).Build(), new Int32Array.Builder().Append(1).Build()], 1);
+
+        string path = NewPath();
+        var file = new LocalSequentialFile(path);
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(Rows(100_000, constant: true));
+            for (int i = 0; i < 1000; i++)
+                await writer.WriteBatchAsync(Rows(1, constant: false));
+            Assert.Equal(1000, writer.OpenRowGroupRows);
+            long position = file.Position;
+
+            await Assert.ThrowsAsync<ArgumentException>(async () =>
+            {
+                if (wholeRowGroup) await writer.WriteRowGroupAsync(other);
+                else await writer.WriteBatchAsync(other);
+            });
+            Assert.Equal(position, file.Position);
+            Assert.Equal(1000, writer.OpenRowGroupRows);
+            await writer.CloseAsync();
+        }
+        await file.DisposeAsync();
+
+        var (metadata, _) = await ReadAsync(path);
+        Assert.Equal(101_000, metadata.NumRows);
+    }
+
+    /// <summary>
+    /// A batch too large to hold is not copied first: the buffers grow only for what is held, so they stay within
+    /// about <see cref="ParquetFileWriter.HeldBytesLimit"/> (#945 review).
+    /// </summary>
+    [Fact]
+    public async Task ABatchOverTheByteLimit_IsNotCopied()
+    {
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("s", StringType.Default, nullable: false)).Build();
+        RecordBatch Row(int length) =>
+            new(schema, [new StringArray.Builder().Append(new string('x', length)).Build()], 1);
+
+        string path = NewPath();
+        await using (var writer = new ParquetFileWriter(new LocalSequentialFile(path), ownsFile: true))
+        {
+            await writer.WriteBatchAsync(Row(10));
+            await writer.WriteBatchAsync(Row(8 << 20));
+            await writer.WriteBatchAsync(Row(10));
+            Assert.True(writer.HeldBufferBytes < ParquetFileWriter.HeldBytesLimit,
+                $"{writer.HeldBufferBytes} bytes of buffers");
+            await writer.CloseAsync();
+        }
+
+        var (_, rows) = await ReadAsync(path);
+        Assert.Equal(3, rows.Count);
+    }
+
+    /// <summary>
+    /// The held rows' size counts a validity bitmap for every held row, the rows held before the first null among
+    /// them too (#945 review).
+    /// </summary>
+    [Fact]
+    public void HeldBytes_CountTheWholeValidityBitmap()
+    {
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("b", BooleanType.Default, nullable: true)).Build();
+        var valid = new BooleanArray.Builder();
+        for (int i = 0; i < 512; i++)
+            valid.Append(true);
+        var first = new RecordBatch(schema, [valid.Build()], 512);
+        var withNull = new RecordBatch(schema, [new BooleanArray.Builder().AppendNull().Build()], 1);
+
+        var held = HeldRows.For(first)!;
+        held.Append(first, held.BytesFor(first));
+        Assert.Equal(64, held.Bytes);
+        held.Append(withNull, held.BytesFor(withNull));
+        Assert.Equal(65 + 65, held.Bytes); // 513 value bits and 513 validity bits
+    }
+
     [Fact]
     public async Task DisposingWithRowsHeld_WritesNothingOfThem()
     {

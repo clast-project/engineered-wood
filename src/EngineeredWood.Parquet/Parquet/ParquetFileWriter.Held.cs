@@ -25,6 +25,9 @@ public sealed partial class ParquetFileWriter
     /// </summary>
     internal int HoldBelowRows { get; set; } = HoldRows;
 
+    /// <summary>The bytes of the buffers rows are held in: for tests.</summary>
+    internal long HeldBufferBytes => _held?.BufferBytes ?? 0;
+
     /// <summary>The most bytes the held rows take, in Arrow's layout, before they are encoded.</summary>
     internal const long HeldBytesLimit = 1L << 20;
 
@@ -79,34 +82,32 @@ public sealed partial class ParquetFileWriter
             _held = held;
         }
 
-        CheckHeld(batch);
-
+        // Sized before anything is copied: a batch too large to hold grows no buffer.
         if (heldRows == 0)
             _heldOpenBytes = _open?.EstimatedBytes() ?? 0;
-        _held.Append(batch);
-        if (HeldRowsFill())
-        {
-            _held.Undo();
+        long bytes = _held.BytesFor(batch);
+        if (HeldRowsFill(heldRows + batch.Length, _held.Bytes + bytes))
             return false;
-        }
 
+        CheckHeld(batch);
+        _held.Append(batch, bytes);
         return true;
     }
 
     /// <summary>
-    /// Whether the held rows are too many bytes to hold, or would take the open row group to
-    /// <see cref="ParquetWriteOptions.RowGroupMaxBytes"/>: counted at the open row group's encoded bytes per row (or the
-    /// last row group's), as <see cref="RowsToAppend"/> cuts a batch; at their Arrow size before there is either.
+    /// Whether <paramref name="rows"/> held rows of <paramref name="bytes"/> (in Arrow's layout) are too many bytes to
+    /// hold, or would take the open row group to <see cref="ParquetWriteOptions.RowGroupMaxBytes"/>: counted at the open
+    /// row group's encoded bytes per row (or the last row group's), as <see cref="RowsToAppend"/> cuts a batch; at their
+    /// Arrow size before there is either.
     /// </summary>
-    private bool HeldRowsFill()
+    private bool HeldRowsFill(int rows, long bytes)
     {
-        var held = _held!;
-        if (held.Bytes > HeldBytesLimit)
+        if (bytes > HeldBytesLimit)
             return true;
 
         long openRows = _open?.Rows ?? 0;
         double? bytesPerRow = openRows > 0 ? (double)_heldOpenBytes / openRows : _lastBytesPerRow;
-        double heldBytes = bytesPerRow is { } perRow ? perRow * held.Rows : held.Bytes;
+        double heldBytes = bytesPerRow is { } perRow ? perRow * rows : bytes;
         return _heldOpenBytes + heldBytes >= _options.RowGroupMaxBytes;
     }
 
@@ -140,6 +141,19 @@ public sealed partial class ParquetFileWriter
             for (int i = 0; i < fields.Count; i++)
                 _requiredColumns[i] = !fields[i].IsNullable;
         }
+    }
+
+    /// <summary>
+    /// Refuses a batch that is not held, before the rows held are encoded for it: encoding them can write the row group
+    /// they fill, and a refused batch leaves the open row group as it was (#945 review). Returns the batch prepared,
+    /// for the caller to encode. A batch of rows already held or written was checked as they were: a file's first
+    /// batch has nothing held before it.
+    /// </summary>
+    private RecordBatch PrepareAndCheckBeforeHeld(RecordBatch batch)
+    {
+        var prepared = PrepareBatch(batch);
+        EnsureWholeBatchMatches(prepared);
+        return prepared;
     }
 
     /// <summary>
