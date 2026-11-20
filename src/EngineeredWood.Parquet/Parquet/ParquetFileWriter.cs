@@ -205,10 +205,12 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             throw new ArgumentOutOfRangeException(nameof(offset));
 
         // A writer the batch reaches past its first rows, the next file's after a rollover, decides its variant layout
-        // from the rest of the batch, as one the batch starts in decides it from the whole: not from the first slice it
-        // takes, a probe's worth of rows (#939 review). Once per writer, so it costs no more than that writer's rows.
+        // from up to a row group of the rows it is about to take, as the rolling writer once did from each file's first
+        // row group: not from the first slice it takes, a probe's worth of rows. Not from the whole rest of the batch
+        // either, which every file the batch spans would read again (#939 review). Only the variant columns are read;
+        // the decision does not depend on how the other columns are laid out.
         if (_variantShredDecisions is null && (_options.ShredVariants is not null || _options.VariantShredSchemas is not null))
-            PrepareBatch(batch.Slice(offset, batch.Length - offset));
+            EnsureVariantShredDecisions(batch.Slice(offset, Math.Min(batch.Length - offset, _options.RowGroupMaxRows)));
 
         int start = offset;
         bool batchInOpenRowGroup = false;

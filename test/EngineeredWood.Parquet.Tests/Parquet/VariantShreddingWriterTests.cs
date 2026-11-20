@@ -448,4 +448,42 @@ public class VariantShreddingWriterTests : IDisposable
         Assert.Equal(expected.Schema.Select(s => s.Name), actual.Schema.Select(s => s.Name));
         Assert.Equal(batch.Length - 500, actualValues.Count);
     }
+
+    /// <summary>
+    /// The rest of the batch is read only as far as a row group, as each file's first row group once decided it: a
+    /// batch spanning many files would otherwise be read again by each of them, its whole rest every time (#939 review).
+    /// Here the first row group is all one shape and the rows after it all another.
+    /// </summary>
+    [Fact]
+    public async Task AWriterReachedAtAnOffset_InfersFromUpToARowGroup()
+    {
+        var options = ParquetWriteOptions.Default with { ShredVariants = ShredOptions.Default, RowGroupMaxRows = 2_000 };
+        var values = new List<VariantValue>();
+        for (int i = 0; i < 100 + 2_000; i++)
+            values.Add(Obj(i, "first"));
+        for (int i = 0; i < 8_000; i++)
+        {
+            values.Add(VariantValue.FromObject(new Dictionary<string, VariantValue>
+            {
+                ["c"] = VariantValue.FromInt64(i),
+                ["d"] = VariantValue.FromDouble(i / 2.0),
+            }));
+        }
+        var batch = Batch(values.ToArray());
+
+        string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N")[..8] + ".parquet");
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            int offset = 100;
+            while (offset < batch.Length)
+                offset += await writer.WriteBatchUntilRowGroupAsync(batch, offset);
+            await writer.CloseAsync();
+        }
+
+        var (meta, read, _) = await ReadAsync(path);
+        Assert.Contains(meta.Schema, s => s.Name == "a");
+        Assert.DoesNotContain(meta.Schema, s => s.Name == "c");
+        Assert.Equal(batch.Length - 100, read.Count);
+    }
 }
