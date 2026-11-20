@@ -15,16 +15,40 @@ using EngineeredWood.Parquet.Metadata;
 namespace EngineeredWood.Parquet.Data;
 
 /// <summary>
-/// Encodes an Arrow column into Parquet pages (PLAIN or dictionary encoding).
-/// Returns the complete column chunk bytes and metadata.
+/// Encodes one leaf column's chunk of a row group into Parquet pages: <see cref="Append"/> encodes
+/// values into pages and holds them compressed, and <see cref="Finish"/> returns the chunk, with its
+/// dictionary page, statistics, page index and Bloom filter.
 /// </summary>
-internal static class ColumnChunkWriter
+/// <remarks>
+/// <para>This is the one column-encoding core of #936. Every per-column knob — encodings, the
+/// dictionary's first-page test and partial fallback, page size, compression, statistics, Bloom
+/// filters, the page index and size statistics — is applied here, so a front end that feeds a row
+/// group to it (<see cref="ParquetFileWriter"/> today; a streaming or permuting writer later) only
+/// decides what to append.</para>
+/// <para>For now a chunk takes ONE append: the dictionary is decided over the whole of it, and the
+/// pages are cut and encoded exactly as the whole-array writer this replaced cut them, so the output
+/// is byte for byte what it was. Multi-batch chunks are step 2 of #936; what each piece of state does
+/// across appends is set out on the fields below.</para>
+/// <para>Not thread-safe. Appends and the finish of one chunk run in order; different chunks run in
+/// parallel. No state is kept in the thread-static encode buffers between calls, so consecutive calls
+/// may run on different threads.</para>
+/// </remarks>
+internal sealed class ColumnChunkWriter
 {
     /// <summary>
     /// Result of encoding a column chunk.
     /// </summary>
     internal readonly struct ColumnChunkResult
     {
+        /// <summary>
+        /// The pages that precede the data pages — the dictionary page or the FSST symbol table page —
+        /// or empty. They are written to the file ahead of <see cref="Data"/>. They are kept apart because
+        /// the dictionary page can only be written once every value of the chunk is known, after the data
+        /// pages that use it.
+        /// </summary>
+        public ArraySegment<byte> PrefixData { get; init; }
+
+        /// <summary>The data pages, which follow <see cref="PrefixData"/> in the file.</summary>
         public required ArraySegment<byte> Data { get; init; }
         public required ColumnMetaData MetaData { get; init; }
 
@@ -47,14 +71,109 @@ internal static class ColumnChunkWriter
         public byte[]? BloomFilterData { get; init; }
 
         /// <summary>
-        /// The chunk's page index, with page offsets relative to the chunk, or null when
-        /// <see cref="ParquetWriteOptions.WritePageIndex"/> is off.
+        /// The chunk's page index, with page offsets relative to the chunk's start (the start of
+        /// <see cref="PrefixData"/>), or null when <see cref="ParquetWriteOptions.WritePageIndex"/> is off.
         /// </summary>
         public ChunkPageIndex? PageIndex { get; init; }
     }
 
     [ThreadStatic]
     private static byte[]? t_compressBuffer;
+
+    // ───── The chunk being written ─────
+    //
+    // What each piece of state does once a chunk takes more than one append (#936 step 2) is noted on it;
+    // the PR for step 1 records the same as decision 5.
+
+    private readonly IReadOnlyList<string> _pathInSchema;
+    private readonly PhysicalType _physicalType;
+    private readonly int _typeLength;
+    private readonly int _maxDefLevel;
+    private readonly int _maxRepLevel;
+
+    /// <summary>The write options with this column's own overrides folded in.</summary>
+    private readonly ParquetWriteOptions _options;
+
+    private bool _appended;
+    private bool _finished;
+
+    /// <summary>
+    /// The data pages, compressed, as they were written. Their offsets are relative to the first data page
+    /// until <see cref="Finish"/> knows how long the prefix is.
+    /// </summary>
+    private ColumnChunkOutput? _output;
+
+    /// <summary>
+    /// The pages that go ahead of the data pages: the FSST symbol table page, written when the chunk's table
+    /// is trained, or the dictionary page, written by <see cref="Finish"/> once the dictionary is complete.
+    /// </summary>
+    private ColumnChunkOutput? _prefix;
+
+    private int _symbolTablePageSize;
+
+    /// <summary>The chunk's encodings, in the order they first appear (a set; enumerated in insertion order).</summary>
+    private readonly HashSet<Encoding> _encodings = new();
+
+    /// <summary>Level encoders, reused for every page of the chunk.</summary>
+    private RleBitPackedEncoder? _defEncoder;
+    private RleBitPackedEncoder? _repEncoder;
+
+    /// <summary>Per page, as pages are emitted; also folds the pages' bounds into the chunk's.</summary>
+    private PageIndexCollector? _pageIndex;
+
+    private StatisticsOrder _statisticsOrder;
+
+    /// <summary>The values' Arrow type as they reach the file, after the rewrites in <see cref="Append"/>.</summary>
+    private IArrowType? _writtenType;
+
+    private int _levelCount;
+    private int _nonNullCount;
+
+    /// <summary>SizeStatistics' unencoded_byte_array_data_bytes for the chunk (#890): summed per page.</summary>
+    private long _unencodedBytes;
+
+    /// <summary>
+    /// The chunk's dictionary, when it has one. Its page is written by <see cref="Finish"/>; a dictionary
+    /// that covers the whole chunk also supplies the statistics (O(distinct)) and the Bloom filter.
+    /// </summary>
+    private DictionaryEncoder.DictionaryResult? _dictionary;
+
+    /// <summary>
+    /// Whether FLOAT/DOUBLE statistics come from the dictionary too, counting NaNs through its indices:
+    /// for a chunk appended already dictionary-encoded, which leaves no values to scan.
+    /// </summary>
+    private bool _dictionaryStatisticsForFloats;
+
+    /// <summary>
+    /// The statistics found by scanning the values, when neither the dictionary nor the page index can
+    /// supply them. Merged across appends once there is more than one.
+    /// </summary>
+    private Statistics? _scannedStatistics;
+
+    /// <summary>
+    /// The Bloom filter of a chunk that is not wholly dictionary-encoded, filled from each append's values.
+    /// One that is gets its filter from the dictionary at <see cref="Finish"/> instead.
+    /// </summary>
+    private SplitBlockBloomFilterBuilder? _bloomFilter;
+
+    /// <summary>Opens a column chunk for one leaf column.</summary>
+    /// <param name="maxDefLevel">The leaf's maximum definition level: 0 or 1 for a flat column.</param>
+    /// <param name="maxRepLevel">The leaf's maximum repetition level: 0 for a column that is not repeated.</param>
+    public ColumnChunkWriter(
+        IReadOnlyList<string> pathInSchema,
+        PhysicalType physicalType,
+        int typeLength,
+        int maxDefLevel,
+        int maxRepLevel,
+        ParquetWriteOptions options)
+    {
+        _pathInSchema = pathInSchema;
+        _physicalType = physicalType;
+        _typeLength = typeLength;
+        _maxDefLevel = maxDefLevel;
+        _maxRepLevel = maxRepLevel;
+        _options = ResolveColumnOptions(pathInSchema, options);
+    }
 
     /// <summary>
     /// Encodes an Arrow array as a Parquet column chunk (flat column, single def level).
@@ -67,14 +186,76 @@ internal static class ColumnChunkWriter
         bool isNullable,
         ParquetWriteOptions options)
     {
+        var writer = new ColumnChunkWriter(pathInSchema, physicalType, typeLength, isNullable ? 1 : 0, 0, options);
+        writer.AppendFlat(array);
+        return writer.Finish();
+    }
+
+    /// <summary>
+    /// Encodes an Arrow array as a Parquet column chunk with pre-computed def/rep levels
+    /// (for nested columns).
+    /// </summary>
+    public static ColumnChunkResult WriteColumn(
+        IArrowArray array,
+        IReadOnlyList<string> pathInSchema,
+        PhysicalType physicalType,
+        int typeLength,
+        int maxDefLevel,
+        int maxRepLevel,
+        int[] defLevels,
+        int[]? repLevels,
+        int nonNullCount,
+        int levelCount,
+        ParquetWriteOptions options)
+    {
+        var writer = new ColumnChunkWriter(pathInSchema, physicalType, typeLength, maxDefLevel, maxRepLevel, options);
+        writer.Append(array, defLevels, repLevels, nonNullCount, levelCount);
+        return writer.Finish();
+    }
+
+    /// <summary>
+    /// The options with this column's overrides for compression, level, byte-array encoding and dictionary
+    /// folded in, or the options themselves when it has none.
+    /// </summary>
+    private static ParquetWriteOptions ResolveColumnOptions(IReadOnlyList<string> pathInSchema, ParquetWriteOptions options)
+    {
+        var columnCodec = options.GetCodec(pathInSchema);
+        var columnLevel = options.GetCompressionLevel(pathInSchema);
+        var columnByteArrayEncoding = options.GetByteArrayEncoding(pathInSchema);
+        bool columnDictionary = options.GetDictionaryEnabled(pathInSchema);
+        if (columnCodec != options.Compression
+            || columnLevel != options.CompressionLevel
+            || columnByteArrayEncoding != options.ByteArrayEncoding
+            || columnDictionary != options.DictionaryEnabled)
+        {
+            options = options with
+            {
+                Compression = columnCodec,
+                CompressionLevel = columnLevel,
+                ByteArrayEncoding = columnByteArrayEncoding,
+                // Folded into the per-column options rather than passed alongside them, so everything
+                // downstream — DictionaryEncoder above all — reads one resolved DictionaryEnabled and
+                // cannot consult the file-wide one by accident.
+                DictionaryEnabled = columnDictionary,
+            };
+        }
+
+        return options;
+    }
+
+    /// <summary>
+    /// Appends a flat column's values, deriving its definition levels from the array: every row holds a
+    /// value unless the column is nullable (<c>maxDefLevel</c> 1) and the row is null.
+    /// </summary>
+    public void AppendFlat(IArrowArray array)
+    {
         int rowCount = array.Length;
-        int maxDefLevel = isNullable ? 1 : 0;
 
         // Extract definition levels for nullable columns
         int[]? defLevels = null;
         int nonNullCount = rowCount;
 
-        if (isNullable)
+        if (_maxDefLevel > 0)
         {
             defLevels = new int[rowCount];
 
@@ -99,8 +280,7 @@ internal static class ColumnChunkWriter
             }
         }
 
-        return WriteColumnCore(array, rowCount, pathInSchema, physicalType, typeLength,
-            maxDefLevel, 0, defLevels, null, nonNullCount, options);
+        Append(array, defLevels, null, nonNullCount, rowCount);
     }
 
     /// <summary>
@@ -121,60 +301,23 @@ internal static class ColumnChunkWriter
     }
 
     /// <summary>
-    /// Encodes an Arrow array as a Parquet column chunk with pre-computed def/rep levels
-    /// (for nested columns).
+    /// Appends values with their levels, and encodes them into pages.
     /// </summary>
-    public static ColumnChunkResult WriteColumn(
-        IArrowArray array,
-        IReadOnlyList<string> pathInSchema,
-        PhysicalType physicalType,
-        int typeLength,
-        int maxDefLevel,
-        int maxRepLevel,
-        int[] defLevels,
-        int[]? repLevels,
-        int nonNullCount,
-        int levelCount,
-        ParquetWriteOptions options)
+    /// <param name="array">One slot per level entry; slots at levels that hold no value are ignored.</param>
+    /// <param name="defLevels">Definition levels, one per entry, or null for a required column.</param>
+    /// <param name="repLevels">Repetition levels, or null for a column that is not repeated.</param>
+    /// <param name="nonNullCount">Entries at the maximum definition level: the values.</param>
+    /// <param name="levelCount">Level entries: rows, for a column that is not repeated.</param>
+    /// <exception cref="NotSupportedException">A second append to the same chunk (#936 step 2).</exception>
+    public void Append(IArrowArray array, int[]? defLevels, int[]? repLevels, int nonNullCount, int levelCount)
     {
-        return WriteColumnCore(array, levelCount, pathInSchema, physicalType, typeLength,
-            maxDefLevel, maxRepLevel, defLevels, repLevels, nonNullCount, options);
-    }
+        BeginAppend();
 
-    private static ColumnChunkResult WriteColumnCore(
-        IArrowArray array,
-        int rowCount,
-        IReadOnlyList<string> pathInSchema,
-        PhysicalType physicalType,
-        int typeLength,
-        int maxDefLevel,
-        int maxRepLevel,
-        int[]? defLevels,
-        int[]? repLevels,
-        int nonNullCount,
-        ParquetWriteOptions options)
-    {
-        // Resolve per-column overrides for compression, level, and byte-array encoding
-        var columnCodec = options.GetCodec(pathInSchema);
-        var columnLevel = options.GetCompressionLevel(pathInSchema);
-        var columnByteArrayEncoding = options.GetByteArrayEncoding(pathInSchema);
-        bool columnDictionary = options.GetDictionaryEnabled(pathInSchema);
-        if (columnCodec != options.Compression
-            || columnLevel != options.CompressionLevel
-            || columnByteArrayEncoding != options.ByteArrayEncoding
-            || columnDictionary != options.DictionaryEnabled)
-        {
-            options = options with
-            {
-                Compression = columnCodec,
-                CompressionLevel = columnLevel,
-                ByteArrayEncoding = columnByteArrayEncoding,
-                // Folded into the per-column options rather than passed alongside them, so everything
-                // downstream — DictionaryEncoder above all — reads one resolved DictionaryEnabled and
-                // cannot consult the file-wide one by accident.
-                DictionaryEnabled = columnDictionary,
-            };
-        }
+        var options = _options;
+        var physicalType = _physicalType;
+        int typeLength = _typeLength;
+        int maxDefLevel = _maxDefLevel;
+        int rowCount = levelCount;
 
         // Normalize def levels for value-encoding and dictionary methods:
         // these check defLevels[i] == 0 for null, which only works when maxDefLevel <= 1.
@@ -219,14 +362,14 @@ internal static class ColumnChunkWriter
         // here, for the same reason the decimal reversal below happens here: everything downstream --
         // dictionary, page encoders, statistics, bloom filter -- must see the bytes that reach the file.
         bool extendedTimestamp = physicalType == PhysicalType.FixedLenByteArray
-            && options.IsExtendedTimestampColumn(pathInSchema);
+            && options.IsExtendedTimestampColumn(_pathInSchema);
 
         // Read off the Arrow type before the rewrites below replace it with the bytes that reach the file.
-        var statisticsOrder = StatisticsOrders.For(ValueType(array), physicalType, extendedTimestamp);
+        _statisticsOrder = StatisticsOrders.For(ValueType(array), physicalType, extendedTimestamp);
 
         // Null when page indexes are off, which is what keeps every page loop below free of their cost.
-        var pageIndex = options.WritePageIndex
-            ? NewPageIndexCollector(ValueType(array), physicalType, typeLength, statisticsOrder, pathInSchema, options)
+        _pageIndex = options.WritePageIndex
+            ? NewPageIndexCollector(ValueType(array), physicalType, typeLength, _statisticsOrder, _pathInSchema, options)
             : null;
 
         // Only when the values are still timestamps. The buffered writer encodes at accumulation time --
@@ -271,103 +414,265 @@ internal static class ColumnChunkWriter
         if (dictResult is null && array is RunEndEncodedArray declined)
             array = RunEndEncoding.Expand(declined);
 
-        ColumnChunkResult result;
+        _writtenType = ValueType(array);
 
         if (dictResult != null)
         {
-            result = WriteDictionaryColumn(
-                dictResult.Value, rowCount, pathInSchema, physicalType,
-                maxDefLevel, maxRepLevel, defLevels, repLevels, options, pageIndex,
-                array, typeLength, valueDefLevels);
+            _dictionary = dictResult;
+            WriteDictionaryDataPages(dictResult.Value, rowCount, defLevels, repLevels, array, valueDefLevels);
         }
         else
         {
             // Non-dictionary encoding (PLAIN for V1, type-aware for V2)
-            result = WriteNonDictionaryColumn(
-                array, rowCount, pathInSchema, physicalType, typeLength,
-                maxDefLevel, maxRepLevel, defLevels, repLevels, valueDefLevels, nonNullCount, options, pageIndex);
+            WriteNonDictionaryPages(array, rowCount, defLevels, repLevels, valueDefLevels, nonNullCount);
         }
+
+        _levelCount += rowCount;
+        _nonNullCount += nonNullCount;
 
         // Statistics OFF leaves the column chunk with no Statistics at all — not merely no bounds — and
         // skips computing them, so a non-dictionary column also skips the collector's full scan of its
-        // values. That is write time saved as well as footer bytes. This guards rather than returns early
-        // because the GC.KeepAlive at the end of the method roots `array` across everything above it.
+        // values. That is write time saved as well as footer bytes.
         // See ParquetWriteOptions.WriteStatistics for why the null count goes with the bounds.
-        if (options.GetWriteStatistics(pathInSchema))
+        if (options.GetWriteStatistics(_pathInSchema))
         {
-            // Compute column-level statistics: use dictionary entries when available (O(unique) vs O(total)).
-            // FLOAT/DOUBLE columns are always full-scanned so the NaN count covers every value,
-            // not just the distinct dictionary entries.
-            bool isFloatingPoint = StatisticsCollector.IsFloatingPoint(physicalType, statisticsOrder);
-            bool floatingPointTotalOrder =
-                options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder;
-            // A page index already found every page's bounds with the same scans; folding them gives
-            // these statistics exactly, and saves the second pass over the values. A partial dictionary
-            // holds only the values before its cut, so it cannot stand for the chunk.
-            var stats = dictResult is { PartialLength: null } && !isFloatingPoint
-                ? StatisticsCollector.ComputeFromDictEntries(
-                    dictResult.Value.DictionaryPageData, dictResult.Value.DictionaryCount,
-                    physicalType, typeLength, rowCount - nonNullCount, statisticsOrder)
-                : pageIndex?.ChunkStatistics(nonNullCount, rowCount)
-                    ?? StatisticsCollector.Compute(
-                        array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
-                        floatingPointTotalOrder, statisticsOrder);
-            stats = StatisticsCollector.ApplyTypeOrderZeroRule(stats, physicalType, floatingPointTotalOrder, statisticsOrder);
-            result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, ValueType(array), physicalType);
+            // The chunk's statistics come from the dictionary entries when one covers the chunk (O(unique)
+            // vs O(total)), or else from the page index, which found every page's bounds with the same scans:
+            // folding them gives these statistics exactly. Only when neither can are the values scanned here.
+            // FLOAT/DOUBLE columns are always scanned (or folded) so the NaN count covers every value, not
+            // just the distinct dictionary entries. A partial dictionary holds only the values before its
+            // cut, so it cannot stand for the chunk.
+            bool isFloatingPoint = StatisticsCollector.IsFloatingPoint(physicalType, _statisticsOrder);
+            bool fromDictionary = dictResult is { PartialLength: null } && !isFloatingPoint;
+            if (!fromDictionary && _pageIndex?.HasChunkStatistics(_nonNullCount) != true)
+            {
+                _scannedStatistics = StatisticsCollector.Compute(
+                    array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
+                    options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder, _statisticsOrder);
+            }
         }
 
-        if (options.HasBloomFilter(pathInSchema))
+        // A column the dictionary took whole is filled from its entries at Finish — O(distinct) rather than
+        // O(rows). That also covers every run-end encoded column that reaches here, since one the dictionary
+        // declined was expanded above. The rest hash every row, and size the filter from the row count
+        // because they have no better estimate of the distinct values.
+        if (options.HasBloomFilter(_pathInSchema) && dictResult is not { PartialLength: null })
         {
-            // A column the dictionary took is filled from its entries — O(distinct) rather than O(rows).
-            // That also covers every run-end encoded column that reaches here, since one the dictionary
-            // declined was expanded above. The rest hash every row, and size the filter from the row
-            // count because they have no better estimate of the distinct values.
-            SplitBlockBloomFilterBuilder bloomFilter;
-            if (dictResult is { PartialLength: null } dictionary)
+            _bloomFilter = NewBloomFilterBuilder(nonNullCount, options);
+            BloomFilterArrowEncoder.AddArrowValues(_bloomFilter, array, physicalType, typeLength);
+        }
+
+        // Roots the caller's array across the whole append. Everything above — the dictionary encoder, the
+        // plain/V2 encoders, the statistics scan, the Bloom filter — reads raw spans off its buffers. A span
+        // does not keep the array alive, so without this the buffers of a caller-built array can be finalized
+        // mid-encode. See doc/arrow-span-lifetime.md.
+        GC.KeepAlive(array);
+    }
+
+    /// <summary>
+    /// Appends values that are already dictionary-encoded, as the buffered writer builds them: the whole
+    /// chunk's dictionary and indices. Statistics and the Bloom filter come from the dictionary, since there
+    /// are no values to scan.
+    /// </summary>
+    /// <param name="arrowType">The values' Arrow type, for the statistics order.</param>
+    internal void AppendDictionaryEncoded(
+        DictionaryEncoder.DictionaryResult dictResult,
+        IArrowType arrowType,
+        int[]? defLevels,
+        int[]? repLevels,
+        int nonNullCount,
+        int levelCount)
+    {
+        if (dictResult.PartialLength is not null)
+            throw new ArgumentException("A dictionary appended whole must cover the chunk.", nameof(dictResult));
+
+        BeginAppend();
+
+        _statisticsOrder = StatisticsOrders.For(
+            arrowType, _physicalType,
+            _physicalType == PhysicalType.FixedLenByteArray && _options.IsExtendedTimestampColumn(_pathInSchema));
+        _pageIndex = _options.WritePageIndex
+            ? NewPageIndexCollector(arrowType, _physicalType, _typeLength, _statisticsOrder, _pathInSchema, _options)
+            : null;
+        _writtenType = arrowType;
+        _dictionary = dictResult;
+        // FLOAT/DOUBLE take the index-aware overload: the bounds come from the dictionary entries either
+        // way, but nan_count counts VALUES, so it has to see the indices. Append full-scans the Arrow array
+        // for the same reason; here there is no array left to scan.
+        _dictionaryStatisticsForFloats = true;
+
+        WriteDictionaryDataPages(dictResult, levelCount, defLevels, repLevels, array: null, valueDefLevels: null);
+
+        _levelCount += levelCount;
+        _nonNullCount += nonNullCount;
+    }
+
+    private void BeginAppend()
+    {
+        if (_finished)
+            throw new InvalidOperationException("The column chunk has already been finished.");
+        if (_appended)
+        {
+            throw new NotSupportedException(
+                "A column chunk takes one append for now; multi-batch row groups are step 2 of #936.");
+        }
+
+        _appended = true;
+
+        // Reusable encoders for def/rep levels across pages
+        int maxLiteralGroups = _options.MaxLiteralGroups;
+        _defEncoder = _maxDefLevel > 0 ? new RleBitPackedEncoder(BitWidth(_maxDefLevel), maxLiteralGroups: maxLiteralGroups) : null;
+        _repEncoder = _maxRepLevel > 0 ? new RleBitPackedEncoder(BitWidth(_maxRepLevel), maxLiteralGroups: maxLiteralGroups) : null;
+    }
+
+    /// <summary>
+    /// Ends the chunk: writes its dictionary page, and returns the chunk with its metadata, statistics,
+    /// page index and Bloom filter. The writer can take nothing more afterwards.
+    /// </summary>
+    public ColumnChunkResult Finish()
+    {
+        if (_finished)
+            throw new InvalidOperationException("The column chunk has already been finished.");
+        if (!_appended)
+            throw new InvalidOperationException("A column chunk needs an append before it can be finished.");
+        _finished = true;
+
+        var options = _options;
+        var physicalType = _physicalType;
+        var output = _output!;
+
+        // The dictionary page goes ahead of the data pages that use it, so it is written last and placed first.
+        int dictionaryPageSize = 0;
+        if (_dictionary is { } dictionary)
+        {
+            _prefix ??= new ColumnChunkOutput(
+                Compressor.GetMaxCompressedLength(options.Compression, dictionary.DictionaryPageData.Length)
+                    + PageHeaderAllowance,
+                options);
+            dictionaryPageSize = WriteDictionaryPage(_prefix, dictionary, options);
+        }
+
+        var prefix = _prefix;
+        var prefixData = prefix?.Data ?? default;
+
+        // encoding_stats in order of first appearance: the prefix's pages come first.
+        PageEncodingStats[] encodingStats;
+        if (prefix is null)
+        {
+            encodingStats = output.EncodingStats.ToArray();
+        }
+        else
+        {
+            encodingStats = new PageEncodingStats[prefix.EncodingStats.Count + output.EncodingStats.Count];
+            for (int i = 0; i < prefix.EncodingStats.Count; i++)
+                encodingStats[i] = prefix.EncodingStats[i];
+            for (int i = 0; i < output.EncodingStats.Count; i++)
+                encodingStats[prefix.EncodingStats.Count + i] = output.EncodingStats[i];
+        }
+
+        var metadata = new ColumnMetaData
+        {
+            Type = physicalType,
+            Encodings = _encodings.ToArray(),
+            PathInSchema = _pathInSchema is string[] arr ? arr : _pathInSchema.ToArray(),
+            Codec = options.Compression,
+            NumValues = _levelCount,
+            TotalUncompressedSize = (prefix?.TotalUncompressedSize ?? 0) + output.TotalUncompressedSize,
+            TotalCompressedSize = (prefix?.TotalCompressedSize ?? 0) + output.TotalCompressedSize,
+            EncodingStats = encodingStats,
+            DataPageOffset = 0, // set by caller
+            DictionaryPageOffset = dictionaryPageSize > 0 ? 0 : null, // set by caller
+            SymbolTablePageOffset = _symbolTablePageSize > 0 ? 0 : null, // set by caller
+            SymbolTablePageLength = _symbolTablePageSize > 0 ? _symbolTablePageSize : null,
+            UnencodedByteArrayDataBytes = RecordsUnencodedBytes(physicalType, options) ? _unencodedBytes : null,
+        };
+
+        // See ParquetWriteOptions.WriteStatistics: off means no Statistics at all, not merely no bounds.
+        if (options.GetWriteStatistics(_pathInSchema))
+        {
+            bool floatingPointTotalOrder = options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder;
+            bool isFloatingPoint = StatisticsCollector.IsFloatingPoint(physicalType, _statisticsOrder);
+            int nullCount = _levelCount - _nonNullCount;
+
+            Statistics stats;
+            if (_dictionary is { PartialLength: null } whole && (!isFloatingPoint || _dictionaryStatisticsForFloats))
             {
-                bloomFilter = DictionaryBloomFilter(dictionary, physicalType, typeLength, options);
+                stats = isFloatingPoint
+                    ? StatisticsCollector.ComputeFloatingPointFromDictEntries(
+                        whole, physicalType, nullCount, floatingPointTotalOrder)
+                    : StatisticsCollector.ComputeFromDictEntries(
+                        whole.DictionaryPageData, whole.DictionaryCount,
+                        physicalType, _typeLength, nullCount, _statisticsOrder);
             }
             else
             {
-                bloomFilter = NewBloomFilterBuilder(nonNullCount, options);
-                BloomFilterArrowEncoder.AddArrowValues(bloomFilter, array, physicalType, typeLength);
+                stats = _pageIndex?.ChunkStatistics(_nonNullCount, _levelCount)
+                    ?? _scannedStatistics
+                    ?? throw new InvalidOperationException("The chunk's statistics were neither folded nor scanned.");
             }
 
-            result = WithBloomFilter(result, bloomFilter);
+            stats = StatisticsCollector.ApplyTypeOrderZeroRule(stats, physicalType, floatingPointTotalOrder, _statisticsOrder);
+            metadata.Statistics = DropDeprecatedMinMaxIfMisordered(stats, _writtenType!, physicalType);
         }
 
-        // Roots the caller's array across the whole column encode. Both WriteColumn overloads land here,
-        // and everything below this point — the dictionary encoder, the plain/V2 encoders, the statistics
-        // scan, the Bloom filter — reads raw spans off its buffers. A span does not keep the array alive,
-        // so without this the buffers of a caller-built array can be finalized mid-encode.
-        // See doc/arrow-span-lifetime.md.
-        GC.KeepAlive(array);
+        byte[]? bloomFilterData = null;
+        if (options.HasBloomFilter(_pathInSchema))
+        {
+            var bloomFilter = _dictionary is { PartialLength: null } wholeDictionary
+                ? DictionaryBloomFilter(wholeDictionary, physicalType, _typeLength, options)
+                : _bloomFilter ?? throw new InvalidOperationException("The chunk's Bloom filter was never filled.");
+            bloomFilterData = BloomFilterSerializer.Serialize(bloomFilter.ToArray());
+        }
+
+        var result = new ColumnChunkResult
+        {
+            PrefixData = prefixData,
+            Data = output.Data,
+            MetaData = metadata,
+            DictionaryPageSize = dictionaryPageSize,
+            SymbolTablePageSize = _symbolTablePageSize,
+            BloomFilterData = bloomFilterData,
+            PageIndex = _pageIndex?.Build(pageOffsetBase: prefixData.Count),
+        };
+
+        // What the chunk held is the result's now; the rest can go.
+        _output = null;
+        _prefix = null;
+        _dictionary = null;
+        _bloomFilter = null;
+        _pageIndex = null;
+        _scannedStatistics = null;
+        _defEncoder = null;
+        _repEncoder = null;
         return result;
     }
 
-    private static ColumnChunkResult WriteNonDictionaryColumn(
+    /// <summary>
+    /// Writes level positions 0 .. <paramref name="rowCount"/> as data pages in the column's own encoding
+    /// (PLAIN for V1, type-aware for V2), training the chunk's FSST symbol table first when it uses one.
+    /// </summary>
+    private void WriteNonDictionaryPages(
         IArrowArray array, int rowCount,
-        IReadOnlyList<string> pathInSchema,
-        PhysicalType physicalType, int typeLength,
-        int maxDefLevel, int maxRepLevel, int[]? defLevels, int[]? repLevels,
-        int[]? valueDefLevels, int nonNullCount,
-        ParquetWriteOptions options, PageIndexCollector? pageIndex)
+        int[]? defLevels, int[]? repLevels, int[]? valueDefLevels, int nonNullCount)
     {
+        var options = _options;
+        var physicalType = _physicalType;
+        int typeLength = _typeLength;
+
         int valuesPerPage = EstimateValuesPerPage(array, physicalType, typeLength, options.DataPageSize);
         if (valuesPerPage < 1) valuesPerPage = 1;
 
-        var output = new ColumnChunkOutput(
+        _output = new ColumnChunkOutput(
             EstimateColumnSize(
                 rowCount, nonNullCount, PlainValueBytes(array, nonNullCount, physicalType, typeLength),
                 LayOutPages(repLevels, rowCount, valuesPerPage, options.DataPageRowCountLimit),
                 physicalType, typeLength,
-                maxDefLevel, maxRepLevel, options.ByteArrayEncoding == ByteArrayEncoding.DeltaByteArray,
+                _maxDefLevel, _maxRepLevel, options.ByteArrayEncoding == ByteArrayEncoding.DeltaByteArray,
                 options.Compression),
             options);
-        var encodings = new HashSet<Encoding>();
 
-        if (maxDefLevel > 0 || maxRepLevel > 0)
-            encodings.Add(Encoding.Rle);
+        if (_maxDefLevel > 0 || _maxRepLevel > 0)
+            _encodings.Add(Encoding.Rle);
 
         // FSST trains one symbol table per column chunk (§1.4), so the whole chunk is compressed
         // up front — before any page is written — and the pages below are slices of the result.
@@ -391,7 +696,6 @@ internal static class ColumnChunkWriter
         }
 
         FsstCompressedColumn? fsstColumn = null;
-        int symbolTablePageSize = 0;
         if (UsesFsst(physicalType, options) && nonNullCount > 0)
         {
             fsstColumn = FsstCompressedColumn.TryCompress(
@@ -401,45 +705,13 @@ internal static class ColumnChunkWriter
 
         if (fsstColumn != null)
         {
-            symbolTablePageSize = WriteSymbolTablePage(output, fsstColumn.Table, options);
+            _prefix = new ColumnChunkOutput(PageHeaderAllowance, options);
+            _symbolTablePageSize = WriteSymbolTablePage(_prefix, fsstColumn.Table, options);
         }
 
-        // Reusable encoder for def/rep levels across pages
-        int maxLiteralGroups = options.MaxLiteralGroups;
-        var defEncoder = maxDefLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxDefLevel), maxLiteralGroups: maxLiteralGroups) : null;
-        var repEncoder = maxRepLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxRepLevel), maxLiteralGroups: maxLiteralGroups) : null;
-
-        // SizeStatistics' unencoded_byte_array_data_bytes, per page and for the chunk (#890).
-        bool byteArray = RecordsUnencodedBytes(physicalType, options);
-        long chunkUnencodedBytes = 0;
-
-        WriteValuePages(output, array, 0, rowCount, 0, valuesPerPage,
-            physicalType, typeLength, maxDefLevel, maxRepLevel, defLevels, repLevels, valueDefLevels, options,
-            defEncoder, repEncoder, fsstColumn, pageIndex, encodings, ref chunkUnencodedBytes);
-
-        var metadata = new ColumnMetaData
-        {
-            Type = physicalType,
-            Encodings = encodings.ToArray(),
-            PathInSchema = pathInSchema is string[] arr ? arr : pathInSchema.ToArray(),
-            Codec = options.Compression,
-            NumValues = rowCount,
-            TotalUncompressedSize = output.TotalUncompressedSize,
-            TotalCompressedSize = output.TotalCompressedSize,
-            EncodingStats = output.EncodingStats.ToArray(),
-            DataPageOffset = 0, // set by caller
-            SymbolTablePageOffset = symbolTablePageSize > 0 ? 0 : null, // set by caller
-            SymbolTablePageLength = symbolTablePageSize > 0 ? symbolTablePageSize : null,
-            UnencodedByteArrayDataBytes = byteArray ? chunkUnencodedBytes : null,
-        };
-
-        return new ColumnChunkResult
-        {
-            Data = output.Data,
-            MetaData = metadata,
-            SymbolTablePageSize = symbolTablePageSize,
-            PageIndex = pageIndex?.Build(),
-        };
+        WriteValuePages(_output, array, 0, rowCount, 0, valuesPerPage,
+            physicalType, typeLength, _maxDefLevel, _maxRepLevel, defLevels, repLevels, valueDefLevels, options,
+            _defEncoder, _repEncoder, fsstColumn, _pageIndex, _encodings, ref _unencodedBytes);
     }
 
     /// <summary>
@@ -663,12 +935,6 @@ internal static class ColumnChunkWriter
     /// Writes a dictionary-encoded column from a pre-built <see cref="DictionaryEncoder.DictionaryResult"/>.
     /// Used by <see cref="BufferedParquetWriter"/> which builds dictionaries incrementally.
     /// </summary>
-    /// <remarks>
-    /// Statistics are computed HERE rather than inside <see cref="WriteDictionaryColumn"/>, because
-    /// <c>WriteColumn</c> — the other caller — assigns them itself once its own encoding decision
-    /// is made, and computing them a level down would have that path do the work twice. This is the entry
-    /// point only the buffered writer uses, so it is where the buffered writer's statistics belong.
-    /// </remarks>
     internal static ColumnChunkResult WriteDictionaryColumnFromResult(
         DictionaryEncoder.DictionaryResult dictResult,
         int rowCount,
@@ -683,65 +949,34 @@ internal static class ColumnChunkWriter
         int[]? repLevels,
         ParquetWriteOptions options)
     {
-        var statisticsOrder = StatisticsOrders.For(
-            arrowType, physicalType,
-            physicalType == PhysicalType.FixedLenByteArray && options.IsExtendedTimestampColumn(pathInSchema));
-        var pageIndex = options.WritePageIndex
-            ? NewPageIndexCollector(arrowType, physicalType, typeLength, statisticsOrder, pathInSchema, options)
-            : null;
-
-        var result = WriteDictionaryColumn(dictResult, rowCount, pathInSchema, physicalType,
-            maxDefLevel, maxRepLevel, defLevels, repLevels, options, pageIndex);
-
-        // See ParquetWriteOptions.WriteStatistics: off means no Statistics at all, not merely no bounds.
-        if (options.GetWriteStatistics(pathInSchema))
-        {
-            // FLOAT/DOUBLE take the index-aware overload: the bounds come from the dictionary entries
-            // either way, but nan_count counts VALUES, so it has to see the indices. WriteColumn
-            // full-scans the Arrow array for the same reason; here there is no array left to scan.
-            var stats = StatisticsCollector.IsFloatingPoint(physicalType, statisticsOrder)
-                ? StatisticsCollector.ComputeFloatingPointFromDictEntries(
-                    dictResult, physicalType, rowCount - nonNullCount,
-                    options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder)
-                : StatisticsCollector.ComputeFromDictEntries(
-                    dictResult.DictionaryPageData, dictResult.DictionaryCount,
-                    physicalType, typeLength, rowCount - nonNullCount, statisticsOrder);
-
-            stats = StatisticsCollector.ApplyTypeOrderZeroRule(stats, physicalType,
-                options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder, statisticsOrder);
-            result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType, physicalType);
-        }
-
-        // With no array left to scan, the dictionary is the only way to build this filter, so until it
-        // was filled from one this path wrote none at all.
-        if (options.HasBloomFilter(pathInSchema))
-            result = WithBloomFilter(result, DictionaryBloomFilter(dictResult, physicalType, typeLength, options));
-
-        return result;
+        var writer = new ColumnChunkWriter(pathInSchema, physicalType, typeLength, maxDefLevel, maxRepLevel, options);
+        writer.AppendDictionaryEncoded(dictResult, arrowType, defLevels, repLevels, nonNullCount, rowCount);
+        return writer.Finish();
     }
 
     /// <summary>
-    /// Writes a dictionary-encoded chunk: the dictionary page, then RLE_DICTIONARY data pages. When the
-    /// dictionary is partial (<see cref="DictionaryEncoder.DictionaryResult.PartialLength"/>), its pages
-    /// stop there and the rest of the chunk follows in the column's own encoding, as parquet-cpp and
-    /// parquet-mr write a column whose dictionary filled up; <paramref name="array"/> and
-    /// <paramref name="valueDefLevels"/> are what those pages are written from.
+    /// Writes a dictionary-encoded chunk's data pages: RLE_DICTIONARY pages, and the dictionary page is
+    /// written by <see cref="Finish"/>. When the dictionary is partial
+    /// (<see cref="DictionaryEncoder.DictionaryResult.PartialLength"/>), its pages stop there and the rest of
+    /// the chunk follows in the column's own encoding, as parquet-cpp and parquet-mr write a column whose
+    /// dictionary filled up; <paramref name="array"/> and <paramref name="valueDefLevels"/> are what those
+    /// pages are written from.
     /// </summary>
-    private static ColumnChunkResult WriteDictionaryColumn(
+    private void WriteDictionaryDataPages(
         DictionaryEncoder.DictionaryResult dictResult,
         int rowCount,
-        IReadOnlyList<string> pathInSchema,
-        PhysicalType physicalType,
-        int maxDefLevel,
-        int maxRepLevel,
         int[]? defLevels,
         int[]? repLevels,
-        ParquetWriteOptions options,
-        PageIndexCollector? pageIndex,
-        IArrowArray? array = null,
-        int typeLength = 0,
-        int[]? valueDefLevels = null)
+        IArrowArray? array,
+        int[]? valueDefLevels)
     {
+        var options = _options;
+        var physicalType = _physicalType;
+        int typeLength = _typeLength;
+        int maxDefLevel = _maxDefLevel;
+        int maxRepLevel = _maxRepLevel;
+        var pageIndex = _pageIndex;
+
         int dictionaryEnd = dictResult.PartialLength ?? rowCount;
         if (dictionaryEnd < rowCount && array is null)
             throw new InvalidOperationException("A partial dictionary needs the array to write the rest of the chunk from.");
@@ -750,8 +985,9 @@ internal static class ColumnChunkWriter
         int bytesPerIndex = Math.Max(1, (bitWidth + 7) / 8);
         int valuesPerPage = Math.Max(1, options.DataPageSize / bytesPerIndex);
 
+        // The dictionary page is not in this stream (see _prefix), so it is not counted in its capacity.
         int capacity = EstimateDictionaryColumnSize(
-            dictResult.DictionaryPageData.Length, rowCount,
+            dictionaryBytes: 0, rowCount,
             LayOutPages(repLevels, rowCount, valuesPerPage, options.DataPageRowCountLimit),
             bitWidth, maxDefLevel, maxRepLevel, options.Compression);
         if (dictionaryEnd < rowCount)
@@ -770,17 +1006,16 @@ internal static class ColumnChunkWriter
             capacity = (int)Math.Min(int.MaxValue, (long)capacity + plain);
         }
 
-        var output = new ColumnChunkOutput(capacity, options);
+        var output = _output = new ColumnChunkOutput(capacity, options);
 
-        // 1. Encode dictionary page
-        int dictionaryPageSize = WriteDictionaryPage(output, dictResult, options);
+        var encodings = _encodings;
+        encodings.Add(Encoding.Plain);
+        encodings.Add(Encoding.RleDictionary);
+        if (maxDefLevel > 0 || maxRepLevel > 0)
+            encodings.Add(Encoding.Rle);
 
-        // 2. Encode data pages with RLE dictionary indices
-
-        // Reusable encoders across pages
-        int maxLiteralGroups = options.MaxLiteralGroups;
-        var defEncoder = maxDefLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxDefLevel), maxLiteralGroups: maxLiteralGroups) : null;
-        var repEncoder = maxRepLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxRepLevel), maxLiteralGroups: maxLiteralGroups) : null;
+        var defEncoder = _defEncoder;
+        var repEncoder = _repEncoder;
         var indexEncoder = new RleBitPackedEncoder(bitWidth, maxLiteralGroups: options.MaxLiteralGroups);
 
         // Run-form indices are walked with a cursor rather than sliced, since a page boundary can fall in
@@ -797,7 +1032,6 @@ internal static class ColumnChunkWriter
         int[]? entryLengths = RecordsUnencodedBytes(physicalType, options)
             ? DictionaryEntryLengths(dictResult.DictionaryPageData, dictResult.DictionaryCount)
             : null;
-        long chunkUnencodedBytes = 0;
 
         int offset = 0;
         int indexOffset = 0;
@@ -836,7 +1070,7 @@ internal static class ColumnChunkWriter
                 pageUnencodedBytes = dictResult.IndexRuns is null
                     ? SumEntryLengths(dictResult.Indices.AsSpan(indexOffset, pageNonNull), entryLengths)
                     : runCursor.SumEntryLengths(pageNonNull, entryLengths);
-                chunkUnencodedBytes += pageUnencodedBytes.Value;
+                _unencodedBytes += pageUnencodedBytes.Value;
             }
 
             // Encoded up front rather than inside each page writer: both need the same bytes in the same
@@ -868,44 +1102,15 @@ internal static class ColumnChunkWriter
             indexOffset += pageNonNull;
         }
 
-        var encodings = new HashSet<Encoding> { Encoding.Plain, Encoding.RleDictionary };
-        if (maxDefLevel > 0 || maxRepLevel > 0)
-            encodings.Add(Encoding.Rle);
-
         // The rest of a chunk whose dictionary filled up, in the column's own encoding. Its byte-array
         // sizes count the values themselves, as a chunk without a dictionary does.
         if (dictionaryEnd < rowCount)
         {
-            long tailUnencodedBytes = 0;
             int tailValuesPerPage = Math.Max(1, EstimateValuesPerPage(array!, physicalType, typeLength, options.DataPageSize));
             WriteValuePages(output, array!, dictionaryEnd, rowCount, indexOffset, tailValuesPerPage,
                 physicalType, typeLength, maxDefLevel, maxRepLevel, defLevels, repLevels, valueDefLevels, options,
-                defEncoder, repEncoder, fsstColumn: null, pageIndex, encodings, ref tailUnencodedBytes);
-            chunkUnencodedBytes += tailUnencodedBytes;
+                defEncoder, repEncoder, fsstColumn: null, pageIndex, encodings, ref _unencodedBytes);
         }
-
-        var metadata = new ColumnMetaData
-        {
-            Type = physicalType,
-            Encodings = encodings.ToArray(),
-            PathInSchema = pathInSchema is string[] arr ? arr : pathInSchema.ToArray(),
-            Codec = options.Compression,
-            NumValues = rowCount,
-            TotalUncompressedSize = output.TotalUncompressedSize,
-            TotalCompressedSize = output.TotalCompressedSize,
-            EncodingStats = output.EncodingStats.ToArray(),
-            DataPageOffset = 0, // set by caller
-            DictionaryPageOffset = 0, // set by caller
-            UnencodedByteArrayDataBytes = entryLengths != null ? chunkUnencodedBytes : null,
-        };
-
-        return new ColumnChunkResult
-        {
-            Data = output.Data,
-            MetaData = metadata,
-            DictionaryPageSize = dictionaryPageSize,
-            PageIndex = pageIndex?.Build(),
-        };
     }
 
     private static int WriteDictionaryPage(
@@ -934,7 +1139,7 @@ internal static class ColumnChunkWriter
 
     /// <param name="uncompressedValuesSize">
     /// Bytes of encoded dictionary indices already sitting in the thread-static values buffer — see the
-    /// page loop in <see cref="WriteDictionaryColumn"/>, which encodes them.
+    /// page loop in <see cref="WriteDictionaryDataPages"/>, which encodes them.
     /// </param>
     private static EmittedPage WriteDictDataPageV2(
         ColumnChunkOutput output,
@@ -993,7 +1198,7 @@ internal static class ColumnChunkWriter
 
     /// <param name="valuesLen">
     /// Bytes of encoded dictionary indices already sitting in the thread-static values buffer — see the
-    /// page loop in <see cref="WriteDictionaryColumn"/>, which encodes them.
+    /// page loop in <see cref="WriteDictionaryDataPages"/>, which encodes them.
     /// </param>
     private static EmittedPage WriteDictDataPageV1(
         ColumnChunkOutput output,
@@ -1355,7 +1560,7 @@ internal static class ColumnChunkWriter
         // valueDefLevels for null detection). A V1 page's values section is byte-for-byte what a V2
         // page's would be — the page header carries the encoding either way — so the only thing that
         // was ever V1-specific here is the level framing and the compression boundary below.
-        // FSST is passed as absent: it is refused for V1 in WriteColumnCore before reaching here.
+        // FSST is passed as absent: it is refused for V1 in WriteNonDictionaryPages before reaching here.
         int valuesLength = EncodeValuesToBuffer(
             array, offset, numValues, nonNullCount, physicalType, typeLength,
             valueDefLevels, options, fsstColumn: null, valueIndex: 0, out valueEncoding);

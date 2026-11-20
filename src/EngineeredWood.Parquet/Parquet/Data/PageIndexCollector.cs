@@ -144,12 +144,18 @@ internal sealed class PageIndexCollector
     }
 
     /// <summary>
+    /// Whether <see cref="ChunkStatistics"/> will answer, so far, for a chunk of <paramref name="nonNullCount"/>
+    /// values: a ColumnIndex is still being kept and there is a value. A page written later can still turn it off.
+    /// </summary>
+    public bool HasChunkStatistics(int nonNullCount) => WritesColumnIndex && nonNullCount > 0;
+
+    /// <summary>
     /// The chunk statistics, from the page bounds, or null when they do not cover the chunk and the
     /// caller must scan: no ColumnIndex (so no bounds were kept), or no values at all.
     /// </summary>
     public Statistics? ChunkStatistics(int nonNullCount, int levelCount)
     {
-        if (!WritesColumnIndex || nonNullCount == 0)
+        if (!HasChunkStatistics(nonNullCount))
             return null;
 
         return StatisticsCollector.FromBounds(
@@ -179,8 +185,19 @@ internal sealed class PageIndexCollector
     }
 
     /// <summary>The chunk's page index, with page offsets still relative to the chunk.</summary>
-    public ChunkPageIndex Build()
+    /// <param name="pageOffsetBase">
+    /// Where the pages' stream begins in the chunk: the length of the pages written ahead of the data pages
+    /// (dictionary or symbol table) when those were not written to the same stream, 0 when they were.
+    /// </param>
+    public ChunkPageIndex Build(int pageOffsetBase = 0)
     {
+        var locations = _locations.ToArray();
+        if (pageOffsetBase != 0)
+        {
+            for (int i = 0; i < locations.Length; i++)
+                locations[i] = locations[i] with { Offset = locations[i].Offset + pageOffsetBase };
+        }
+
         ColumnIndex? columnIndex = null;
         if (WritesColumnIndex)
         {
@@ -196,7 +213,7 @@ internal sealed class PageIndexCollector
         }
 
         return new ChunkPageIndex(
-            _locations.ToArray(), columnIndex, RecordsUnencodedBytes ? _unencodedBytes?.ToArray() ?? [] : null);
+            locations, columnIndex, RecordsUnencodedBytes ? _unencodedBytes?.ToArray() ?? [] : null);
     }
 
     private byte[] Truncate(byte[] value, bool max)

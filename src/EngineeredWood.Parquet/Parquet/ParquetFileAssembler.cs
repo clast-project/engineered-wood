@@ -73,6 +73,8 @@ internal sealed class ParquetFileAssembler
             var result = chunks[i];
             long chunkStart = _file.Position;
 
+            if (result.PrefixData.Count > 0)
+                await _file.WriteAsync(result.PrefixData, cancellationToken).ConfigureAwait(false);
             await _file.WriteAsync(result.Data, cancellationToken).ConfigureAwait(false);
 
             // A dictionary page or an FSST symbol table page precedes the data pages; a chunk
