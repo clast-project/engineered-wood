@@ -65,13 +65,22 @@ internal static class DecimalNarrowing
     /// Narrows a <c>Decimal128</c>/<c>Decimal256</c> array to the <c>Decimal32</c> or <c>Decimal64</c>
     /// <paramref name="target"/> (from <see cref="EncodingType"/>). The result starts at offset 0.
     /// </summary>
-    public static IArrowArray ToInteger(IArrowArray array, IArrowType target)
+    public static IArrowArray ToInteger(IArrowArray array, IArrowType target) => ToInteger(array, target, scratch: null);
+
+    /// <summary>
+    /// As <see cref="ToInteger(IArrowArray, IArrowType)"/>, writing into <paramref name="scratch"/> when it is large
+    /// enough (#940). The result is then valid only until the scratch is written again.
+    /// </summary>
+    public static IArrowArray ToInteger(IArrowArray array, IArrowType target, byte[]? scratch)
     {
         int width = target is Decimal32Type ? 4 : 8;
         int length = array.Length;
-        var values = new byte[length * width];
+        int bytes = length * width;
+        var values = scratch is not null && scratch.Length >= bytes ? scratch : new byte[bytes];
         CopyNarrowed(array, values, width, bigEndian: false);
-        return Build(array, target, values);
+        var (validity, nullCount) = ArrowCompute.AlignedValidity(array);
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            target, length, nullCount, offset: 0, [validity, new ArrowBuffer(values.AsMemory(0, bytes))]));
     }
 
     /// <summary>
@@ -88,7 +97,7 @@ internal static class DecimalNarrowing
     }
 
     /// <summary>
-    /// Refuses, as <see cref="ToInteger"/> and <see cref="ToBigEndian"/> would, an array holding a non-null
+    /// Refuses, as <see cref="ToInteger(IArrowArray, IArrowType)"/> and <see cref="ToBigEndian"/> would, an array holding a non-null
     /// value that <paramref name="width"/> bytes cannot hold, without narrowing anything: for a caller that has
     /// to know a batch is writable before it changes any state.
     /// </summary>
@@ -154,9 +163,13 @@ internal static class DecimalNarrowing
                 if (bigEndian)
                     dest.Reverse();
             }
-            // The bytes under a null are arbitrary and may not fit; they are left zero. Asking only here keeps
-            // the validity lookup off the common path.
-            else if (!checkNulls || !array.IsNull(i))
+            // The bytes under a null are arbitrary and may not fit; they are written zero, since the destination
+            // may be reused scratch (#940). Asking only here keeps the validity lookup off the common path.
+            else if (checkNulls && array.IsNull(i))
+            {
+                dest.Clear();
+            }
+            else
             {
                 throw OutOfRange(slot, width);
             }

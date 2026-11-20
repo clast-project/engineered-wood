@@ -343,7 +343,7 @@ internal static class DictionaryEncoder
         /// Gives the non-null values of <paramref name="array"/> their entries, adding the new ones.
         /// </summary>
         /// <param name="defLevels">0 for a level without a value, or null when every level has one.</param>
-        public FeedResult Feed(IArrowArray array, int[]? defLevels, int nonNullCount)
+        public FeedResult Feed(IArrowArray array, int[]? defLevels, int nonNullCount, int[]? indexScratch = null)
         {
             if (Declined || Frozen)
                 throw new InvalidOperationException("The dictionary takes no more values.");
@@ -354,6 +354,7 @@ internal static class DictionaryEncoder
             // Every arm below reads raw spans off this array's buffers and then loops, allocating, for as long as
             // the column is. A span is not a GC reference to what it points at, so without the KeepAlive a
             // caller-built array is collectable mid-loop. See doc/arrow-span-lifetime.md.
+            _indexScratch = indexScratch;
             var result = array is RunEndEncodedArray ree
                 ? FeedRuns(ree, nonNullCount)
                 : _physicalType switch
@@ -367,9 +368,19 @@ internal static class DictionaryEncoder
                     _ => FeedFixedLenByteArray(array, defLevels, nonNullCount),
                 };
 
+            _indexScratch = null;
             GC.KeepAlive(array);
             return result;
         }
+
+        /// <summary>
+        /// An array the caller lends for this feed's indices, which it reuses from append to append (#940), or null
+        /// to allocate them. Set only for the duration of <see cref="Feed"/>.
+        /// </summary>
+        private int[]? _indexScratch;
+
+        private int[] NewIndices(int count) =>
+            _indexScratch is { } scratch && scratch.Length >= count ? scratch : new int[count];
 
         private FeedResult FeedFixed<TBits>(IArrowArray array, int[]? defLevels, int nonNullCount)
             where TBits : unmanaged, IEquatable<TBits>
@@ -385,7 +396,7 @@ internal static class DictionaryEncoder
                 return FeedConstant(buffer.Slice(0, elementSize), nonNullCount, elementSize);
 
             var valueBuffer = MemoryMarshal.Cast<byte, TBits>(buffer);
-            var indices = new int[nonNullCount];
+            var indices = NewIndices(nonNullCount);
             int idx = 0;
             long values = _values, plainBytes = _plainBytes;
             bool decided = Decided;
@@ -435,7 +446,7 @@ internal static class DictionaryEncoder
                 return FeedConstant(arrowData.Slice(constStart, constLen), nonNullCount, 4 + constLen);
             }
 
-            var indices = new int[nonNullCount];
+            var indices = NewIndices(nonNullCount);
             int idx = 0;
             long values = _values, plainBytes = _plainBytes;
             bool decided = Decided;
@@ -477,7 +488,7 @@ internal static class DictionaryEncoder
             int rowCount = array.Length;
             var valueBuffer = array.Data.Buffers[1].Span;
 
-            var indices = new int[nonNullCount];
+            var indices = NewIndices(nonNullCount);
             int idx = 0;
             long values = _values, plainBytes = _plainBytes;
             bool decided = Decided;
@@ -518,9 +529,9 @@ internal static class DictionaryEncoder
             if (inserted && _table.ByteCount > _pageSizeLimit)
                 return Overflow([], 0, 0, _values, _plainBytes);
 
-            var indices = new int[count];
-            if (entry != 0)
-                indices.AsSpan().Fill(entry);
+            // A lent array is not zeroed: entry 0 is filled in too.
+            var indices = NewIndices(count);
+            indices.AsSpan(0, count).Fill(entry);
 
             _constantOnly = first || _constantOnly;
             _values += count;
