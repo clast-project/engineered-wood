@@ -396,6 +396,7 @@ internal sealed class ColumnChunkWriter
     /// <param name="levelCount">Level entries: rows, for a column that is not repeated.</param>
     public void Append(IArrowArray array, int[]? defLevels, int[]? repLevels, int nonNullCount, int levelCount)
     {
+        EnsureRoomFor(levelCount);
         bool first = BeginAppend();
         if (_prebuiltDictionary is not null)
             throw new InvalidOperationException("A chunk appended already dictionary-encoded takes no other append.");
@@ -728,6 +729,7 @@ internal sealed class ColumnChunkWriter
         if (_appendCount > 0)
             throw new InvalidOperationException("A chunk appended already dictionary-encoded takes no other append.");
 
+        EnsureRoomFor(levelCount);
         BeginAppend();
 
         _statisticsOrder = StatisticsOrders.For(
@@ -761,6 +763,23 @@ internal sealed class ColumnChunkWriter
             Runs = dictResult.IndexRuns,
             Borrowed = true,
         }, levelCount);
+    }
+
+    /// <summary>
+    /// Refuses an append that would take the chunk past <see cref="int.MaxValue"/> level entries, before any of it is
+    /// taken: the counts the chunk's metadata, pages and buffers are built on are 32-bit, and wrapped they would be
+    /// written as a well-formed, wrong <c>num_values</c>. A row group whose leaves repeat that much must be cut sooner.
+    /// </summary>
+    private void EnsureRoomFor(int levelCount)
+    {
+        if (_finished)
+            throw new InvalidOperationException("The column chunk has already been finished.");
+        if ((long)_levelCount + levelCount > int.MaxValue)
+        {
+            throw new InvalidOperationException(
+                $"Column '{string.Join(".", _pathInSchema)}' would hold more than {int.MaxValue} level entries in one "
+                + "column chunk; cut row groups sooner (RowGroupMaxRows, or FlushRowGroupAsync).");
+        }
     }
 
     /// <returns>Whether this is the chunk's first append.</returns>

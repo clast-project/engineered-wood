@@ -495,6 +495,115 @@ public class StreamingRowGroupTests : IDisposable
 
     // ───── Failure ─────
 
+    private static readonly Apache.Arrow.Schema RequiredInt =
+        new Apache.Arrow.Schema.Builder().Field(new Field("v", Int32Type.Default, nullable: false)).Build();
+
+    /// <summary>Rows <paramref name="start"/>.. of a required column, with a null (which it must refuse) at <paramref name="nullAt"/>.</summary>
+    private static RecordBatch RequiredRows(int start, int count, int nullAt = -1)
+    {
+        var builder = new Int32Array.Builder();
+        for (int i = 0; i < count; i++)
+        {
+            if (i == nullAt) builder.AppendNull();
+            else builder.Append(start + i);
+        }
+        return new RecordBatch(RequiredInt, [builder.Build()], count);
+    }
+
+    [Fact]
+    public async Task EmptyFirstBatch_StillFixesTheSchema()
+    {
+        string path = NewPath();
+        await using var writer = new ParquetFileWriter(new LocalSequentialFile(path), ownsFile: true);
+        await writer.WriteBatchAsync(RequiredRows(0, 0));
+
+        // A batch of another shape is refused, as it would be after a non-empty first batch (#938 review).
+        var other = new RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Field("v", StringType.Default, nullable: false)).Build(),
+            [new StringArray.Builder().Append("x").Build()], 1);
+        await Assert.ThrowsAsync<ArgumentException>(async () => await writer.WriteBatchAsync(other));
+        await Assert.ThrowsAsync<ArgumentException>(async () => await writer.WriteBatchAsync(other.Slice(0, 0)));
+
+        await writer.WriteBatchAsync(RequiredRows(0, 10));
+        await writer.CloseAsync();
+        var (_, read) = await ReadAsync(path);
+        Assert.Equal(10, read.Sum(b => b.Length));
+    }
+
+    /// <summary>
+    /// A batch that is cut into several pieces is checked whole before any piece goes in: a null in a required
+    /// column near its end must not leave its first rows in the open row group, or in a row group already written
+    /// (#938 review).
+    /// </summary>
+    [Fact]
+    public async Task RefusedSplitBatch_LeavesNothingOfItBehind()
+    {
+        var options = new ParquetWriteOptions { RowGroupMaxRows = 1000 };
+        string path = NewPath();
+        await using (var writer = new ParquetFileWriter(new LocalSequentialFile(path), ownsFile: true, options))
+        {
+            await writer.WriteBatchAsync(RequiredRows(0, 100));
+            await Assert.ThrowsAsync<ArgumentException>(
+                async () => await writer.WriteBatchAsync(RequiredRows(100, 1000, nullAt: 999)));
+            Assert.Equal(100, writer.OpenRowGroupRows);
+
+            await writer.WriteBatchAsync(RequiredRows(100, 50));
+            await writer.CloseAsync();
+        }
+
+        var (metadata, read) = await ReadAsync(path);
+        Assert.Equal(new long[] { 150 }, metadata.RowGroups.Select(g => g.NumRows));
+        Assert.Equal(Enumerable.Range(0, 150).Select(i => i.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            Rows(read));
+    }
+
+    [Fact]
+    public async Task RefusedSplitBatch_WriteRowGroup_WritesNoneOfItsRowGroups()
+    {
+        var options = new ParquetWriteOptions { RowGroupMaxRows = 100 };
+        string path = NewPath();
+        await using (var writer = new ParquetFileWriter(new LocalSequentialFile(path), ownsFile: true, options))
+        {
+            await writer.WriteRowGroupAsync(RequiredRows(0, 10));
+            await Assert.ThrowsAsync<ArgumentException>(
+                async () => await writer.WriteRowGroupAsync(RequiredRows(10, 500, nullAt: 450)));
+            await writer.CloseAsync();
+        }
+
+        var (metadata, _) = await ReadAsync(path);
+        Assert.Equal(new long[] { 10 }, metadata.RowGroups.Select(g => g.NumRows));
+    }
+
+    /// <summary>
+    /// The first slice of a file is a small probe: a run-end encoded constant is a few bytes of Arrow, so its Arrow
+    /// size says nothing of the PLAIN pages its rows become (#938 review).
+    /// </summary>
+    [Fact]
+    public async Task CompactColumn_FirstBatch_StillRespectsTheByteLimit()
+    {
+        const long limit = 1 << 20;
+        var options = new ParquetWriteOptions
+        {
+            RowGroupMaxRows = int.MaxValue,
+            RowGroupMaxBytes = limit,
+            DictionaryEnabled = false,
+            Compression = CompressionCodec.Uncompressed,
+            ByteArrayEncoding = ByteArrayEncoding.Plain,
+        };
+        var value = System.Text.Encoding.UTF8.GetBytes(new string('x', 1024));
+        var constant = EngineeredWood.Arrow.RunEndEncoding.Constant(StringType.Default, value, 20_000);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("c", constant.Data.DataType, nullable: true)).Build();
+
+        string path = await WriteStreamedAsync([new RecordBatch(schema, [constant], 20_000)], options);
+        var (metadata, read) = await ReadAsync(path);
+
+        Assert.Equal(20_000, read.Sum(b => b.Length));
+        Assert.True(metadata.RowGroups.Count >= 15, $"{metadata.RowGroups.Count} row groups");
+        Assert.All(metadata.RowGroups, g => Assert.True(
+            g.Columns.Sum(c => c.MetaData!.TotalCompressedSize) <= limit * 5 / 4,
+            $"{g.NumRows} rows in {g.Columns.Sum(c => c.MetaData!.TotalCompressedSize)} bytes"));
+    }
+
     [Fact]
     public async Task RefusedBatch_LeavesTheOpenRowGroupAsItWas()
     {

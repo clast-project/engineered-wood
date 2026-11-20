@@ -44,7 +44,12 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     /// The rows a batch's first slice is cut to when nothing yet says how large a row encodes: the first rows of a
     /// file. The rest of the batch is cut by the estimate those rows give.
     /// </summary>
-    internal const int ProbeRows = 65_536;
+    /// <remarks>
+    /// Small, because nothing cheap bounds what a slice encodes to before it is encoded. Its Arrow size does not: a
+    /// run-end encoded or narrow column can be a few bytes of Arrow and many of PLAIN pages (#938 review). A probe
+    /// this size overshoots a byte limit by at most 1,024 rows; costs one more append, once a file.
+    /// </remarks>
+    internal const int ProbeRows = 1_024;
 
     /// <summary>
     /// Below this many cells (rows × columns) a batch's columns are encoded one after another rather than in
@@ -127,11 +132,13 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         try
         {
             batch = PrepareBatch(batch);
+            int maxRows = _options.RowGroupMaxRows;
+            if (batch.Length > maxRows)
+                EnsureWholeBatchMatches(batch);
             await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
             await FlushOpenRowGroupAsync(cancellationToken).ConfigureAwait(false);
 
             // Auto-split large batches into multiple row groups
-            int maxRows = _options.RowGroupMaxRows;
             if (batch.Length > maxRows)
             {
                 int offset = 0;
@@ -192,6 +199,21 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         try
         {
             batch = PrepareBatch(batch);
+
+            // An empty batch adds no rows, but its schema is captured, or checked against the captured one, as any
+            // other batch's is: otherwise a file whose first batch was empty took a later batch of another shape.
+            if (batch.Length == 0)
+            {
+                ShredAndCheck(batch);
+                return 0;
+            }
+
+            // A batch that will be cut is checked whole first: checked a slice at a time, a refusal of a later slice
+            // would come after earlier ones had joined the open row group, or been written.
+            int firstRows = RowsToAppend(batch, batch.Length);
+            if (firstRows < batch.Length)
+                EnsureWholeBatchMatches(batch);
+
             await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
 
             int offset = 0;
@@ -201,7 +223,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
                 while (offset < batch.Length)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    int rows = RowsToAppend(batch, batch.Length - offset);
+                    int rows = offset == 0 ? firstRows : RowsToAppend(batch, batch.Length - offset);
                     var slice = offset == 0 && rows == batch.Length ? batch : SliceBatch(batch, offset, rows);
                     AppendToOpenRowGroup(slice);
                     batchInOpenRowGroup = true;
@@ -331,6 +353,16 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         return batch;
     }
 
+    /// <summary>
+    /// Checks a batch that will be cut into several pieces against the captured schema, whole, before any piece is
+    /// written. The first batch of a file needs no more than <see cref="PrepareBatch"/> checked: it sets the schema.
+    /// </summary>
+    private void EnsureWholeBatchMatches(RecordBatch batch)
+    {
+        if (_arrowSchema is not null)
+            RowGroupSchemaCheck.EnsureMatches(_arrowSchema, ApplyVariantShredding(batch));
+    }
+
     private async ValueTask WriteSingleRowGroupAsync(
         RecordBatch batch,
         CancellationToken cancellationToken)
@@ -409,8 +441,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     /// <summary>
     /// The rows of a batch to append to the open row group next: as many as fit by rows, and by bytes at the encoded
     /// bytes per row so far (or the last row group's). With no estimate at all, the first rows of a file, a probe's
-    /// worth, which make one: at most <see cref="ProbeRows"/>, and no more than fit in the byte limit at their Arrow
-    /// size, which bounds what they encode to.
+    /// worth, which make one: at most <see cref="ProbeRows"/>, and fewer for rows whose Arrow size alone would fill the
+    /// byte limit.
     /// </summary>
     private int RowsToAppend(RecordBatch batch, int remaining)
     {
