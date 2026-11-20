@@ -213,7 +213,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
                 cancellationToken.ThrowIfCancellationRequested();
                 int rows = RowsToAppend(batch, batch.Length - offset);
                 var slice = PrepareBatch(batch.Slice(offset, rows));
-                await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
+                await WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
                 AppendToOpenRowGroup(slice);
                 batchInOpenRowGroup = true;
                 offset += rows;
