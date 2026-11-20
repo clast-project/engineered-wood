@@ -442,10 +442,11 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             {
                 AppendColumn(batch, i, writers, i, bloomFilterExpectedValues: null, detach: false);
                 var leafWriters = writers[i]!;
-                var results = new ColumnChunkWriter.ColumnChunkResult[leafWriters.Length];
+                // Registered before the leaves finish: a leaf's writer gives up its pages to its result, so a later
+                // leaf's failure must still find the earlier results to release them (#942 review).
+                var results = perColumnLeaves[i] = new ColumnChunkWriter.ColumnChunkResult[leafWriters.Length];
                 for (int l = 0; l < results.Length; l++)
                     results[l] = leafWriters[l]!.Finish();
-                perColumnLeaves[i] = results;
             });
         }
         catch
@@ -591,10 +592,10 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             Parallel.For(0, open.Writers.Length, i =>
             {
                 var writers = open.Writers[i]!;
-                var results = new ColumnChunkWriter.ColumnChunkResult[writers.Length];
+                // Registered first, as in WriteSingleRowGroupAsync: a later leaf's failure must find the finished ones.
+                var results = perColumnLeaves[i] = new ColumnChunkWriter.ColumnChunkResult[writers.Length];
                 for (int l = 0; l < writers.Length; l++)
                     results[l] = writers[l]!.Finish();
-                perColumnLeaves[i] = results;
             });
         }
         catch

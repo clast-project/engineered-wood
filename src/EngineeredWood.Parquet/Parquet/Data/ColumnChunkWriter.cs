@@ -285,8 +285,16 @@ internal sealed class ColumnChunkWriter
         ParquetWriteOptions options)
     {
         var writer = new ColumnChunkWriter(pathInSchema, physicalType, typeLength, isNullable ? 1 : 0, 0, options);
-        writer.AppendFlat(array);
-        return writer.Finish();
+        try
+        {
+            writer.AppendFlat(array);
+            return writer.Finish();
+        }
+        finally
+        {
+            // A failed append or finish leaves pages behind; after Finish its result owns them and this does nothing.
+            writer.Discard();
+        }
     }
 
     /// <summary>
@@ -307,8 +315,15 @@ internal sealed class ColumnChunkWriter
         ParquetWriteOptions options)
     {
         var writer = new ColumnChunkWriter(pathInSchema, physicalType, typeLength, maxDefLevel, maxRepLevel, options);
-        writer.Append(array, defLevels, repLevels, nonNullCount, levelCount);
-        return writer.Finish();
+        try
+        {
+            writer.Append(array, defLevels, repLevels, nonNullCount, levelCount);
+            return writer.Finish();
+        }
+        finally
+        {
+            writer.Discard();
+        }
     }
 
     /// <summary>
@@ -1924,8 +1939,15 @@ internal sealed class ColumnChunkWriter
         ParquetWriteOptions options)
     {
         var writer = new ColumnChunkWriter(pathInSchema, physicalType, typeLength, maxDefLevel, maxRepLevel, options);
-        writer.AppendDictionaryEncoded(dictResult, arrowType, defLevels, repLevels, nonNullCount, rowCount);
-        return writer.Finish();
+        try
+        {
+            writer.AppendDictionaryEncoded(dictResult, arrowType, defLevels, repLevels, nonNullCount, rowCount);
+            return writer.Finish();
+        }
+        finally
+        {
+            writer.Discard();
+        }
     }
 
     private static int WriteDictionaryPage(
