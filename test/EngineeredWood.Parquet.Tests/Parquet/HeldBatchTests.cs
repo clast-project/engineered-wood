@@ -369,6 +369,33 @@ public class HeldBatchTests : IDisposable
     }
 
     /// <summary>
+    /// Past the probe, rows are held up to <see cref="ParquetFileWriter.HeldRowsLimit"/> exactly, and the batch that
+    /// would hold more encodes them (#946 review). One narrow column, so that the byte limit is far off.
+    /// </summary>
+    [Fact]
+    public async Task HeldRows_StopAtTheRowLimit()
+    {
+        int probe = ParquetFileWriter.ProbeRows, limit = ParquetFileWriter.HeldRowsLimit;
+        int total = probe + limit + 1;
+        string path = NewPath();
+        await using (var writer = new ParquetFileWriter(new LocalSequentialFile(path), ownsFile: true))
+        {
+            for (int i = 0; i < probe + limit; i++)
+                await writer.WriteBatchAsync(RequiredRows(i, 1));
+            Assert.Equal(limit, writer.HeldRowCount);
+            Assert.True(writer.HeldBufferBytes < ParquetFileWriter.HeldBytesLimit / 8);
+
+            await writer.WriteBatchAsync(RequiredRows(probe + limit, 1)); // one more than the limit
+            Assert.Equal(1, writer.HeldRowCount);
+            Assert.Equal(total, writer.OpenRowGroupRows);
+            await writer.CloseAsync();
+        }
+
+        var (_, rows) = await ReadAsync(path);
+        Assert.Equal(Rows(RequiredRows(0, total)), rows);
+    }
+
+    /// <summary>
     /// A batch of fewer than <see cref="ParquetFileWriter.HoldRows"/> rows is held once the probe is encoded, and
     /// one that many is not; at the start of a file, one larger than the probe is cut to it, as it is unheld.
     /// </summary>
