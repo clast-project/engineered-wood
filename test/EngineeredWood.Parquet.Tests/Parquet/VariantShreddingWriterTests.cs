@@ -401,4 +401,51 @@ public class VariantShreddingWriterTests : IDisposable
         ListType l => $"list<{Describe(l.ValueField)}>",
         _ => type.TypeId.ToString(),
     };
+
+    /// <summary>
+    /// A batch that spans a file boundary reaches the next file's writer at an offset. That writer decides its layout
+    /// from the rest of the batch, as one the batch starts in decides it from the whole batch, and not from the first
+    /// slice it happens to take (#939 review). Here the slice is all one shape and the rest mostly another.
+    /// </summary>
+    [Fact]
+    public async Task AWriterReachedAtAnOffset_InfersFromTheRestOfTheBatch()
+    {
+        var options = ParquetWriteOptions.Default with
+        {
+            ShredVariants = ShredOptions.Default,
+            RowGroupMaxRows = int.MaxValue,
+            RowGroupMaxBytes = long.MaxValue,
+        };
+        var values = new List<VariantValue>();
+        for (int i = 0; i < 500; i++)
+            values.Add(Obj(i, "head"));
+        for (int i = 0; i < ParquetFileWriter.ProbeRows; i++)
+            values.Add(Obj(i, "slice"));
+        for (int i = 0; i < 5_000; i++)
+        {
+            values.Add(VariantValue.FromObject(new Dictionary<string, VariantValue>
+            {
+                ["c"] = VariantValue.FromInt64(i),
+                ["d"] = VariantValue.FromDouble(i / 2.0),
+            }));
+        }
+        var batch = Batch(values.ToArray());
+
+        string atOffset = Path.Combine(_tempDir, Guid.NewGuid().ToString("N")[..8] + ".parquet");
+        await using (var file = new LocalSequentialFile(atOffset))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            int offset = 500;
+            while (offset < batch.Length)
+                offset += await writer.WriteBatchUntilRowGroupAsync(batch, offset);
+            await writer.CloseAsync();
+        }
+        string whole = await WriteAsync(options, batch.Slice(500, batch.Length - 500));
+
+        var (expected, _, _) = await ReadAsync(whole);
+        var (actual, actualValues, _) = await ReadAsync(atOffset);
+        Assert.Contains(expected.Schema, s => s.Name == "c");
+        Assert.Equal(expected.Schema.Select(s => s.Name), actual.Schema.Select(s => s.Name));
+        Assert.Equal(batch.Length - 500, actualValues.Count);
+    }
 }
