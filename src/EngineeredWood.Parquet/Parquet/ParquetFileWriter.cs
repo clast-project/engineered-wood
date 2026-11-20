@@ -183,13 +183,12 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             RowGroupSchemaCheck.EnsureMatches(_arrowSchema, batch);
         }
 
-        // Decompose all Arrow columns into leaf columns (flat columns produce 1 leaf each,
-        // nested columns produce multiple leaves)
+        // Each leaf column's chunk is encoded by its own ColumnChunkWriter: one append of this batch, then
+        // finish. The unit of parallel work is a top-level column's append (#936 decision 6): its leaves run
+        // in order on one thread, since a nested column is decomposed into all of them at once, and the
+        // columns run in parallel.
         int arrowColumnCount = batch.ColumnCount;
-        var allLeafResults = new List<ColumnChunkWriter.ColumnChunkResult>();
-
-        // Collect leaf column tasks per Arrow column
-        var perColumnLeaves = new List<ColumnChunkWriter.ColumnChunkResult>[arrowColumnCount];
+        var perColumnLeaves = new ColumnChunkWriter.ColumnChunkResult[arrowColumnCount][];
 
         Parallel.For(0, arrowColumnCount, i =>
         {
@@ -200,21 +199,15 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             {
                 // Nested: decompose into leaf columns with def/rep levels
                 var leaves = NestedLevelWriter.Decompose(array, field, batch.Length);
-                var results = new List<ColumnChunkWriter.ColumnChunkResult>(leaves.Count);
-                foreach (var leaf in leaves)
+                var results = new ColumnChunkWriter.ColumnChunkResult[leaves.Count];
+                for (int l = 0; l < leaves.Count; l++)
                 {
-                    results.Add(ColumnChunkWriter.WriteColumn(
-                        leaf.Array,
-                        leaf.PathInSchema,
-                        leaf.PhysicalType,
-                        leaf.TypeLength,
-                        leaf.MaxDefLevel,
-                        leaf.MaxRepLevel,
-                        leaf.DefLevels,
-                        leaf.RepLevels,
-                        leaf.NonNullCount,
-                        leaf.LevelCount,
-                        _options));
+                    var leaf = leaves[l];
+                    var writer = new ColumnChunkWriter(
+                        leaf.PathInSchema, leaf.PhysicalType, leaf.TypeLength,
+                        leaf.MaxDefLevel, leaf.MaxRepLevel, _options);
+                    writer.Append(leaf.Array, leaf.DefLevels, leaf.RepLevels, leaf.NonNullCount, leaf.LevelCount);
+                    results[l] = writer.Finish();
                 }
                 perColumnLeaves[i] = results;
             }
@@ -222,20 +215,16 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             {
                 // Flat: resolve physical type from schema
                 var element = FindLeafElement(_parquetSchema!, field.Name);
-                perColumnLeaves[i] =
-                [
-                    ColumnChunkWriter.WriteColumn(
-                        array,
-                        new[] { field.Name },
-                        element.Type!.Value,
-                        element.TypeLength ?? 0,
-                        field.IsNullable,
-                        _options)
-                ];
+                var writer = new ColumnChunkWriter(
+                    new[] { field.Name }, element.Type!.Value, element.TypeLength ?? 0,
+                    maxDefLevel: field.IsNullable ? 1 : 0, maxRepLevel: 0, _options);
+                writer.AppendFlat(array);
+                perColumnLeaves[i] = [writer.Finish()];
             }
         });
 
         // Flatten results in schema order
+        var allLeafResults = new List<ColumnChunkWriter.ColumnChunkResult>();
         foreach (var results in perColumnLeaves)
             allLeafResults.AddRange(results);
 
