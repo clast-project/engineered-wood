@@ -294,8 +294,17 @@ public sealed record ParquetWriteOptions
     public int RowGroupMaxRows { get; init; } = 1_000_000;
 
     /// <summary>
-    /// Maximum uncompressed byte size per row group. Default is 128 MB.
+    /// The size at which <see cref="ParquetFileWriter.WriteBatchAsync"/> closes a row group, by an estimate of its
+    /// encoded size: the pages written so far, and the open pages and dictionary pages at their uncompressed size
+    /// (#936). Default is 128 MB.
     /// </summary>
+    /// <remarks>
+    /// The estimate costs no extra encoding, so it is not exact: it is usually within a few percent once a column's
+    /// dictionary has decided, but values held while it is undecided (up to 1 MiB a column) count at the smaller of
+    /// their PLAIN and dictionary sizes, which overstates a column that another encoding shrinks further.
+    /// <see cref="ParquetFileWriter.WriteRowGroupAsync"/> writes each batch as it is given, cut only by
+    /// <see cref="RowGroupMaxRows"/>.
+    /// </remarks>
     public long RowGroupMaxBytes { get; init; } = 128L * 1024 * 1024;
 
     /// <summary>

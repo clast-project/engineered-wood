@@ -82,7 +82,8 @@ internal static class DictionaryEncoder
     }
 
     /// <summary>
-    /// Attempts to build a dictionary for the given column.
+    /// Attempts to build a dictionary for the given column: a <see cref="DictionaryBuilder"/> fed the whole
+    /// column once, with its first-page test taken at the end when the values never reached it.
     /// Returns null if dictionary encoding is disabled, not applicable, or thresholds are exceeded.
     /// </summary>
     public static DictionaryResult? TryEncode(
@@ -93,42 +94,18 @@ internal static class DictionaryEncoder
         int nonNullCount,
         ParquetWriteOptions options)
     {
-        if (!options.DictionaryEnabled || physicalType == PhysicalType.Boolean)
+        var builder = DictionaryBuilder.Create(physicalType, typeLength, options);
+        if (builder is null)
             return null;
 
-        // For very small columns, dictionary overhead isn't worthwhile
-        if (nonNullCount == 0)
-            return null;
-
-        // A run-end encoded column is dictionary-encoded from its RUNS. Everything below reads one value
-        // slot per row, which such a column does not have.
-        if (array is RunEndEncodedArray ree)
+        var feed = builder.Feed(array, defLevels, nonNullCount);
+        return feed.Outcome switch
         {
-            var runResult = TryEncodeRuns(ree, physicalType, typeLength, nonNullCount, options.DictionaryPageSizeLimit);
-            GC.KeepAlive(array);
-            return runResult;
-        }
-
-        // Every arm below reads raw spans off this array's buffers and then loops, allocating, for as long
-        // as the column is. `array` is not referenced again once an arm has taken its spans, and a span is
-        // not a GC reference to what it points at — so without the KeepAlive the array is collectable from
-        // that moment, and for a caller-built array that means its buffers are freed by a finalizer while
-        // the arms are still reading them. See doc/arrow-span-lifetime.md.
-        var result = physicalType switch
-        {
-            // The type argument is the BIT PATTERN of a value slot, not the value — see TryEncodeFixed.
-            // FLOAT and DOUBLE go in as uint/ulong so that the dictionary is keyed on bits.
-            PhysicalType.Int32 => TryEncodeFixed<int>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit, FirstPageBytes),
-            PhysicalType.Int64 => TryEncodeFixed<long>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit, FirstPageBytes),
-            PhysicalType.Float => TryEncodeFixed<uint>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit, FirstPageBytes),
-            PhysicalType.Double => TryEncodeFixed<ulong>(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit, FirstPageBytes),
-            PhysicalType.ByteArray => TryEncodeByteArray(array, defLevels, nonNullCount, options.DictionaryPageSizeLimit, FirstPageBytes),
-            PhysicalType.FixedLenByteArray => TryEncodeFixedLenByteArray(array, defLevels, nonNullCount, typeLength, options.DictionaryPageSizeLimit, FirstPageBytes),
+            DictionaryFeed.Accepted => builder.ToResult(feed),
+            DictionaryFeed.Full => builder.ToResult(feed),
+            DictionaryFeed.Pending => builder.Decide() ? builder.ToResult(feed) : null,
             _ => null,
         };
-
-        GC.KeepAlive(array);
-        return result;
     }
 
     /// <summary>
@@ -141,105 +118,672 @@ internal static class DictionaryEncoder
         dictionaryCount <= 1 ? 1 : 32 - BitPolyfills.LeadingZeroCount((uint)(dictionaryCount - 1));
 #endif
 
-    /// <summary>
-    /// Dictionary-encodes a fixed-width column, keyed on the BIT PATTERN of each value slot.
-    /// </summary>
-    /// <typeparam name="TBits">
-    /// An integer type the width of one value slot — never the value's own type for FLOAT or DOUBLE, which
-    /// come in as <see cref="uint"/> and <see cref="ulong"/>. Nothing here interprets a slot, so reading the
-    /// buffer as an integer of the same width changes only the equality used to fold slots together, and
-    /// the dictionary page comes out byte-for-byte the same.
-    /// </typeparam>
-    /// <remarks>
-    /// A dictionary entry is a set of BYTES: two slots belong in the same entry exactly when their encoded
-    /// bytes match. Keying on the VALUE is LOOSER than that for floating point and merges slots that are not
-    /// the same — <c>IEquatable&lt;double&gt;.Equals(-0.0, 0.0)</c> is <c>true</c>, so both zeros landed in
-    /// one entry and every index for the second one pointed at the first one's bytes. Whichever zero came
-    /// first won and the other was silently rewritten (issue #154).
-    /// <para>
-    /// Two consequences worth naming. NaNs with different payloads are now separate entries rather than one,
-    /// which is the same rule applied consistently. And separating the zeros costs a dictionary entry, so a
-    /// column sitting exactly on the cardinality threshold can now fall out of dictionary encoding — the
-    /// values are right either way, since declining just writes them plain.
-    /// </para>
-    /// </remarks>
-    private static DictionaryResult? TryEncodeFixed<TBits>(
-        IArrowArray array, int[]? defLevels, int nonNullCount, int pageSizeLimit, int firstPageBytes)
-        where TBits : unmanaged, IEquatable<TBits>
+    /// <summary>What a <see cref="DictionaryBuilder.Feed"/> did with the values it was given.</summary>
+    internal enum DictionaryFeed
     {
-        int rowCount = array.Length;
-        int elementSize = Marshal.SizeOf<TBits>();
-        // The values the first page holds written plain, or all of them.
-        int firstPage = (int)Math.Min(nonNullCount, Math.Max(1, ((long)firstPageBytes + elementSize - 1) / elementSize));
+        /// <summary>Every value has an entry, and the first-page test is still to come.</summary>
+        Pending,
 
-        // The fixed-width twin of the constant probe in TryEncodeByteArray, and cheaper: every value slot is
-        // the same width, so "all rows equal" is exactly "the value buffer is periodic with period
-        // elementSize" — one vectorized compare that stops at the first differing byte.
-        //
-        // This probe compares BYTES, which is now the same equality the dictionary below uses; the two agree
-        // rather than one being stricter than the other.
-        if (defLevels is null && rowCount > 0
-            && IsConstantFixedWidth(array.Data.Buffers[1].Span, rowCount, elementSize))
+        /// <summary>Every value has an entry, and the dictionary has passed its first-page test.</summary>
+        Accepted,
+
+        /// <summary>The dictionary was declined, for the whole chunk: it filled before its first-page test, or failed it.</summary>
+        Declined,
+
+        /// <summary>
+        /// The dictionary filled after passing its test. The values before <see cref="FeedResult.FullAt"/> have
+        /// entries; the dictionary takes no more.
+        /// </summary>
+        Full,
+
+        /// <summary>
+        /// A run-end encoded column the run arm cannot read, after values have already been fed: the caller expands it
+        /// and feeds the rows.
+        /// </summary>
+        UseRows,
+    }
+
+    /// <summary>The outcome of one <see cref="DictionaryBuilder.Feed"/>, and the entries of the values it took.</summary>
+    internal readonly struct FeedResult
+    {
+        public DictionaryFeed Outcome { get; init; }
+
+        /// <summary>
+        /// The entry of each value taken, in order (<see cref="Taken"/> of them are set), or null when
+        /// <see cref="Runs"/> carries them instead or nothing was taken.
+        /// </summary>
+        public int[]? Indices { get; init; }
+
+        /// <summary>The entries in run form, for a run-end encoded column.</summary>
+        public DictionaryIndexRuns? Runs { get; init; }
+
+        /// <summary>Values given an entry.</summary>
+        public int Taken { get; init; }
+
+        /// <summary>For <see cref="DictionaryFeed.Full"/>: the level position of the first value without an entry.</summary>
+        public int FullAt { get; init; }
+    }
+
+    /// <summary>A dictionary's entries, as the PLAIN bytes the dictionary page holds for each.</summary>
+    internal interface IDictionaryEntries
+    {
+        int Count { get; }
+
+        ReadOnlySpan<byte> Entry(int entry);
+    }
+
+    /// <summary>The entries of a dictionary already built: a page and its entry count.</summary>
+    internal sealed class PageEntries : IDictionaryEntries
+    {
+        private readonly byte[] _page;
+        private readonly int[] _starts;
+        private readonly int[] _lengths;
+
+        public PageEntries(byte[] page, int count, PhysicalType physicalType, int typeLength)
         {
-            if (elementSize > pageSizeLimit)
-                return null;
-
-            var constPage = array.Data.Buffers[1].Span.Slice(0, elementSize).ToArray();
-            return new DictionaryResult
+            _page = page;
+            _starts = new int[count];
+            _lengths = new int[count];
+            if (physicalType == PhysicalType.ByteArray)
             {
-                DictionaryPageData = constPage,
-                DictionaryCount = 1,
-                Indices = new int[nonNullCount],
-            };
+                // PLAIN BYTE_ARRAY: a 4-byte little-endian length before each entry.
+                for (int i = 0, position = 0; i < count; i++)
+                {
+                    _lengths[i] = BinaryPrimitives.ReadInt32LittleEndian(page.AsSpan(position));
+                    _starts[i] = position + 4;
+                    position += 4 + _lengths[i];
+                }
+            }
+            else
+            {
+                int width = physicalType switch
+                {
+                    PhysicalType.Int32 or PhysicalType.Float => 4,
+                    PhysicalType.Int64 or PhysicalType.Double => 8,
+                    PhysicalType.Int96 => 12,
+                    PhysicalType.Boolean => 1,
+                    _ => typeLength,
+                };
+                for (int i = 0; i < count; i++)
+                {
+                    _starts[i] = i * width;
+                    _lengths[i] = width;
+                }
+            }
         }
 
-        var dict = new Dictionary<TBits, int>();
-        var indices = new int[nonNullCount];
-        var valueBuffer = MemoryMarshal.Cast<byte, TBits>(array.Data.Buffers[1].Span);
-        int idx = 0;
-        int? partialAt = null;
+        public int Count => _starts.Length;
 
-        for (int i = 0; i < rowCount; i++)
+        public ReadOnlySpan<byte> Entry(int entry) => _page.AsSpan(_starts[entry], _lengths[entry]);
+    }
+
+    /// <summary>
+    /// A column chunk's dictionary, built as its values arrive: one feed per append, the hash table kept between
+    /// them. Entries are numbered in the order their values first appear.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>The first-page test</b> (as parquet-mr decides on its first page) is taken once
+    /// <see cref="FirstPageBytes"/> of values written plain have been fed, or by <see cref="Decide"/> when the chunk
+    /// ends short of that. If the dictionary page and those values' bit-packed indices are no smaller than the values
+    /// written plain, the dictionary is declined for the whole chunk. Until then the caller holds the values, so that
+    /// a declined dictionary can write them plain. Past the test only <see cref="ParquetWriteOptions.DictionaryPageSizeLimit"/>
+    /// stops it, and then partway (<see cref="DictionaryFeed.Full"/>); a dictionary that fills before its test is
+    /// declined.</para>
+    /// <para><b>One feed of a whole chunk is today's single-pass encoder</b> (<see cref="TryEncode"/> is exactly that),
+    /// so a row group written from one batch gets the dictionary it always did. Three of its shortcuts are kept as they
+    /// were: a column with no nulls whose values are all one value takes one lookup (and no test); and a run-end
+    /// encoded column is fed by its runs, and when it is the first to bring values, decided by
+    /// <see cref="CardinalityThreshold"/> over them.</para>
+    /// <para><b>Fixed-width values are keyed on their BIT PATTERN</b>: an integer type the width of one value slot,
+    /// never the value's own type for FLOAT or DOUBLE, which come in as <see cref="uint"/> and <see cref="ulong"/>.
+    /// A dictionary entry is a set of BYTES: two slots belong in the same entry exactly when their encoded bytes
+    /// match. Keying on the VALUE is looser than that for floating point and merged -0.0 into 0.0 (issue #154). NaNs
+    /// with different payloads are separate entries, by the same rule.</para>
+    /// </remarks>
+    internal sealed class DictionaryBuilder : IDictionaryEntries
+    {
+        private readonly PhysicalType _physicalType;
+        private readonly int _typeLength;
+        private readonly int _pageSizeLimit;
+
+        /// <summary>A value's PLAIN width, or 0 for BYTE_ARRAY, whose values are a 4-byte length and their bytes.</summary>
+        private readonly int _elementSize;
+
+        private EntryTable? _table;
+
+        /// <summary>Values given an entry so far.</summary>
+        private long _values;
+
+        /// <summary>The values fed before the test was taken, written plain: the test's yardstick.</summary>
+        private long _plainBytes;
+
+        /// <summary>Whether every value so far came through a constant probe, which takes no test.</summary>
+        private bool _constantOnly;
+
+        /// <summary>The entries once the dictionary is full: the one that overflowed is not among them.</summary>
+        private int? _frozenCount;
+
+        private DictionaryBuilder(PhysicalType physicalType, int typeLength, int elementSize, int pageSizeLimit)
         {
-            if (defLevels != null && defLevels[i] == 0) continue;
+            _physicalType = physicalType;
+            _typeLength = typeLength;
+            _elementSize = elementSize;
+            _pageSizeLimit = pageSizeLimit;
+        }
 
-            TBits value = valueBuffer[i];
-            if (!dict.TryGetValue(value, out int dictIdx))
+        /// <summary>A builder for a column chunk, or null when the column gets no dictionary at all.</summary>
+        public static DictionaryBuilder? Create(PhysicalType physicalType, int typeLength, ParquetWriteOptions options)
+        {
+            if (!options.DictionaryEnabled)
+                return null;
+
+            int elementSize = physicalType switch
             {
-                dictIdx = dict.Count;
-                dict[value] = dictIdx;
+                PhysicalType.Int32 or PhysicalType.Float => 4,
+                PhysicalType.Int64 or PhysicalType.Double => 8,
+                PhysicalType.ByteArray => 0,
+                PhysicalType.FixedLenByteArray => typeLength,
+                _ => -1, // BOOLEAN, INT96
+            };
+            return elementSize < 0
+                ? null
+                : new DictionaryBuilder(physicalType, typeLength, elementSize, options.DictionaryPageSizeLimit);
+        }
 
-                if (dict.Count * elementSize > pageSizeLimit)
+        /// <summary>Whether the dictionary has passed its first-page test.</summary>
+        public bool Decided { get; private set; }
+
+        /// <summary>Whether the dictionary was declined; it takes nothing more.</summary>
+        public bool Declined { get; private set; }
+
+        /// <summary>Whether the dictionary is full; it takes nothing more, and keeps the entries it has.</summary>
+        public bool Frozen => _frozenCount is not null;
+
+        /// <summary>The entries the dictionary page holds.</summary>
+        public int Count => _frozenCount ?? _table?.Count ?? 0;
+
+        /// <summary>The dictionary page's bytes so far, uncompressed.</summary>
+        public long ByteCount => _table?.ByteCount ?? 0;
+
+        public ReadOnlySpan<byte> Entry(int entry) => _table!.Entry(entry);
+
+        /// <summary>The PLAIN dictionary page.</summary>
+        public byte[] ToPage() => _table is null ? [] : _table.ToPage(Count);
+
+        /// <summary>The dictionary as a <see cref="DictionaryResult"/>, with the entries of <paramref name="feed"/>.</summary>
+        public DictionaryResult ToResult(in FeedResult feed) => new()
+        {
+            DictionaryPageData = ToPage(),
+            DictionaryCount = Count,
+            Indices = feed.Runs is null ? feed.Indices ?? [] : null,
+            IndexRuns = feed.Runs,
+            PartialLength = feed.Outcome == DictionaryFeed.Full ? feed.FullAt : null,
+        };
+
+        /// <summary>
+        /// Takes the first-page test now, over what has been fed, for a chunk that ends (or must be decided) before
+        /// its values reach <see cref="FirstPageBytes"/>. Returns whether the dictionary is kept.
+        /// </summary>
+        public bool Decide()
+        {
+            if (Declined)
+                return false;
+            if (!Decided)
+            {
+                // A constant probe never took the test; one entry fed only through probes is kept as it was.
+                if ((_constantOnly && Count == 1) || Pays(ByteCount, _values, Count, _plainBytes))
+                    Decided = true;
+                else
+                    Declined = true;
+            }
+            return Decided;
+        }
+
+        /// <summary>
+        /// Gives the non-null values of <paramref name="array"/> their entries, adding the new ones.
+        /// </summary>
+        /// <param name="defLevels">0 for a level without a value, or null when every level has one.</param>
+        public FeedResult Feed(IArrowArray array, int[]? defLevels, int nonNullCount)
+        {
+            if (Declined || Frozen)
+                throw new InvalidOperationException("The dictionary takes no more values.");
+
+            if (nonNullCount == 0)
+                return new FeedResult { Outcome = Decided ? DictionaryFeed.Accepted : DictionaryFeed.Pending };
+
+            // Every arm below reads raw spans off this array's buffers and then loops, allocating, for as long as
+            // the column is. A span is not a GC reference to what it points at, so without the KeepAlive a
+            // caller-built array is collectable mid-loop. See doc/arrow-span-lifetime.md.
+            var result = array is RunEndEncodedArray ree
+                ? FeedRuns(ree, nonNullCount)
+                : _physicalType switch
                 {
-                    // Full before the first page decided: decline. After: keep what is encoded.
-                    if (idx < firstPage)
-                        return null;
-                    dict.Remove(value);
-                    partialAt = i;
-                    break;
+                    // The type argument is the BIT PATTERN of a value slot, not the value.
+                    PhysicalType.Int32 => FeedFixed<int>(array, defLevels, nonNullCount),
+                    PhysicalType.Int64 => FeedFixed<long>(array, defLevels, nonNullCount),
+                    PhysicalType.Float => FeedFixed<uint>(array, defLevels, nonNullCount),
+                    PhysicalType.Double => FeedFixed<ulong>(array, defLevels, nonNullCount),
+                    PhysicalType.ByteArray => FeedByteArray(array, defLevels, nonNullCount),
+                    _ => FeedFixedLenByteArray(array, defLevels, nonNullCount),
+                };
+
+            GC.KeepAlive(array);
+            return result;
+        }
+
+        private FeedResult FeedFixed<TBits>(IArrowArray array, int[]? defLevels, int nonNullCount)
+            where TBits : unmanaged, IEquatable<TBits>
+        {
+            var table = (FixedTable<TBits>)(_table ??= new FixedTable<TBits>());
+            int rowCount = array.Length;
+            int elementSize = _elementSize;
+            var buffer = array.Data.Buffers[1].Span;
+
+            // "All rows equal" is exactly "the value buffer is periodic with period elementSize": one vectorized
+            // compare that stops at the first differing byte. It compares BYTES, the equality the table uses.
+            if (defLevels is null && rowCount > 0 && IsConstantFixedWidth(buffer, rowCount, elementSize))
+                return FeedConstant(buffer.Slice(0, elementSize), nonNullCount, elementSize);
+
+            var valueBuffer = MemoryMarshal.Cast<byte, TBits>(buffer);
+            var indices = new int[nonNullCount];
+            int idx = 0;
+            long values = _values, plainBytes = _plainBytes;
+            bool decided = Decided;
+
+            for (int i = 0; i < rowCount; i++)
+            {
+                if (defLevels != null && defLevels[i] == 0) continue;
+
+                int entry = table.GetOrAdd(valueBuffer[i], out bool inserted);
+                if (inserted && table.ByteCount > _pageSizeLimit)
+                    return Overflow(indices, idx, i, values, plainBytes);
+
+                indices[idx++] = entry;
+                values++;
+                if (!decided)
+                {
+                    plainBytes += elementSize;
+                    if (plainBytes >= FirstPageBytes)
+                    {
+                        if (!Pays(table.ByteCount, values, table.Count, plainBytes))
+                            return Decline();
+                        decided = Decided = true;
+                    }
                 }
             }
 
-            indices[idx++] = dictIdx;
-            if (idx == firstPage && !Pays(dict.Count * (long)elementSize, idx, dict.Count, idx * (long)elementSize))
-                return null;
+            return Fed(indices, idx, values, plainBytes);
         }
 
-        // Produce PLAIN-encoded dictionary page: values in index order
-        var entries = new TBits[dict.Count];
-        foreach (var kvp in dict)
-            entries[kvp.Value] = kvp.Key;
-
-        var dictPage = new byte[dict.Count * elementSize];
-        MemoryMarshal.AsBytes(entries.AsSpan()).CopyTo(dictPage);
-
-        return new DictionaryResult
+        private FeedResult FeedByteArray(IArrowArray array, int[]? defLevels, int nonNullCount)
         {
-            DictionaryPageData = dictPage,
-            DictionaryCount = dict.Count,
-            Indices = indices,
-            PartialLength = partialAt,
+            var table = (BytesTable)(_table ??= new BytesTable(lengthPrefixed: true));
+            int rowCount = array.Length;
+
+            var data = array.Data;
+            ReadOnlySpan<int> arrowOffsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
+            ReadOnlySpan<byte> arrowData = data.Buffers[2].Span;
+
+            // A column holding one value in every row is a common shape on the write path — a materialized
+            // partition value, a CDF _change_type, anything ArrowCompute.Repeat produced — and hashing every row
+            // to discover that it has one distinct value is what dominates encoding it. Recognising it up front
+            // replaces that with a length check and one comparison. The probe costs almost nothing when it
+            // fails: see TryDescribeConstantValue.
+            if (defLevels is null &&
+                TryDescribeConstantValue(arrowOffsets, arrowData, rowCount, out int constStart, out int constLen))
+            {
+                return FeedConstant(arrowData.Slice(constStart, constLen), nonNullCount, 4 + constLen);
+            }
+
+            var indices = new int[nonNullCount];
+            int idx = 0;
+            long values = _values, plainBytes = _plainBytes;
+            bool decided = Decided;
+
+            for (int i = 0; i < rowCount; i++)
+            {
+                if (defLevels != null && defLevels[i] == 0) continue;
+
+                int start = arrowOffsets[i];
+                ReadOnlySpan<byte> valueBytes = arrowData.Slice(start, arrowOffsets[i + 1] - start);
+
+                int entry = table.GetOrAddBytes(valueBytes, out bool inserted);
+                if (inserted && table.ByteCount > _pageSizeLimit)
+                    return Overflow(indices, idx, i, values, plainBytes);
+
+                indices[idx++] = entry;
+                values++;
+                if (!decided)
+                {
+                    // The first page: the values up to its size written plain.
+                    plainBytes += 4 + valueBytes.Length;
+                    if (plainBytes >= FirstPageBytes)
+                    {
+                        if (!Pays(table.ByteCount, values, table.Count, plainBytes))
+                            return Decline();
+                        decided = Decided = true;
+                    }
+                }
+            }
+
+            return Fed(indices, idx, values, plainBytes);
+        }
+
+        private FeedResult FeedFixedLenByteArray(IArrowArray array, int[]? defLevels, int nonNullCount)
+        {
+            int typeLength = _typeLength;
+            // The page is the values concatenated (PLAIN for FLBA has no length prefix), which the table holds.
+            var table = (BytesTable)(_table ??= new BytesTable(lengthPrefixed: false));
+            int rowCount = array.Length;
+            var valueBuffer = array.Data.Buffers[1].Span;
+
+            var indices = new int[nonNullCount];
+            int idx = 0;
+            long values = _values, plainBytes = _plainBytes;
+            bool decided = Decided;
+
+            for (int i = 0; i < rowCount; i++)
+            {
+                if (defLevels != null && defLevels[i] == 0) continue;
+
+                int entry = table.GetOrAddBytes(valueBuffer.Slice(i * typeLength, typeLength), out bool inserted);
+                if (inserted && table.ByteCount > _pageSizeLimit)
+                    return Overflow(indices, idx, i, values, plainBytes);
+
+                indices[idx++] = entry;
+                values++;
+                if (!decided)
+                {
+                    plainBytes += typeLength;
+                    if (plainBytes >= FirstPageBytes)
+                    {
+                        if (!Pays(table.ByteCount, values, table.Count, plainBytes))
+                            return Decline();
+                        decided = Decided = true;
+                    }
+                }
+            }
+
+            return Fed(indices, idx, values, plainBytes);
+        }
+
+        /// <summary>
+        /// A column of one value in every row (and no nulls): one lookup, and one entry for every row. Such a feed
+        /// takes no first-page test, as the single-pass encoder never did.
+        /// </summary>
+        private FeedResult FeedConstant(ReadOnlySpan<byte> value, int count, int plainSize)
+        {
+            bool first = _values == 0;
+            int entry = _table!.GetOrAddBytes(value, out bool inserted);
+            if (inserted && _table.ByteCount > _pageSizeLimit)
+                return Overflow([], 0, 0, _values, _plainBytes);
+
+            var indices = new int[count];
+            if (entry != 0)
+                indices.AsSpan().Fill(entry);
+
+            _constantOnly = first || _constantOnly;
+            _values += count;
+            if (!Decided)
+            {
+                _plainBytes += (long)count * plainSize;
+                if (_plainBytes >= FirstPageBytes && !Decide())
+                    return Decline();
+            }
+
+            return new FeedResult
+            {
+                Outcome = Decided ? DictionaryFeed.Accepted : DictionaryFeed.Pending,
+                Indices = indices,
+                Taken = count,
+            };
+        }
+
+        /// <summary>
+        /// Feeds a run-end encoded column by its RUNS: one hash per run rather than per row, and entries in run form,
+        /// so both the time and the allocation are O(runs). A constant column — one run — costs one lookup and a
+        /// two-element index run whatever its row count.
+        /// </summary>
+        /// <remarks>
+        /// <para>Nulls come from the run's value, which is the only place a run-end encoded array keeps them (its own
+        /// <c>IsNull</c> answers false for every row). A null run contributes no entries at all, matching what the
+        /// per-row arms do with a def level of 0.</para>
+        /// <para>The first feed to bring values decides by runs, as the single-pass encoder did: the dictionary is
+        /// declined when its distinct values exceed <see cref="CardinalityThreshold"/> of the values, or its page the
+        /// size limit. A later feed follows the per-row rules, with each run counted as its rows.</para>
+        /// <para>Values are compared as BYTES, like the per-row arms.</para>
+        /// </remarks>
+        private FeedResult FeedRuns(RunEndEncodedArray array, int nonNullCount)
+        {
+            bool first = _values == 0 && !Decided;
+            var values = array.Values;
+
+            // The run arm reads value slots straight out of the raw buffers, so it has to recognise the LAYOUT and not
+            // merely the physical type. LargeString (64-bit offsets) and StringView reach BYTE_ARRAY too, and reading
+            // either as 32-bit offsets is silent corruption rather than a failure. An unrecognised layout is fed by
+            // its rows instead, or declines on a first feed, as the single-pass encoder did.
+            bool lengthPrefixed = _physicalType == PhysicalType.ByteArray;
+            int slotWidth = 0;
+            if (lengthPrefixed
+                ? values.Data.DataType is not (Apache.Arrow.Types.StringType or BinaryType)
+                : !TryGetSlotWidth(values.Data.DataType, _physicalType, _typeLength, out slotWidth))
+            {
+                if (!first)
+                    return new FeedResult { Outcome = DictionaryFeed.UseRows };
+                return Decline();
+            }
+
+            int maxCardinality = Math.Max(1, (int)(nonNullCount * CardinalityThreshold));
+            if (_table is null)
+            {
+                // The runs are an EXACT upper bound on the distinct values — one run cannot hold two of them. Sizing
+                // the table to it means a column whose bound is tight never rehashes.
+                int distinctBound = first ? Math.Min(maxCardinality, values.Length) + 1 : 0;
+                _table = NewTable(distinctBound);
+            }
+
+            var table = _table;
+            var runIndices = new List<int>();
+            var runLengths = new List<int>();
+            long counted = 0;
+            int levelPosition = 0;
+            long plainBytes = _plainBytes;
+
+            foreach (var run in RunEndEncoding.EnumerateRuns(array))
+            {
+                int runStart = levelPosition;
+                levelPosition += run.Length;
+                if (values.IsNull(run.PhysicalIndex))
+                    continue;
+
+                var valueBytes = RunValueBytes(values, run.PhysicalIndex, lengthPrefixed, slotWidth);
+                int entry = table.GetOrAddBytes(valueBytes, out bool inserted);
+                if (inserted)
+                {
+                    if (first ? table.Count > maxCardinality || table.ByteCount > _pageSizeLimit
+                              : table.ByteCount > _pageSizeLimit)
+                    {
+                        if (first || !Decided)
+                            return Decline();
+                        _frozenCount = table.Count - 1;
+                        _values += counted;
+                        return new FeedResult
+                        {
+                            Outcome = DictionaryFeed.Full,
+                            Runs = Runs(runIndices, runLengths),
+                            Taken = checked((int)counted),
+                            FullAt = runStart,
+                        };
+                    }
+                }
+
+                counted += run.Length;
+
+                // Two runs that map to the same entry are one run in the index stream — they are adjacent there
+                // whenever the runs between them were null, and the RLE encoder cannot merge what it is handed as two.
+                if (runIndices.Count > 0 && runIndices[runIndices.Count - 1] == entry)
+                    runLengths[runLengths.Count - 1] += run.Length;
+                else
+                {
+                    runIndices.Add(entry);
+                    runLengths.Add(run.Length);
+                }
+
+                if (!first && !Decided)
+                {
+                    plainBytes += (long)run.Length * (lengthPrefixed ? 4 + valueBytes.Length : slotWidth);
+                    if (plainBytes >= FirstPageBytes)
+                    {
+                        if (!Pays(table.ByteCount, _values + counted, table.Count, plainBytes))
+                            return Decline();
+                        Decided = true;
+                    }
+                }
+            }
+
+            // The caller derived the definition levels from these same runs, so a disagreement means the two views of
+            // this column have diverged. A first feed declines, which writes the column on the caller's terms; later,
+            // entries have been added for values the levels do not admit.
+            if (counted != nonNullCount)
+            {
+                if (first)
+                    return Decline();
+                throw new InvalidOperationException(
+                    "A run-end encoded column's runs disagree with its definition levels.");
+            }
+
+            if (first)
+                Decided = true;
+            _constantOnly = false;
+            _values += counted;
+            _plainBytes = plainBytes;
+            return new FeedResult
+            {
+                Outcome = Decided ? DictionaryFeed.Accepted : DictionaryFeed.Pending,
+                Runs = Runs(runIndices, runLengths),
+                Taken = checked((int)counted),
+            };
+        }
+
+        private static DictionaryIndexRuns Runs(List<int> values, List<int> lengths) => new()
+        {
+            Values = values.ToArray(),
+            Lengths = lengths.ToArray(),
         };
+
+        private EntryTable NewTable(int expectedEntries) => _physicalType switch
+        {
+            PhysicalType.Int32 => new FixedTable<int>(expectedEntries),
+            PhysicalType.Int64 => new FixedTable<long>(expectedEntries),
+            PhysicalType.Float => new FixedTable<uint>(expectedEntries),
+            PhysicalType.Double => new FixedTable<ulong>(expectedEntries),
+            PhysicalType.ByteArray => new BytesTable(lengthPrefixed: true, expectedEntries),
+            _ => new BytesTable(lengthPrefixed: false, expectedEntries),
+        };
+
+        /// <summary>A value overflowed the page: declined before the test, full after it.</summary>
+        private FeedResult Overflow(int[] indices, int taken, int levelPosition, long values, long plainBytes)
+        {
+            if (!Decided)
+                return Decline();
+
+            _frozenCount = _table!.Count - 1;
+            _values = values;
+            _plainBytes = plainBytes;
+            _constantOnly = false;
+            return new FeedResult { Outcome = DictionaryFeed.Full, Indices = indices, Taken = taken, FullAt = levelPosition };
+        }
+
+        private FeedResult Fed(int[] indices, int taken, long values, long plainBytes)
+        {
+            _values = values;
+            _plainBytes = plainBytes;
+            _constantOnly = false;
+            return new FeedResult
+            {
+                Outcome = Decided ? DictionaryFeed.Accepted : DictionaryFeed.Pending,
+                Indices = indices,
+                Taken = taken,
+            };
+        }
+
+        private FeedResult Decline()
+        {
+            Declined = true;
+            _table = null;
+            return new FeedResult { Outcome = DictionaryFeed.Declined };
+        }
+    }
+
+    /// <summary>A builder's distinct values and their entry numbers.</summary>
+    private abstract class EntryTable : IDictionaryEntries
+    {
+        public abstract int Count { get; }
+
+        /// <summary>The bytes of the dictionary page of every entry.</summary>
+        public abstract long ByteCount { get; }
+
+        public abstract int GetOrAddBytes(ReadOnlySpan<byte> key, out bool inserted);
+
+        public abstract ReadOnlySpan<byte> Entry(int entry);
+
+        /// <summary>The PLAIN dictionary page of the first <paramref name="entries"/> entries.</summary>
+        public abstract byte[] ToPage(int entries);
+    }
+
+    /// <summary>Fixed-width entries keyed on their bits (see <see cref="DictionaryBuilder"/>).</summary>
+    private sealed class FixedTable<TBits>(int capacity = 0) : EntryTable
+        where TBits : unmanaged, IEquatable<TBits>
+    {
+        private readonly Dictionary<TBits, int> _map = new(capacity);
+        private TBits[] _entries = new TBits[16];
+        private int _count;
+
+        public override int Count => _count;
+
+        public override long ByteCount => (long)_count * Size;
+
+        private static readonly int Size = Marshal.SizeOf<TBits>();
+
+        public int GetOrAdd(TBits value, out bool inserted)
+        {
+            if (_map.TryGetValue(value, out int entry))
+            {
+                inserted = false;
+                return entry;
+            }
+
+            entry = _count;
+            _map[value] = entry;
+            if (_count == _entries.Length)
+                System.Array.Resize(ref _entries, _count * 2);
+            _entries[_count++] = value;
+            inserted = true;
+            return entry;
+        }
+
+        public override int GetOrAddBytes(ReadOnlySpan<byte> key, out bool inserted) =>
+            GetOrAdd(MemoryMarshal.Read<TBits>(key), out inserted);
+
+        public override ReadOnlySpan<byte> Entry(int entry) => MemoryMarshal.AsBytes(_entries.AsSpan(entry, 1));
+
+        public override byte[] ToPage(int entries) => MemoryMarshal.AsBytes(_entries.AsSpan(0, entries)).ToArray();
+    }
+
+    /// <summary>Byte entries in a <see cref="BytesHashTable"/>, which holds them as the page itself.</summary>
+    private sealed class BytesTable(bool lengthPrefixed, int expectedEntries = 0) : EntryTable
+    {
+        private readonly BytesHashTable _table = new(lengthPrefixed, expectedEntries);
+
+        public override int Count => _table.Count;
+
+        public override long ByteCount => _table.ByteCount;
+
+        public override int GetOrAddBytes(ReadOnlySpan<byte> key, out bool inserted) => _table.GetOrAdd(key, out inserted);
+
+        public override ReadOnlySpan<byte> Entry(int entry) => _table.Entry(entry);
+
+        public override byte[] ToPage(int entries) => _table.ToPage(entries);
     }
 
     /// <summary>
@@ -297,186 +841,8 @@ internal static class DictionaryEncoder
     /// <paramref name="values"/> indices bit-packed at the width <paramref name="entries"/> needs, against those
     /// values written plain (<paramref name="plainBytes"/>). This is parquet-mr's test.
     /// </summary>
-    private static bool Pays(long dictionaryBytes, int values, int entries, long plainBytes) =>
-        dictionaryBytes + ((long)values * GetIndexBitWidth(entries) + 7) / 8 < plainBytes;
-
-    private static DictionaryResult? TryEncodeByteArray(
-        IArrowArray array, int[]? defLevels, int nonNullCount, int pageSizeLimit, int firstPageBytes)
-    {
-        int rowCount = array.Length;
-
-        var data = array.Data;
-        ReadOnlySpan<int> arrowOffsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
-        ReadOnlySpan<byte> arrowData = data.Buffers[2].Span;
-
-        // A column holding one value in every row is a common shape on the write path — a materialized
-        // partition value, a CDF _change_type, anything ArrowCompute.Repeat produced — and hashing every row
-        // to discover that it has one distinct value is what dominates encoding it. Recognising it up front
-        // replaces that with a length check and one comparison. The probe costs almost nothing when it
-        // fails: see TryDescribeConstantValue.
-        if (defLevels is null &&
-            TryDescribeConstantValue(arrowOffsets, arrowData, rowCount, out int constStart, out int constLen))
-        {
-            // The dictionary page has the same PLAIN shape as below, with one entry.
-            if (4 + constLen > pageSizeLimit)
-                return null;
-
-            var constPage = new byte[4 + constLen];
-            BinaryPrimitives.WriteInt32LittleEndian(constPage, constLen);
-            arrowData.Slice(constStart, constLen).CopyTo(constPage.AsSpan(4));
-
-            return new DictionaryResult
-            {
-                DictionaryPageData = constPage,
-                DictionaryCount = 1,
-                // Every row maps to entry 0, and a fresh int[] is already zeroed — nothing to write per row.
-                Indices = new int[nonNullCount],
-            };
-        }
-
-        // The table keeps the distinct values as the dictionary page itself (PLAIN: a 4-byte LE length prefix
-        // per entry), so the page is a copy of what it holds.
-        var table = new BytesHashTable(lengthPrefixed: true);
-        var indices = new int[nonNullCount];
-        int idx = 0;
-        long plainBytes = 0;
-        bool decided = false;
-        int? partialAt = null;
-
-        for (int i = 0; i < rowCount; i++)
-        {
-            if (defLevels != null && defLevels[i] == 0) continue;
-
-            int start = arrowOffsets[i];
-            ReadOnlySpan<byte> valueBytes = arrowData.Slice(start, arrowOffsets[i + 1] - start);
-
-            int dictIdx = table.GetOrAdd(valueBytes, out bool inserted);
-            if (inserted && table.ByteCount > pageSizeLimit)
-            {
-                // Full before the first page decided: decline. After: keep what is encoded.
-                if (!decided)
-                    return null;
-                partialAt = i;
-                break;
-            }
-
-            indices[idx++] = dictIdx;
-            if (!decided)
-            {
-                // The first page: the values up to its size written plain, or all of them.
-                plainBytes += 4 + valueBytes.Length;
-                if (plainBytes >= firstPageBytes || idx == nonNullCount)
-                {
-                    if (!Pays(table.ByteCount, idx, table.Count, plainBytes))
-                        return null;
-                    decided = true;
-                }
-            }
-        }
-
-        // The entry that overflowed is not part of a partial dictionary.
-        int entries = partialAt is null ? table.Count : table.Count - 1;
-        return new DictionaryResult
-        {
-            DictionaryPageData = table.ToPage(entries),
-            DictionaryCount = entries,
-            Indices = indices,
-            PartialLength = partialAt,
-        };
-    }
-
-    /// <summary>
-    /// Builds the dictionary for a run-end encoded column out of its RUNS: one hash per run rather than
-    /// per row, and indices emitted in run form, so both the time and the allocation are O(runs). A
-    /// constant column — one run — costs one lookup and a two-element index run whatever its row count.
-    ///
-    /// <para>Nulls come from the run's value, which is the only place a run-end encoded array keeps them
-    /// (its own <c>IsNull</c> answers false for every row). A null run contributes no indices at all,
-    /// matching what the per-row encoders do with a def level of 0.</para>
-    ///
-    /// <para>Values are compared as BYTES, like the constant probes above, where the fixed-width per-row
-    /// path compares as values. The difference costs at most a duplicate dictionary entry (+0.0 and -0.0
-    /// are equal but differ in bytes) and never a wrong value, since byte-identical entries read back
-    /// identical.</para>
-    /// </summary>
-    private static DictionaryResult? TryEncodeRuns(
-        RunEndEncodedArray array,
-        PhysicalType physicalType,
-        int typeLength,
-        int nonNullCount,
-        int pageSizeLimit)
-    {
-        var values = array.Values;
-
-        // The run arm reads value slots straight out of the raw buffers, so it has to recognise the
-        // LAYOUT and not merely the physical type. MapArrowType routes LargeString (64-bit offsets) and
-        // StringView (a different layout entirely) to BYTE_ARRAY alongside String/Binary, and reading
-        // either of those as 32-bit offsets is silent corruption rather than a failure. An unrecognised
-        // layout declines here, which lands the column on the expansion path where the per-row encoders
-        // handle it exactly as they do today.
-        bool lengthPrefixed = physicalType == PhysicalType.ByteArray;
-        int slotWidth = 0;
-        if (lengthPrefixed
-            ? values.Data.DataType is not (Apache.Arrow.Types.StringType or BinaryType)
-            : !TryGetSlotWidth(values.Data.DataType, physicalType, typeLength, out slotWidth))
-        {
-            return null;
-        }
-
-        int maxCardinality = Math.Max(1, (int)(nonNullCount * CardinalityThreshold));
-
-        // The runs are an EXACT upper bound on the distinct values — one run cannot hold two of them —
-        // where the per-row arms have nothing to go on and must grow into the right size. Passing it
-        // costs nothing and means a column whose bound is tight never rehashes at all.
-        int distinctBound = Math.Min(maxCardinality, values.Length) + 1;
-        var table = new BytesHashTable(lengthPrefixed, distinctBound);
-        var runIndices = new List<int>();
-        var runLengths = new List<int>();
-        long countedNonNull = 0;
-
-        foreach (var run in RunEndEncoding.EnumerateRuns(array))
-        {
-            if (values.IsNull(run.PhysicalIndex))
-                continue;
-
-            countedNonNull += run.Length;
-
-            var valueBytes = RunValueBytes(values, run.PhysicalIndex, lengthPrefixed, slotWidth);
-            int dictIdx = table.GetOrAdd(valueBytes, out bool inserted);
-            if (inserted && (table.Count > maxCardinality || table.ByteCount > pageSizeLimit))
-                return null;
-
-            // Two runs that map to the same entry are one run in the index stream — they are adjacent
-            // there whenever the runs between them were null, and the RLE encoder cannot merge what it is
-            // handed as two.
-            if (runIndices.Count > 0 && runIndices[runIndices.Count - 1] == dictIdx)
-                runLengths[runLengths.Count - 1] += run.Length;
-            else
-            {
-                runIndices.Add(dictIdx);
-                runLengths.Add(run.Length);
-            }
-        }
-
-        // The caller derived the definition levels from these same runs, so a disagreement means the two
-        // views of this column have diverged — the array carries nulls the levels do not admit, or the
-        // reverse. Declining sends it down the expansion path, where it is encoded on the caller's terms
-        // rather than written with an index stream the levels cannot address.
-        if (countedNonNull != nonNullCount)
-            return null;
-
-        return new DictionaryResult
-        {
-            DictionaryPageData = table.ToPage(),
-            DictionaryCount = table.Count,
-            Indices = null,
-            IndexRuns = new DictionaryIndexRuns
-            {
-                Values = runIndices.ToArray(),
-                Lengths = runLengths.ToArray(),
-            },
-        };
-    }
+    private static bool Pays(long dictionaryBytes, long values, int entries, long plainBytes) =>
+        dictionaryBytes + (values * GetIndexBitWidth(entries) + 7) / 8 < plainBytes;
 
     /// <summary>One value slot of a run-end encoded column's values child, as raw bytes.</summary>
     private static ReadOnlySpan<byte> RunValueBytes(
@@ -591,50 +957,6 @@ internal static class DictionaryEncoder
         return true;
     }
 
-    private static DictionaryResult? TryEncodeFixedLenByteArray(
-        IArrowArray array, int[]? defLevels, int nonNullCount, int typeLength, int pageSizeLimit, int firstPageBytes)
-    {
-        int rowCount = array.Length;
-        int firstPage = (int)Math.Min(nonNullCount, Math.Max(1, ((long)firstPageBytes + typeLength - 1) / typeLength));
-
-        var valueBuffer = array.Data.Buffers[1].Span;
-
-        // The page is the values concatenated (PLAIN for FLBA has no length prefix), which the table holds.
-        var table = new BytesHashTable(lengthPrefixed: false);
-        var indices = new int[nonNullCount];
-        int idx = 0;
-        int? partialAt = null;
-
-        for (int i = 0; i < rowCount; i++)
-        {
-            if (defLevels != null && defLevels[i] == 0) continue;
-
-            ReadOnlySpan<byte> valueBytes = valueBuffer.Slice(i * typeLength, typeLength);
-            int dictIdx = table.GetOrAdd(valueBytes, out bool inserted);
-            if (inserted && table.ByteCount > pageSizeLimit)
-            {
-                // Full before the first page decided: decline. After: keep what is encoded.
-                if (idx < firstPage)
-                    return null;
-                partialAt = i;
-                break;
-            }
-
-            indices[idx++] = dictIdx;
-            if (idx == firstPage && !Pays(table.ByteCount, idx, table.Count, idx * (long)typeLength))
-                return null;
-        }
-
-        int entries = partialAt is null ? table.Count : table.Count - 1;
-        return new DictionaryResult
-        {
-            DictionaryPageData = table.ToPage(entries),
-            DictionaryCount = entries,
-            Indices = indices,
-            PartialLength = partialAt,
-        };
-    }
-
     /// <summary>
     /// The distinct values of a column, numbered in the order they first appear, found with an open-addressing
     /// hash table (linear probing) and kept as the PLAIN dictionary page they will be written as.
@@ -720,6 +1042,9 @@ internal static class DictionaryEncoder
 
         /// <summary>The bytes of the dictionary page so far.</summary>
         public int ByteCount => _pageLength;
+
+        /// <summary>Entry <paramref name="entry"/>'s bytes, without a length prefix.</summary>
+        public ReadOnlySpan<byte> Entry(int entry) => _page.AsSpan(_starts[entry], EntryLength(entry));
 
         /// <summary>The PLAIN dictionary page: every entry, in order.</summary>
         public byte[] ToPage() => _page.AsSpan(0, _pageLength).ToArray();

@@ -54,6 +54,9 @@ internal sealed class ColumnChunkOutput
     /// </summary>
     public IReadOnlyList<PageEncodingStats> EncodingStats => _encodingStats;
 
+    /// <summary>The number of bytes written so far.</summary>
+    public int Length => checked((int)_stream.Length);
+
     /// <summary>The chunk's bytes so far.</summary>
     public ArraySegment<byte> Data
     {
