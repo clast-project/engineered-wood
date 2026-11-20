@@ -165,14 +165,16 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         if (writeBatch.Length == 0)
             return;
 
-        if (lease is not null)
-            _leases.Add(lease.Acquire());
-
         if (_columnFieldIds is not null)
             writeBatch = WithColumnFieldIds(writeBatch);
 
         if (_fileSchema is not null && !SameLayout(_fileSchema.FieldsList, writeBatch.Schema.FieldsList))
             await CloseFileAsync(cancellationToken).ConfigureAwait(false);
+
+        // Held only once the previous file is closed: closing a host's file lets go of every lease it holds, and this
+        // batch is the next file's (#939 review).
+        if (lease is not null)
+            _leases.Add(lease.Acquire());
 
         if (_host is not null)
         {
@@ -191,9 +193,9 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         while (offset < writeBatch.Length)
         {
             var writer = await OpenWriterAsync(cancellationToken).ConfigureAwait(false);
-            bool whole = offset == 0;
-            var piece = whole ? writeBatch : writeBatch.Slice(offset, writeBatch.Length - offset);
-            int rows = await writer.WriteBatchUntilRowGroupAsync(piece, cancellationToken).ConfigureAwait(false);
+            // The whole batch and where to go on from, not the rest as a slice: the writer prepares only the rows each
+            // call takes, so a batch spanning many row groups is not prepared again for every one (#939 review).
+            int rows = await writer.WriteBatchUntilRowGroupAsync(writeBatch, offset, cancellationToken).ConfigureAwait(false);
             Account(
                 rows == writeBatch.Length ? writeBatch : writeBatch.Slice(offset, rows),
                 rows == writeBatch.Length ? statsBatch : statsBatch.Slice(offset, rows));

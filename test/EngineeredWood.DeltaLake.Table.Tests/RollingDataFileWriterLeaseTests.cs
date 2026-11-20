@@ -108,6 +108,39 @@ public class RollingDataFileWriterLeaseTests : IDisposable
         Assert.True(largeLease.Released);
     }
 
+    /// <summary>
+    /// A batch of another layout closes the open file first, which lets go of that file's leases. The new batch's
+    /// lease is the next file's: it was taken before the close and let go with them, and the host then read buffers
+    /// its caller had freed (#939 review).
+    /// </summary>
+    [Fact]
+    public async Task UnderAHostWriter_ALayoutChange_KeepsTheNewBatchsLease()
+    {
+        var host = new CountingHost();
+#pragma warning disable EWDELTA0001 // codec seam is experimental
+        await using var writer = new RollingDataFileWriter(
+            _fs, host, ParquetWriteOptions.Default, targetFileSize: long.MaxValue, partitionDirectory: "", written: null,
+            collectStats: false, statsSelection: null, tableAllowsShredding: false);
+#pragma warning restore EWDELTA0001
+        var (first, firstLease) = Leased(10);
+        var otherSchema = new Apache.Arrow.Schema.Builder().Field(new Field("w", Int64Type.Default, false)).Build();
+        var second = new RecordBatch(otherSchema, [new Int64Array.Builder().Append(1).Append(2).Build()], 2);
+        var secondLease = BatchLease.Of(second);
+
+        await writer.AddAsync(first, first, CancellationToken.None, firstLease);
+        firstLease.Dispose();
+        await writer.AddAsync(second, second, CancellationToken.None, secondLease);
+        secondLease.Dispose();
+
+        Assert.Equal(1, host.Files);          // the first file, closed by the layout change
+        Assert.True(firstLease.Released);
+        Assert.False(secondLease.Released);   // the open file's, still to be written
+
+        await writer.CompleteAsync(CancellationToken.None);
+        Assert.Equal(2, host.Files);
+        Assert.True(secondLease.Released);
+    }
+
     [Fact]
     public async Task AnAbandonedWrite_LetsGoOfItsLeases()
     {

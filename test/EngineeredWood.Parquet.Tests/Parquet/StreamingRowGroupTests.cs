@@ -524,6 +524,44 @@ public class StreamingRowGroupTests : IDisposable
         Assert.Equal(1, ParquetFileWriter.WithinBytes(1000, 0, 4.0, roundUp: true));
     }
 
+    /// <summary>
+    /// The entry point a file-rolling caller uses: one batch, taken a row group at a time from an offset, on one writer
+    /// and then on the next file's. Every row lands once, in order, nested and run-end encoded columns included.
+    /// </summary>
+    [Fact]
+    public async Task UntilRowGroup_FromAnOffset_ContinuesTheBatch_OnTheNextFilesWriterToo()
+    {
+        var options = new ParquetWriteOptions { RowGroupMaxRows = 1000 };
+        var batch = Batch(3_500, 12);
+
+        string first = NewPath(), second = NewPath();
+        int offset = 0;
+        await using (var writer = new ParquetFileWriter(new LocalSequentialFile(first), ownsFile: true, options))
+        {
+            offset += await writer.WriteBatchUntilRowGroupAsync(batch, offset);
+            Assert.Equal(1000, offset);
+            offset += await writer.WriteBatchUntilRowGroupAsync(batch, offset);
+            Assert.Equal(2000, offset);
+            await writer.CloseAsync();
+        }
+        await using (var writer = new ParquetFileWriter(new LocalSequentialFile(second), ownsFile: true, options))
+        {
+            offset += await writer.WriteBatchUntilRowGroupAsync(batch, offset);
+            Assert.Equal(3000, offset);
+            offset += await writer.WriteBatchUntilRowGroupAsync(batch, offset);
+            Assert.Equal(3500, offset);
+            Assert.Equal(500, writer.OpenRowGroupRows);
+            Assert.Equal(0, await writer.WriteBatchUntilRowGroupAsync(batch, offset));
+            await writer.CloseAsync();
+        }
+
+        var (firstMeta, firstRows) = await ReadAsync(first);
+        var (secondMeta, secondRows) = await ReadAsync(second);
+        Assert.Equal(new long[] { 1000, 1000 }, firstMeta.RowGroups.Select(g => g.NumRows));
+        Assert.Equal(new long[] { 1000, 500 }, secondMeta.RowGroups.Select(g => g.NumRows));
+        Assert.Equal(Rows([batch]), Rows(firstRows).Concat(Rows(secondRows)));
+    }
+
     [Fact]
     public async Task FlushRowGroup_CutsEarly_AndReportsWhatIsOpen()
     {
