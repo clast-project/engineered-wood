@@ -1516,6 +1516,11 @@ internal sealed class ColumnChunkWriter
 
         int openLevels = _openLevels;
         int take = Math.Min(end - offset, valuesPerPage - openLevels);
+        // A page cut by rows ends before its values fill the page: join only the levels that complete it, not the rest
+        // of the append, which would be copied and then written from the append itself. The count stops at the byte
+        // page's end, past which nothing is joined anyway (#944 review).
+        if (rowLimit is int rows)
+            take = LevelsForRows(segment.Rep, offset, offset + take, rows - _openRows);
         // One entry past the page, when there is one, so that the record alignment can see where the next record starts.
         int lookahead = offset + take < end ? 1 : 0;
         var joined = JoinOpen(segment, offset, take + lookahead, valueIndex, dictionary, ref cursor);
@@ -1531,6 +1536,24 @@ internal sealed class ColumnChunkWriter
         ClearOpenPage();
 
         AdvancePast(segment, ref offset, ref valueIndex, pageValues - openLevels, dictionary, ref cursor);
+    }
+
+    /// <summary>
+    /// The level entries from <paramref name="offset"/> that hold <paramref name="rows"/> whole records (at least one),
+    /// or all of them up to <paramref name="end"/> when there are fewer.
+    /// </summary>
+    private static int LevelsForRows(int[]? repLevels, int offset, int end, int rows)
+    {
+        if (repLevels is null)
+            return Math.Min(end - offset, rows);
+
+        int seen = 0;
+        for (int i = offset; i < end; i++)
+        {
+            if (repLevels[i] == 0 && ++seen > rows)
+                return i - offset;
+        }
+        return end - offset;
     }
 
     /// <summary>
