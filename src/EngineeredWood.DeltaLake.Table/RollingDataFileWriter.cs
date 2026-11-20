@@ -196,9 +196,11 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             // The whole batch and where to go on from, not the rest as a slice: the writer prepares only the rows each
             // call takes, so a batch spanning many row groups is not prepared again for every one (#939 review).
             int rows = await writer.WriteBatchUntilRowGroupAsync(writeBatch, offset, cancellationToken).ConfigureAwait(false);
-            Account(
-                rows == writeBatch.Length ? writeBatch : writeBatch.Slice(offset, rows),
-                rows == writeBatch.Length ? statsBatch : statsBatch.Slice(offset, rows));
+            // None when rows the writer held from earlier batches filled a row group first (#941).
+            if (rows > 0)
+                Account(
+                    rows == writeBatch.Length ? writeBatch : writeBatch.Slice(offset, rows),
+                    rows == writeBatch.Length ? statsBatch : statsBatch.Slice(offset, rows));
             offset += rows;
 
             // Only between row groups: the file holds its header from the first rows on.

@@ -12,7 +12,7 @@ namespace EngineeredWood.Parquet;
 /// <summary>
 /// Writes Arrow <see cref="RecordBatch"/> data to Parquet files.
 /// </summary>
-public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
+public sealed partial class ParquetFileWriter : IAsyncDisposable, IDisposable
 {
     private readonly ISequentialFile _file;
     private readonly bool _ownsFile;
@@ -136,6 +136,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             if (batch.Length > maxRows)
                 EnsureWholeBatchMatches(batch);
             await WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
+            await EncodeHeldAsync(cancellationToken).ConfigureAwait(false);
             await FlushOpenRowGroupAsync(cancellationToken).ConfigureAwait(false);
 
             // Auto-split large batches into multiple row groups
@@ -170,6 +171,13 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     /// the open pages and the dictionary pages at their uncompressed size. A batch that would overfill it is split:
     /// by rows exactly, and by bytes at the encoded bytes per row so far. <see cref="FlushRowGroupAsync"/> cuts one
     /// early, and <see cref="CloseAsync"/> writes the last.</para>
+    /// <para>A batch of fewer than 1,024 rows of flat columns (booleans, fixed-width values, strings and binaries) is
+    /// copied and held, and encoded together with the batches after it once there are 1,024 rows or so: encoding a
+    /// batch costs about the same whatever its length (#941). The held rows are in the open row group, and are written
+    /// as the same rows, row groups and statistics as batches encoded as they come (their pages may be cut at other
+    /// rows, as pages always may be by how rows arrive). A held batch is checked as it is held, so a refusal is
+    /// still this call's; a failure to encode it may be a later call's, and discards the open row group as any
+    /// encoding failure does.</para>
     /// <para>The batch is the caller's again once this returns: nothing of it is kept. The schema is captured from
     /// the first batch, as <see cref="WriteRowGroupAsync"/> does, and later batches must match it.</para>
     /// <para>If encoding fails, or the write is cancelled once the batch has rows in the open row group, the open row
@@ -184,7 +192,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// <see cref="WriteBatchAsync"/> of the rows of <paramref name="batch"/> from <paramref name="offset"/> on, stopping
-    /// once a row group has been written: returns the rows taken, all the rest unless a row group filled first. For a
+    /// once a row group has been written: returns the rows taken, all the rest unless a row group filled first. None
+    /// when rows held from earlier small batches filled one before any of this batch was taken. For a
     /// caller that cuts files between row groups, and so calls again with the same batch and a later offset, on this
     /// writer or the next file's.
     /// </summary>
@@ -203,6 +212,10 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         EnsureWritable();
         if (offset < 0 || offset > batch.Length)
             throw new ArgumentOutOfRangeException(nameof(offset));
+
+        // Nothing is held between the calls that take one batch, but rows held before it go first.
+        if (await EncodeHeldAsync(cancellationToken).ConfigureAwait(false))
+            return 0;
 
         // A writer the batch reaches past its first rows, the next file's after a rollover, decides its variant layout
         // from up to a row group of the rows it is about to take, as the rolling writer once did from each file's first
@@ -253,6 +266,21 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     {
         EnsureWritable();
         cancellationToken.ThrowIfCancellationRequested();
+
+        // A small batch is held, copied, and encoded with the next (#941). One that cannot be has the rows held before
+        // it encoded first; if they fill a row group, a caller stopping at one takes none of this batch yet.
+        if (batch.Length > 0)
+        {
+            if (TryHold(batch))
+                return batch.Length;
+            if (_held is { Rows: > 0 })
+            {
+                if (await EncodeHeldAsync(cancellationToken).ConfigureAwait(false) && stopAfterRowGroup)
+                    return 0;
+                if (TryHold(batch))
+                    return batch.Length;
+            }
+        }
 
         var source = batch;
         try
@@ -321,17 +349,20 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     public async ValueTask FlushRowGroupAsync(CancellationToken cancellationToken = default)
     {
         EnsureWritable();
+        await EncodeHeldAsync(cancellationToken).ConfigureAwait(false);
         await FlushOpenRowGroupAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>The rows <see cref="WriteBatchAsync"/> has added to the open row group: not yet in the file.</summary>
-    public long OpenRowGroupRows => _open?.Rows ?? 0;
+    /// <remarks>Rows of small batches held to be encoded together count: they are in the open row group.</remarks>
+    public long OpenRowGroupRows => (_open?.Rows ?? 0) + (_held?.Rows ?? 0);
 
     /// <summary>
     /// The estimated encoded size of the open row group, which is about what the writer holds for it: the pages
     /// written so far, and the open pages and dictionary pages at their uncompressed size.
     /// </summary>
-    public long OpenRowGroupBytes => _open?.EstimatedBytes() ?? 0;
+    /// <remarks>Rows of small batches held to be encoded together count at their Arrow size, which is what they take.</remarks>
+    public long OpenRowGroupBytes => (_open?.EstimatedBytes() ?? 0) + (_held?.Bytes ?? 0);
 
     private void EnsureWritable()
     {
@@ -646,6 +677,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     /// </summary>
     private void DiscardOpenRowGroup()
     {
+        _held?.Clear();
         if (_open is not { } open)
             return;
         _open = null;
@@ -1043,6 +1075,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         // The row group WriteBatchAsync was filling is the file's last. This also writes the header of a file with no
         // row groups, which is still a valid empty file.
         await WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
+        await EncodeHeldAsync(cancellationToken).ConfigureAwait(false);
         await FlushOpenRowGroupAsync(cancellationToken).ConfigureAwait(false);
 
         // The header is written before the first row group but the schema is captured during it, so a
