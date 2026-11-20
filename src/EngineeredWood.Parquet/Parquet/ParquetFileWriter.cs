@@ -237,7 +237,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         catch when (batchInOpenRowGroup)
         {
             // As in WriteBatchCoreAsync: rows of the batch in the open row group cannot be taken back out.
-            _open = null;
+            DiscardOpenRowGroup();
             throw;
         }
         finally
@@ -302,7 +302,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
                 // Cancelled or failed once rows of this batch were in the open row group: they cannot be taken back
                 // out, so the open row group goes, as when encoding fails (#936 decision 11). Rows of the batch in a
                 // row group already written stay in the file.
-                _open = null;
+                DiscardOpenRowGroup();
                 throw;
             }
 
@@ -433,17 +433,27 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         // in order on one thread, since a nested column is decomposed into all of them at once, and the
         // columns run in parallel.
         int arrowColumnCount = batch.ColumnCount;
+        var writers = new ColumnChunkWriter?[arrowColumnCount][];
         var perColumnLeaves = new ColumnChunkWriter.ColumnChunkResult[arrowColumnCount][];
 
-        Parallel.For(0, arrowColumnCount, i =>
+        try
         {
-            var writers = new ColumnChunkWriter?[1][];
-            AppendColumn(batch, i, writers, 0, bloomFilterExpectedValues: null, detach: false);
-            var results = new ColumnChunkWriter.ColumnChunkResult[writers[0].Length];
-            for (int l = 0; l < results.Length; l++)
-                results[l] = writers[0][l]!.Finish();
-            perColumnLeaves[i] = results;
-        });
+            Parallel.For(0, arrowColumnCount, i =>
+            {
+                AppendColumn(batch, i, writers, i, bloomFilterExpectedValues: null, detach: false);
+                var leafWriters = writers[i]!;
+                // Registered before the leaves finish: a leaf's writer gives up its pages to its result, so a later
+                // leaf's failure must still find the earlier results to release them (#942 review).
+                var results = perColumnLeaves[i] = new ColumnChunkWriter.ColumnChunkResult[leafWriters.Length];
+                for (int l = 0; l < results.Length; l++)
+                    results[l] = leafWriters[l]!.Finish();
+            });
+        }
+        catch
+        {
+            ReleasePages(writers, perColumnLeaves);
+            throw;
+        }
 
         await WriteChunksAsync(perColumnLeaves, batch.Length, cancellationToken).ConfigureAwait(false);
     }
@@ -562,7 +572,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         }
         catch
         {
-            _open = null;
+            DiscardOpenRowGroup();
             throw;
         }
 
@@ -577,14 +587,22 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         _open = null;
 
         var perColumnLeaves = new ColumnChunkWriter.ColumnChunkResult[open.Writers.Length][];
-        Parallel.For(0, open.Writers.Length, i =>
+        try
         {
-            var writers = open.Writers[i]!;
-            var results = new ColumnChunkWriter.ColumnChunkResult[writers.Length];
-            for (int l = 0; l < writers.Length; l++)
-                results[l] = writers[l]!.Finish();
-            perColumnLeaves[i] = results;
-        });
+            Parallel.For(0, open.Writers.Length, i =>
+            {
+                var writers = open.Writers[i]!;
+                // Registered first, as in WriteSingleRowGroupAsync: a later leaf's failure must find the finished ones.
+                var results = perColumnLeaves[i] = new ColumnChunkWriter.ColumnChunkResult[writers.Length];
+                for (int l = 0; l < writers.Length; l++)
+                    results[l] = writers[l]!.Finish();
+            });
+        }
+        catch
+        {
+            ReleasePages(open.Writers, perColumnLeaves);
+            throw;
+        }
 
         await WriteChunksAsync(perColumnLeaves, open.Rows, cancellationToken).ConfigureAwait(false);
     }
@@ -619,6 +637,43 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         {
             _fault = e;
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Drops the open row group, releasing the pages its writers hold (#936 decisions 2 and 11): an abandoned row
+    /// group's pages are released on the same paths as a written one's.
+    /// </summary>
+    private void DiscardOpenRowGroup()
+    {
+        if (_open is not { } open)
+            return;
+        _open = null;
+        ReleasePages(open.Writers, results: null);
+    }
+
+    /// <summary>
+    /// Releases the pages of a row group that will not be written: the chunks still in their writers, and the
+    /// results already finished. A writer's pages are its result's once it has finished, so none is released twice.
+    /// </summary>
+    private static void ReleasePages(ColumnChunkWriter?[]?[] writers, ColumnChunkWriter.ColumnChunkResult[]?[]? results)
+    {
+        foreach (var leaves in writers)
+        {
+            if (leaves is null)
+                continue;
+            foreach (var writer in leaves)
+                writer?.Discard();
+        }
+
+        if (results is null)
+            return;
+        foreach (var leaves in results)
+        {
+            if (leaves is null)
+                continue;
+            foreach (var result in leaves)
+                result.Release();
         }
     }
 
@@ -1047,6 +1102,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        DiscardOpenRowGroup();
 
         if (_ownsFile)
             await _file.DisposeAsync().ConfigureAwait(false);
@@ -1057,6 +1113,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        DiscardOpenRowGroup();
 
         if (_ownsFile)
             _file.Dispose();

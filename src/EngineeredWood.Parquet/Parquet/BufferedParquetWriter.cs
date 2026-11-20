@@ -203,37 +203,47 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         // Encode all columns into page bytes
         var columnResults = new ColumnChunkWriter.ColumnChunkResult[states.Length];
 
-        Parallel.For(0, states.Length, i =>
+        try
         {
-            var s = states[i];
-            if (dictResults[i] != null && !useNonDictionary[i])
+            Parallel.For(0, states.Length, i =>
             {
-                // Dictionary encoding: cardinality is within threshold
-                columnResults[i] = ColumnChunkWriter.WriteDictionaryColumnFromResult(
-                    dictResults[i]!.Value, s.LevelCount, s.NonNullCount, s.PathInSchema, s.PhysicalType,
-                    s.TypeLength, s.ArrowType,
-                    s.MaxDefLevel, s.MaxRepLevel, defLevelsPerColumn[i], repLevelsPerColumn[i], _options);
-            }
-            else if (dictResults[i] != null && useNonDictionary[i])
-            {
-                // Cardinality too high: reconstruct Arrow array from dictionary + indices
-                // and encode via the standard non-dictionary path (delta, BSS, plain, etc.)
-                var array = ReconstructArrowArray(s, dictResults[i]!.Value, pageLengths[i],
-                    PresenceLevels(s, defLevelsPerColumn[i]), s.LevelCount);
-                var options = overLimit[i] ? _options : _options with { DictionaryEnabled = false };
-                columnResults[i] = WriteLeaf(
-                    s, array, defLevelsPerColumn[i], repLevelsPerColumn[i], options);
-            }
-            else if (s.BooleanValues != null)
-            {
-                var boolArr = BuildBooleanArray(s);
-                columnResults[i] = WriteLeaf(s, boolArr, defLevelsPerColumn[i], repLevelsPerColumn[i], _options);
-            }
-            else
-            {
-                columnResults[i] = WriteValuelessColumn(s, defLevelsPerColumn[i], repLevelsPerColumn[i]);
-            }
-        });
+                var s = states[i];
+                if (dictResults[i] != null && !useNonDictionary[i])
+                {
+                    // Dictionary encoding: cardinality is within threshold
+                    columnResults[i] = ColumnChunkWriter.WriteDictionaryColumnFromResult(
+                        dictResults[i]!.Value, s.LevelCount, s.NonNullCount, s.PathInSchema, s.PhysicalType,
+                        s.TypeLength, s.ArrowType,
+                        s.MaxDefLevel, s.MaxRepLevel, defLevelsPerColumn[i], repLevelsPerColumn[i], _options);
+                }
+                else if (dictResults[i] != null && useNonDictionary[i])
+                {
+                    // Cardinality too high: reconstruct Arrow array from dictionary + indices
+                    // and encode via the standard non-dictionary path (delta, BSS, plain, etc.)
+                    var array = ReconstructArrowArray(s, dictResults[i]!.Value, pageLengths[i],
+                        PresenceLevels(s, defLevelsPerColumn[i]), s.LevelCount);
+                    var options = overLimit[i] ? _options : _options with { DictionaryEnabled = false };
+                    columnResults[i] = WriteLeaf(
+                        s, array, defLevelsPerColumn[i], repLevelsPerColumn[i], options);
+                }
+                else if (s.BooleanValues != null)
+                {
+                    var boolArr = BuildBooleanArray(s);
+                    columnResults[i] = WriteLeaf(s, boolArr, defLevelsPerColumn[i], repLevelsPerColumn[i], _options);
+                }
+                else
+                {
+                    columnResults[i] = WriteValuelessColumn(s, defLevelsPerColumn[i], repLevelsPerColumn[i]);
+                }
+            });
+        }
+        catch
+        {
+            // The chunks already encoded will not be written: release their pages (#936 decision 2).
+            foreach (var result in columnResults)
+                result.Release();
+            throw;
+        }
 
         await _assembler.WriteRowGroupAsync(columnResults, numRows, cancellationToken).ConfigureAwait(false);
 

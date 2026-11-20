@@ -115,7 +115,7 @@ public class ColumnChunkWriterTests
         var kept = InAppends(NewWriter, values, piece: 333, detach: false);
         var detached = InAppends(NewWriter, values, piece: 333, detach: true);
 
-        Assert.Equal(kept.PrefixData.ToArray(), detached.PrefixData.ToArray());
+        Assert.Equal(kept.Prefix?.ToArray() ?? [], detached.Prefix?.ToArray() ?? []);
         Assert.Equal(kept.Data.ToArray(), detached.Data.ToArray());
     }
 
@@ -176,14 +176,14 @@ public class ColumnChunkWriterTests
         var result = writer.Finish();
 
         Assert.True(result.DictionaryPageSize > 0);
-        Assert.Equal(result.DictionaryPageSize, result.PrefixData.Count);
+        Assert.Equal(result.DictionaryPageSize, result.PrefixLength);
 
         // The dictionary page is written last but placed first: the page index and encoding_stats see the
         // chunk in file order.
-        Assert.Equal(result.PrefixData.Count, result.PageIndex!.PageLocations[0].Offset);
+        Assert.Equal(result.PrefixLength, result.PageIndex!.PageLocations[0].Offset);
         Assert.Equal(PageType.DictionaryPage, result.MetaData.EncodingStats![0].PageType);
         Assert.Equal(
-            result.PrefixData.Count + result.Data.Count,
+            result.PrefixLength + result.Data.Length,
             result.MetaData.TotalCompressedSize);
     }
 
@@ -194,10 +194,10 @@ public class ColumnChunkWriterTests
         writer.AppendFlat(Ints(10_000, 10_000));
         var result = writer.Finish();
 
-        Assert.Equal(0, result.PrefixData.Count);
+        Assert.Equal(0, result.PrefixLength);
         Assert.Equal(0, result.DictionaryPageSize);
         Assert.Equal(0, result.PageIndex!.PageLocations[0].Offset);
-        Assert.Equal(result.Data.Count, result.MetaData.TotalCompressedSize);
+        Assert.Equal(result.Data.Length, result.MetaData.TotalCompressedSize);
     }
 
 #pragma warning disable EWPARQUET0003 // FSST is experimental; this test opts in on purpose.
@@ -214,8 +214,8 @@ public class ColumnChunkWriterTests
         var result = writer.Finish();
 
         Assert.True(result.SymbolTablePageSize > 0);
-        Assert.Equal(result.SymbolTablePageSize, result.PrefixData.Count);
-        Assert.Equal(result.PrefixData.Count, result.PageIndex!.PageLocations[0].Offset);
+        Assert.Equal(result.SymbolTablePageSize, result.PrefixLength);
+        Assert.Equal(result.PrefixLength, result.PageIndex!.PageLocations[0].Offset);
     }
 #pragma warning restore EWPARQUET0003
 
