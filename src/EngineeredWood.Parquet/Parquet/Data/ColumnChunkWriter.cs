@@ -1517,9 +1517,10 @@ internal sealed class ColumnChunkWriter
         int openLevels = _openLevels;
         int take = Math.Min(end - offset, valuesPerPage - openLevels);
         // A page cut by rows ends before its values fill the page: join only the levels that complete it, not the rest
-        // of the append, which would be copied and then written from the append itself.
+        // of the append, which would be copied and then written from the append itself. The count stops at the byte
+        // page's end, past which nothing is joined anyway (#944 review).
         if (rowLimit is int rows)
-            take = Math.Min(take, LevelsForRows(segment.Rep, offset, end, rows - _openRows));
+            take = LevelsForRows(segment.Rep, offset, offset + take, rows - _openRows);
         // One entry past the page, when there is one, so that the record alignment can see where the next record starts.
         int lookahead = offset + take < end ? 1 : 0;
         var joined = JoinOpen(segment, offset, take + lookahead, valueIndex, dictionary, ref cursor);
