@@ -7,6 +7,7 @@ using EngineeredWood.Compression;
 using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
+using EngineeredWood.Parquet.Data;
 using EngineeredWood.Parquet.Metadata;
 
 namespace EngineeredWood.Tests.Parquet;
@@ -275,6 +276,58 @@ public class StreamingRowGroupTests : IDisposable
         }
 
         Assert.Equal(File.ReadAllBytes(whole), File.ReadAllBytes(streamed));
+    }
+
+    /// <summary>
+    /// The sizes and counts in the footer of a streamed file are those of the pages in it: each chunk's compressed size
+    /// spans its pages exactly, its uncompressed size and value count are the sum of theirs, and each row group's totals
+    /// are its chunks' (#938 review). Row groups are cut by rows and by bytes, so chunks end mid-batch.
+    /// </summary>
+    [Theory]
+    [InlineData("default", long.MaxValue)]
+    [InlineData("default", 64_000)]
+    [InlineData("v1", long.MaxValue)]
+    [InlineData("dictsmall", 200_000)]
+    [InlineData("nodict", 100_000)]
+    [InlineData("nopageindex", long.MaxValue)]
+    [InlineData("bloom", 300_000)]
+    [InlineData("rowlimit", 50_000)]
+    public async Task FooterSizes_AreThoseOfThePagesWritten(string optionSet, long maxBytes)
+    {
+        var options = Options(optionSet) with { RowGroupMaxRows = 7_000, RowGroupMaxBytes = maxBytes };
+        string path = await WriteStreamedAsync(Pieces(Batch(20_000, 3), seed: 9), options);
+        byte[] bytes = File.ReadAllBytes(path);
+        var (metadata, _) = await ReadAsync(path);
+
+        Assert.True(metadata.RowGroups.Count > 2);
+        long previousEnd = 0;
+        foreach (var group in metadata.RowGroups)
+        {
+            long groupUncompressed = 0, groupCompressed = 0;
+            foreach (var chunk in group.Columns)
+            {
+                var md = chunk.MetaData!;
+                long start = Math.Min(md.DictionaryPageOffset ?? long.MaxValue, md.DataPageOffset);
+                Assert.True(start >= previousEnd, $"a chunk at {start} starts before the previous one ends at {previousEnd}");
+                long position = start, end = start + md.TotalCompressedSize, uncompressed = 0, values = 0;
+                while (position < end)
+                {
+                    var header = PageHeaderDecoder.Decode(bytes.AsSpan(checked((int)position)), out int headerLength);
+                    position += headerLength + header.CompressedPageSize;
+                    uncompressed += headerLength + header.UncompressedPageSize;
+                    values += header.DataPageHeader?.NumValues ?? header.DataPageHeaderV2?.NumValues ?? 0;
+                }
+                Assert.Equal(end, position);
+                Assert.Equal(md.TotalUncompressedSize, uncompressed);
+                Assert.Equal(md.NumValues, values);
+                groupUncompressed += md.TotalUncompressedSize;
+                groupCompressed += md.TotalCompressedSize;
+                previousEnd = end;
+            }
+            Assert.Equal(groupUncompressed, group.TotalByteSize);
+            if (group.TotalCompressedSize is { } total)
+                Assert.Equal(groupCompressed, total);
+        }
     }
 
     [Fact]

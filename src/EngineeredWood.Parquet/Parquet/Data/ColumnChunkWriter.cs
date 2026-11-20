@@ -178,6 +178,8 @@ internal sealed class ColumnChunkWriter
     /// pages if it is kept, in the column's own encoding if it is declined.
     /// </summary>
     private List<Segment>? _held;
+    /// <summary>How many of <see cref="_held"/>'s segments <see cref="Detach"/> has copied already.</summary>
+    private int _heldDetached;
     private long _heldLevels;
     private long _heldValues;
     private long _heldPlainBytes;
@@ -189,6 +191,8 @@ internal sealed class ColumnChunkWriter
     /// small batches cost what large ones do per value.
     /// </summary>
     private List<Segment>? _open;
+    /// <summary>How many of <see cref="_open"/>'s pieces <see cref="Detach"/> has copied already.</summary>
+    private int _openDetached;
     private int _openLevels;
     private int _openRows;
     private int _openNonNull;
@@ -611,6 +615,7 @@ internal sealed class ColumnChunkWriter
 
         var held = _held;
         _held = null;
+        _heldDetached = 0;
         _heldLevels = 0;
         _heldValues = 0;
         _heldPlainBytes = 0;
@@ -816,22 +821,26 @@ internal sealed class ColumnChunkWriter
             WriteHeld(kept);
         }
 
+        // Both lists only grow until they are let go, so only the segments added since the last call can still be
+        // borrowed. Walking the whole list each time made a run of one-row appends quadratic (#938 review).
         if (_held is not null)
         {
-            for (int i = 0; i < _held.Count; i++)
+            for (int i = _heldDetached; i < _held.Count; i++)
             {
                 if (_held[i].Borrowed)
                     _held[i] = _held[i].Copy(withArray: true, withIndices: true);
             }
+            _heldDetached = _held.Count;
         }
 
         if (_open is not null)
         {
-            for (int i = 0; i < _open.Count; i++)
+            for (int i = _openDetached; i < _open.Count; i++)
             {
                 if (_open[i].Borrowed)
                     _open[i] = _open[i].Copy(withArray: !_tailDictionary, withIndices: _tailDictionary);
             }
+            _openDetached = _open.Count;
         }
     }
 
@@ -1036,7 +1045,9 @@ internal sealed class ColumnChunkWriter
         _defEncoder = null;
         _repEncoder = null;
         _held = null;
+        _heldDetached = 0;
         _open = null;
+        _openDetached = 0;
         return result;
     }
 
@@ -1449,6 +1460,7 @@ internal sealed class ColumnChunkWriter
     private void ClearOpenPage()
     {
         _open = null;
+        _openDetached = 0;
         _openLevels = 0;
         _openRows = 0;
         _openNonNull = 0;
