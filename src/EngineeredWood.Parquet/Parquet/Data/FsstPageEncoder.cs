@@ -114,6 +114,34 @@ internal sealed class FsstCompressedColumn
         return new FsstCompressedColumn(table, payload, endOffsets);
     }
 #pragma warning restore EWPARQUET0003
+
+    /// <summary>
+    /// Compresses <paramref name="values"/> with a table already trained, for the later appends of a chunk whose first
+    /// trained it: FSST's escapes keep any value correct, whatever the table was trained on.
+    /// </summary>
+    public static FsstCompressedColumn Compress(FsstSymbolTable table, ReadOnlySpan<byte[]> values)
+    {
+        long rawBytes = 0;
+        foreach (var value in values)
+            rawBytes += value.Length;
+
+        long worstCase = table.MaxCompressedLength(rawBytes);
+        if (worstCase > MaxArrayLength)
+            throw new InvalidOperationException("An append's values exceed the largest array .NET can allocate.");
+
+        var payload = new byte[(int)worstCase];
+        var endOffsets = new int[values.Length + 1];
+        int written = 0;
+        for (int i = 0; i < values.Length; i++)
+        {
+            written += table.Compress(values[i], payload.AsSpan(written));
+            endOffsets[i + 1] = written;
+        }
+
+        if (written != payload.Length)
+            Array.Resize(ref payload, written);
+        return new FsstCompressedColumn(table, payload, endOffsets);
+    }
 }
 
 /// <summary>

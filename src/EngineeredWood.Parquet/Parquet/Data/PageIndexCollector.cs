@@ -45,10 +45,8 @@ internal sealed class PageIndexCollector
     private long _firstRowIndex;
 
     // The chunk's bounds, folded from the untruncated page bounds as the pages arrive, so the chunk
-    // statistics need not scan the values a second time. Strict comparisons keep the first of equal
-    // values, as the full scan does.
-    private byte[]? _chunkMin, _chunkMax, _minNaN, _maxNaN;
-    private long _chunkNanCount;
+    // statistics need not scan the values a second time.
+    private readonly BoundsFold _fold;
 
     /// <param name="writeColumnIndex">
     /// Whether the chunk may get a ColumnIndex at all; false for a column without statistics or of a
@@ -80,10 +78,19 @@ internal sealed class PageIndexCollector
         _utf8 = utf8;
         _floatingPoint = StatisticsCollector.IsFloatingPoint(physicalType, order);
         WritesColumnIndex = writeColumnIndex;
+        FoldsBounds = writeColumnIndex;
+        _fold = new BoundsFold(physicalType, order, floatingPointTotalOrder);
     }
 
-    /// <summary>Whether page bounds are needed: false once the chunk is known to get no ColumnIndex.</summary>
+    /// <summary>Whether the chunk still gets a ColumnIndex: false once it is known to get none.</summary>
     public bool WritesColumnIndex { get; private set; }
+
+    /// <summary>
+    /// Whether page bounds are needed: for the ColumnIndex, and for the chunk statistics folded from them. A chunk
+    /// that drops its ColumnIndex for an all-NaN page keeps folding, so that its statistics still cover every page
+    /// (a chunk of several appends has no other pass over the earlier ones).
+    /// </summary>
+    public bool FoldsBounds { get; }
 
     public bool FloatingPointTotalOrder { get; }
 
@@ -102,7 +109,7 @@ internal sealed class PageIndexCollector
     /// <param name="page">Where <see cref="ColumnChunkOutput.EmitPage(PageHeader, ReadOnlySpan{byte})"/> put it.</param>
     /// <param name="rows">Rows that start in the page. Every page starts a row, so this sums to the chunk's rows.</param>
     /// <param name="nullCount">Level entries in the page that hold no value.</param>
-    /// <param name="bounds">The page's bounds; ignored unless <see cref="WritesColumnIndex"/>.</param>
+    /// <param name="bounds">The page's bounds; ignored unless <see cref="FoldsBounds"/>.</param>
     /// <param name="unencodedBytes">
     /// The page's BYTE_ARRAY value bytes, length prefixes excluded; null unless
     /// <see cref="RecordsUnencodedBytes"/>.
@@ -120,20 +127,21 @@ internal sealed class PageIndexCollector
         if (unencodedBytes is { } bytes)
             (_unencodedBytes ??= new()).Add(bytes);
 
-        if (!WritesColumnIndex)
+        if (!FoldsBounds)
             return;
 
         bool nullPage = nonNullCount == 0;
-        if (!nullPage && bounds.Min is null)
+        if (!nullPage)
         {
             // Values but no bounds: every value is NaN under TYPE_ORDER. The format then requires the
-            // chunk to have no ColumnIndex at all, since no bound would be a valid one.
-            WritesColumnIndex = false;
-            return;
+            // chunk to have no ColumnIndex at all, since no bound would be a valid one. Its NaNs still count.
+            if (bounds.Min is null)
+                WritesColumnIndex = false;
+            _fold.Add(bounds);
         }
 
-        if (!nullPage)
-            Fold(bounds);
+        if (!WritesColumnIndex)
+            return;
 
         _nullPages.Add(nullPage);
         _mins.Add(nullPage ? [] : Truncate(LowerBound(bounds.Min!), max: false));
@@ -144,44 +152,21 @@ internal sealed class PageIndexCollector
     }
 
     /// <summary>
-    /// Whether <see cref="ChunkStatistics"/> will answer, so far, for a chunk of <paramref name="nonNullCount"/>
-    /// values: a ColumnIndex is still being kept and there is a value. A page written later can still turn it off.
+    /// Whether <see cref="ChunkStatistics"/> will answer for a chunk of <paramref name="nonNullCount"/> values:
+    /// the pages' bounds are folded and there is a value.
     /// </summary>
-    public bool HasChunkStatistics(int nonNullCount) => WritesColumnIndex && nonNullCount > 0;
+    public bool HasChunkStatistics(int nonNullCount) => FoldsBounds && nonNullCount > 0;
 
     /// <summary>
     /// The chunk statistics, from the page bounds, or null when they do not cover the chunk and the
-    /// caller must scan: no ColumnIndex (so no bounds were kept), or no values at all.
+    /// caller must scan: no bounds were kept, or there are no values at all.
     /// </summary>
     public Statistics? ChunkStatistics(int nonNullCount, int levelCount)
     {
         if (!HasChunkStatistics(nonNullCount))
             return null;
 
-        return StatisticsCollector.FromBounds(
-            _physicalType, _chunkMin, _chunkMax, _minNaN, _maxNaN, _chunkNanCount,
-            levelCount - nonNullCount, FloatingPointTotalOrder, _order);
-    }
-
-    private void Fold(in PageBounds bounds)
-    {
-        _chunkNanCount += bounds.NanCount;
-
-        // A NaN bound is an all-NaN page under total order, its smallest and largest NaN; they take part
-        // only if nothing else does, and then as the chunk's smallest and largest NaN.
-        if (_floatingPoint && IsNaN(bounds.Min!))
-        {
-            if (_minNaN is null || TotalOrderKey(bounds.Min!) < TotalOrderKey(_minNaN))
-                _minNaN = bounds.Min;
-            if (_maxNaN is null || TotalOrderKey(bounds.Max!) > TotalOrderKey(_maxNaN))
-                _maxNaN = bounds.Max;
-            return;
-        }
-
-        if (_chunkMin is null || Compare(bounds.Min!, _chunkMin) < 0)
-            _chunkMin = bounds.Min;
-        if (_chunkMax is null || Compare(bounds.Max!, _chunkMax) > 0)
-            _chunkMax = bounds.Max;
+        return _fold.ToStatistics(levelCount - nonNullCount);
     }
 
     /// <summary>The chunk's page index, with page offsets still relative to the chunk.</summary>
@@ -272,9 +257,55 @@ internal sealed class PageIndexCollector
     private byte[] UpperBound(byte[] max) =>
         _floatingPoint && !FloatingPointTotalOrder ? StatisticsCollector.TypeOrderUpperBound(max, _physicalType) : max;
 
-    private long TotalOrderKey(byte[] value) => StatisticsCollector.TotalOrderKey(value, _physicalType);
-
     private bool IsNaN(byte[] value) => StatisticsCollector.IsNaN(value, _physicalType);
+}
+
+/// <summary>
+/// The bounds of a set of values, folded from the bounds of its parts (pages for a page index, appends for a
+/// chunk's scanned statistics) into the statistics one scan of the whole would give.
+/// </summary>
+/// <remarks>
+/// Strict comparisons keep the first of equal values, as the full scan does. A part with values but no bounds (all
+/// NaN under TYPE_ORDER) adds only its NaN count.
+/// </remarks>
+internal sealed class BoundsFold(PhysicalType physicalType, StatisticsOrder order, bool floatingPointTotalOrder)
+{
+    private readonly bool _floatingPoint = StatisticsCollector.IsFloatingPoint(physicalType, order);
+    private byte[]? _min, _max, _minNaN, _maxNaN;
+    private long _nanCount;
+
+    public void Add(in PageBounds bounds)
+    {
+        _nanCount += bounds.NanCount;
+        if (bounds.Min is null)
+            return;
+
+        // A NaN bound is an all-NaN part under total order, its smallest and largest NaN; they take part
+        // only if nothing else does, and then as the smallest and largest NaN.
+        if (_floatingPoint && StatisticsCollector.IsNaN(bounds.Min, physicalType))
+        {
+            if (_minNaN is null || TotalOrderKey(bounds.Min) < TotalOrderKey(_minNaN))
+                _minNaN = bounds.Min;
+            if (_maxNaN is null || TotalOrderKey(bounds.Max!) > TotalOrderKey(_maxNaN))
+                _maxNaN = bounds.Max;
+            return;
+        }
+
+        if (_min is null || Compare(bounds.Min, _min) < 0)
+            _min = bounds.Min;
+        if (_max is null || Compare(bounds.Max!, _max) > 0)
+            _max = bounds.Max;
+    }
+
+    /// <summary>The statistics of a set with at least one value.</summary>
+    public Statistics ToStatistics(long nullCount) =>
+        StatisticsCollector.FromBounds(
+            physicalType, _min, _max, _minNaN, _maxNaN, _nanCount, nullCount, floatingPointTotalOrder, order);
+
+    private int Compare(byte[] left, byte[] right) =>
+        StatisticsCollector.CompareValues(left, right, physicalType, order);
+
+    private long TotalOrderKey(byte[] value) => StatisticsCollector.TotalOrderKey(value, physicalType);
 }
 
 /// <summary>
@@ -289,77 +320,65 @@ internal sealed class PageIndexCollector
 /// </remarks>
 internal sealed class DictionaryPageBounds
 {
-    private readonly byte[] _dictionary;
-    private readonly int[] _entryStart;
-    private readonly int[] _entryLength;
-    private readonly bool[]? _nanEntries;
+    private readonly DictionaryEncoder.IDictionaryEntries _entries;
     private readonly PhysicalType _physicalType;
     private readonly StatisticsOrder _order;
     private readonly bool _totalOrder;
+    private readonly bool _floatingPoint;
+
+    // Per entry, as far as the dictionary has been looked at: it can grow between pages.
+    private bool[]? _nanEntries;
+    private int _known;
 
     // _seen[entry] == _page marks an entry already compared for the current page, so a page costs
     // one comparison per distinct entry, not per value, and nothing has to be cleared between pages.
-    private readonly int[] _seen;
+    private int[] _seen = [];
     private int _page;
 
     private int _min, _max, _minNaN, _maxNaN;
     private long _nanCount;
 
     public DictionaryPageBounds(in DictionaryEncoder.DictionaryResult dictionary, PageIndexCollector collector)
+        : this(
+            new DictionaryEncoder.PageEntries(
+                dictionary.DictionaryPageData, dictionary.DictionaryCount, collector.PhysicalType, collector.TypeLength),
+            collector.PhysicalType, collector.Order, collector.FloatingPointTotalOrder)
     {
-        _dictionary = dictionary.DictionaryPageData;
-        _physicalType = collector.PhysicalType;
-        _order = collector.Order;
-        _totalOrder = collector.FloatingPointTotalOrder;
+    }
 
-        int count = dictionary.DictionaryCount;
-        _entryStart = new int[count];
-        _entryLength = new int[count];
-        _seen = new int[count];
-
-        if (_physicalType == PhysicalType.ByteArray)
-        {
-            // PLAIN BYTE_ARRAY: a 4-byte little-endian length before each entry.
-            int position = 0;
-            for (int i = 0; i < count; i++)
-            {
-                int length = BinaryPrimitives.ReadInt32LittleEndian(_dictionary.AsSpan(position));
-                _entryStart[i] = position + 4;
-                _entryLength[i] = length;
-                position += 4 + length;
-            }
-        }
-        else
-        {
-            int width = _physicalType switch
-            {
-                PhysicalType.Int32 or PhysicalType.Float => 4,
-                PhysicalType.Int64 or PhysicalType.Double => 8,
-                PhysicalType.Int96 => 12,
-                PhysicalType.Boolean => 1,
-                _ => collector.TypeLength,
-            };
-            for (int i = 0; i < count; i++)
-            {
-                _entryStart[i] = i * width;
-                _entryLength[i] = width;
-            }
-        }
-
-        if (StatisticsCollector.IsFloatingPoint(_physicalType, _order))
-        {
-            for (int i = 0; i < count; i++)
-            {
-                if (!StatisticsCollector.IsNaN(Entry(i), _physicalType)) continue;
-                _nanEntries ??= new bool[count];
-                _nanEntries[i] = true;
-            }
-        }
+    /// <param name="entries">The dictionary, which may gain entries between pages.</param>
+    public DictionaryPageBounds(
+        DictionaryEncoder.IDictionaryEntries entries, PhysicalType physicalType, StatisticsOrder order, bool totalOrder)
+    {
+        _entries = entries;
+        _physicalType = physicalType;
+        _order = order;
+        _totalOrder = totalOrder;
+        _floatingPoint = StatisticsCollector.IsFloatingPoint(physicalType, order);
     }
 
     /// <summary>Starts a new page.</summary>
     public void Begin()
     {
+        // The entries added since the last page, which this page's values may reference.
+        int count = _entries.Count;
+        if (count > _known)
+        {
+            if (_seen.Length < count)
+                System.Array.Resize(ref _seen, Math.Max(count, _seen.Length * 2));
+            if (_floatingPoint)
+            {
+                for (int i = _known; i < count; i++)
+                {
+                    if (!StatisticsCollector.IsNaN(Entry(i), _physicalType)) continue;
+                    if (_nanEntries is null || _nanEntries.Length < count)
+                        System.Array.Resize(ref _nanEntries, Math.Max(count, (_nanEntries?.Length ?? 0) * 2));
+                    _nanEntries[i] = true;
+                }
+            }
+            _known = count;
+        }
+
         _page++;
         _min = _max = _minNaN = _maxNaN = -1;
         _nanCount = 0;
@@ -368,7 +387,7 @@ internal sealed class DictionaryPageBounds
     /// <summary>Adds <paramref name="count"/> consecutive values that all reference <paramref name="entry"/>.</summary>
     public void Add(int entry, int count)
     {
-        if (_nanEntries is not null && _nanEntries[entry])
+        if (_nanEntries is not null && entry < _nanEntries.Length && _nanEntries[entry])
         {
             if (_totalOrder)
             {
@@ -415,7 +434,7 @@ internal sealed class DictionaryPageBounds
         return new PageBounds(null, null, _nanCount);
     }
 
-    private ReadOnlySpan<byte> Entry(int entry) => _dictionary.AsSpan(_entryStart[entry], _entryLength[entry]);
+    private ReadOnlySpan<byte> Entry(int entry) => _entries.Entry(entry);
 
     private int Compare(int left, int right) =>
         StatisticsCollector.CompareValues(Entry(left), Entry(right), _physicalType, _order);
