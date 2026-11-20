@@ -30,14 +30,13 @@ internal readonly record struct EmittedPage(int Offset, int Size, int? Ordinal);
 /// </remarks>
 internal sealed class ColumnChunkOutput
 {
-    private readonly MemoryStream _stream;
+    private readonly PageStore _pages = new SegmentedPageStore();
     private readonly bool _pageChecksumEnabled;
     private int _dataPageCount;
     private readonly List<PageEncodingStats> _encodingStats = new(2);
 
-    public ColumnChunkOutput(int initialCapacity, ParquetWriteOptions options)
+    public ColumnChunkOutput(ParquetWriteOptions options)
     {
-        _stream = new MemoryStream(initialCapacity);
         _pageChecksumEnabled = options.PageChecksumEnabled;
     }
 
@@ -55,17 +54,13 @@ internal sealed class ColumnChunkOutput
     public IReadOnlyList<PageEncodingStats> EncodingStats => _encodingStats;
 
     /// <summary>The number of bytes written so far.</summary>
-    public int Length => checked((int)_stream.Length);
+    public int Length => checked((int)_pages.Length);
 
-    /// <summary>The chunk's bytes so far.</summary>
-    public ArraySegment<byte> Data
-    {
-        get
-        {
-            _stream.TryGetBuffer(out var buffer);
-            return buffer;
-        }
-    }
+    /// <summary>
+    /// The chunk's pages so far. Whoever takes them for the file owns them from then on, and disposes them
+    /// whether or not they are written.
+    /// </summary>
+    public PageStore Pages => _pages;
 
     /// <summary>Writes a page whose payload is one contiguous span.</summary>
     public EmittedPage EmitPage(PageHeader header, ReadOnlySpan<byte> payload) =>
@@ -106,7 +101,7 @@ internal sealed class ColumnChunkOutput
         }
 
         byte[] headerBytes = MetadataEncoder.EncodePageHeader(header);
-        int offset = checked((int)_stream.Position);
+        int offset = Length;
 
         Write(headerBytes);
         Write(repetitionLevels);
@@ -148,18 +143,7 @@ internal sealed class ColumnChunkOutput
 
     private void Write(ReadOnlySpan<byte> bytes)
     {
-        if (bytes.IsEmpty)
-            return;
-
-#if NET8_0_OR_GREATER
-        _stream.Write(bytes);
-#else
-        // netstandard2.0's MemoryStream has no span overload. Growing the stream and copying into its
-        // buffer avoids staging the bytes in an array first.
-        int position = checked((int)_stream.Position);
-        _stream.SetLength(position + bytes.Length);
-        bytes.CopyTo(_stream.GetBuffer().AsSpan(position));
-        _stream.Position = position + bytes.Length;
-#endif
+        if (!bytes.IsEmpty)
+            _pages.Write(bytes);
     }
 }

@@ -57,9 +57,27 @@ internal sealed class ParquetFileAssembler
 
     /// <summary>
     /// Writes one row group's encoded column chunks, each followed by its bloom filter if it has one,
-    /// and records the row group for the footer. The chunks must be in schema leaf order.
+    /// and records the row group for the footer. The chunks must be in schema leaf order. Every chunk's
+    /// pages are released, whether this succeeds or not.
     /// </summary>
     public async ValueTask WriteRowGroupAsync(
+        IReadOnlyList<ColumnChunkWriter.ColumnChunkResult> chunks,
+        long numRows,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await WriteChunksAsync(chunks, numRows, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Released as each is written; this covers the ones a failure left behind. Releasing twice is harmless.
+            foreach (var chunk in chunks)
+                chunk.Release();
+        }
+    }
+
+    private async ValueTask WriteChunksAsync(
         IReadOnlyList<ColumnChunkWriter.ColumnChunkResult> chunks,
         long numRows,
         CancellationToken cancellationToken)
@@ -73,9 +91,10 @@ internal sealed class ParquetFileAssembler
             var result = chunks[i];
             long chunkStart = _file.Position;
 
-            if (result.PrefixData.Count > 0)
-                await _file.WriteAsync(result.PrefixData, cancellationToken).ConfigureAwait(false);
-            await _file.WriteAsync(result.Data, cancellationToken).ConfigureAwait(false);
+            if (result.Prefix is { } prefix)
+                await prefix.CopyToAsync(_file, cancellationToken).ConfigureAwait(false);
+            await result.Data.CopyToAsync(_file, cancellationToken).ConfigureAwait(false);
+            result.Release();
 
             // A dictionary page or an FSST symbol table page precedes the data pages; a chunk
             // has at most one of the two, since FSST is a non-dictionary encoding.
