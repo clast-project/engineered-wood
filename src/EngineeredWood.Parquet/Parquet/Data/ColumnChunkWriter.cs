@@ -213,6 +213,71 @@ internal sealed class ColumnChunkWriter
     /// <summary>Whether <see cref="_open"/> is a dictionary-encoded page.</summary>
     private bool _tailDictionary;
 
+    // ───── Scratch reused from append to append (#940) ─────
+    //
+    // An append's own arrays — its definition levels, dictionary indices and narrowed decimals — are referenced only
+    // by its segments, which are Borrowed: Detach copies whatever of them the chunk keeps, as it copies the caller's
+    // arrays. After a Detach nothing refers to them, so the next append writes over them rather than allocating
+    // arrays of a batch's size that the large object heap frees only at a gen2 collection. An append that follows
+    // another without a Detach allocates them, as before. The scratch is released with the chunk.
+
+    /// <summary>Whether <see cref="Detach"/> has run since the last append: the per-append scratch is then free.</summary>
+    private bool _appendDetached = true;
+
+    /// <summary>Whether this append has taken <see cref="_narrowScratch"/> already (a nested column narrows once per leaf array).</summary>
+    private bool _narrowLent;
+
+    private int[]? _defScratch;
+    private int[]? _indexScratch;
+    private byte[]? _narrowScratch;
+
+    // The joined open page (JoinOpen) lives only until it is emitted, so its arrays are reused from page to page.
+    private int[]? _joinDef, _joinRep, _joinValueDef, _joinIndices;
+
+    /// <summary><paramref name="scratch"/>, grown to at least <paramref name="count"/> entries.</summary>
+    private static int[] Grow(ref int[]? scratch, int count)
+    {
+        if (scratch is null || scratch.Length < count)
+            scratch = new int[Math.Max(count, scratch is null ? 0 : Math.Min(int.MaxValue / 2, scratch.Length * 2))];
+        return scratch;
+    }
+
+    /// <summary>
+    /// A zeroed array of exactly <paramref name="count"/> definition levels: the fill helpers read its length, and the
+    /// run-end encoded one writes only the levels that hold a value.
+    /// </summary>
+    private int[] DefScratch(int count)
+    {
+        if (!_appendDetached)
+            return new int[count];
+        if (_defScratch is null || _defScratch.Length != count)
+            _defScratch = new int[count];
+        else
+            _defScratch.AsSpan().Clear();
+        return _defScratch;
+    }
+
+    private int[]? IndexScratch(int count) =>
+        _appendDetached && count > 0 ? Grow(ref _indexScratch, count) : null;
+
+    private byte[]? NarrowScratch(int bytes)
+    {
+        if (!_appendDetached || _narrowLent)
+            return null;
+        _narrowLent = true;
+        if (_narrowScratch is null || _narrowScratch.Length < bytes)
+            _narrowScratch = new byte[Math.Max(bytes, _narrowScratch is null ? 0 : _narrowScratch.Length * 2)];
+        return _narrowScratch;
+    }
+
+    private void ReleaseScratch()
+    {
+        _defScratch = null;
+        _indexScratch = null;
+        _narrowScratch = null;
+        _joinDef = _joinRep = _joinValueDef = _joinIndices = null;
+    }
+
     /// <summary>
     /// The chunk's FSST symbol table: trained on the first values the chunk writes in its own encoding (retried on later
     /// appends while FSST declines and less than <see cref="DictionaryEncoder.FirstPageBytes"/> has been tried), and
@@ -370,7 +435,7 @@ internal sealed class ColumnChunkWriter
 
         if (_maxDefLevel > 0)
         {
-            defLevels = new int[rowCount];
+            defLevels = DefScratch(rowCount);
 
             if (array is RunEndEncodedArray ree)
             {
@@ -474,7 +539,8 @@ internal sealed class ColumnChunkWriter
             && DecimalNarrowing.IsWideDecimal(ValueType(array)))
         {
             var target = DecimalNarrowing.EncodingType(ValueType(array), physicalType);
-            array = MapValues(array, a => DecimalNarrowing.ToInteger(a, target));
+            int width = target is Decimal32Type ? 4 : 8;
+            array = MapValues(array, a => DecimalNarrowing.ToInteger(a, target, NarrowScratch(a.Length * width)));
         }
 
         // An Arrow timestamp promoted to the extended-precision carrier becomes twelve little-endian bytes
@@ -539,6 +605,8 @@ internal sealed class ColumnChunkWriter
         // does not keep the array alive, so without this the buffers of a caller-built array can be finalized
         // mid-encode. See doc/arrow-span-lifetime.md.
         GC.KeepAlive(array);
+        _appendDetached = false;
+        _narrowLent = false;
     }
 
     /// <summary>
@@ -548,11 +616,11 @@ internal sealed class ColumnChunkWriter
     private void AppendToDictionary(Segment segment)
     {
         var dictionary = _dictionary!;
-        var feed = dictionary.Feed(segment.Array!, segment.ValueDef, segment.NonNull);
+        var feed = dictionary.Feed(segment.Array!, segment.ValueDef, segment.NonNull, IndexScratch(segment.NonNull));
         if (feed.Outcome == DictionaryEncoder.DictionaryFeed.UseRows)
         {
             segment.Array = RunEndEncoding.Expand((RunEndEncodedArray)segment.Array!);
-            feed = dictionary.Feed(segment.Array, segment.ValueDef, segment.NonNull);
+            feed = dictionary.Feed(segment.Array, segment.ValueDef, segment.NonNull, IndexScratch(segment.NonNull));
         }
 
         segment.Indices = feed.Indices;
@@ -870,6 +938,8 @@ internal sealed class ColumnChunkWriter
             }
             _openDetached = _open.Count;
         }
+
+        _appendDetached = true;
     }
 
     /// <summary>
@@ -1072,6 +1142,7 @@ internal sealed class ColumnChunkWriter
         _heldDetached = 0;
         _open = null;
         _openDetached = 0;
+        ReleaseScratch();
         return result;
     }
 
@@ -1093,7 +1164,9 @@ internal sealed class ColumnChunkWriter
         _prefix?.Pages.Dispose();
         _output = null;
         _prefix = null;
+        ReleaseScratch();
     }
+
 
     // ───── Pages ─────
 
@@ -1514,14 +1587,14 @@ internal sealed class ColumnChunkWriter
             End = total,
             ValueStart = 0,
             NonNull = _openNonNull + nextNonNull,
-            Def = _maxDefLevel > 0 ? new int[total] : null,
-            Rep = _maxRepLevel > 0 ? new int[total] : null,
+            Def = _maxDefLevel > 0 ? Grow(ref _joinDef, total) : null,
+            Rep = _maxRepLevel > 0 ? Grow(ref _joinRep, total) : null,
         };
         joined.ValueDef = _maxDefLevel switch
         {
             0 => null,
             1 => joined.Def,
-            _ => new int[total],
+            _ => Grow(ref _joinValueDef, total),
         };
 
         int position = 0;
@@ -1535,7 +1608,7 @@ internal sealed class ColumnChunkWriter
 
         if (dictionary)
         {
-            var indices = new int[joined.NonNull];
+            var indices = Grow(ref _joinIndices, joined.NonNull);
             int value = 0;
             foreach (var piece in pieces)
             {
@@ -1558,12 +1631,13 @@ internal sealed class ColumnChunkWriter
         }
         else
         {
+            // The parts are slices and the concatenation copies them once (#940).
             var parts = new List<IArrowArray>(pieces.Count + 1);
             foreach (var piece in pieces)
-                parts.Add(TakeRows(piece.Array!, piece.Start, piece.Levels));
+                parts.Add(SliceRows(piece.Array!, piece.Start, piece.Levels));
             if (segment is not null)
-                parts.Add(TakeRows(segment.Array!, offset, levels));
-            joined.Array = parts.Count == 1 ? parts[0] : ArrowCompute.Concatenate(parts);
+                parts.Add(SliceRows(segment.Array!, offset, levels));
+            joined.Array = parts.Count == 1 ? TakeRows(parts[0], 0, parts[0].Length) : ArrowCompute.Concatenate(parts);
         }
 
         return joined;
@@ -1588,6 +1662,9 @@ internal sealed class ColumnChunkWriter
         second.AsSpan(secondStart, secondLength).CopyTo(joined.AsSpan(firstLength));
         return joined;
     }
+
+    private static IArrowArray SliceRows(IArrowArray array, int start, int length) =>
+        start == 0 && length == array.Length ? array : ArrowArrayFactory.BuildArray(array.Data.Slice(start, length));
 
     /// <summary>A copy of rows [<paramref name="start"/>, +<paramref name="length"/>) of an array, at offset 0.</summary>
     private static IArrowArray TakeRows(IArrowArray array, int start, int length)
