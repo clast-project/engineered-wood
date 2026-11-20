@@ -568,6 +568,43 @@ public class HeldBatchTests : IDisposable
         Assert.Equal(65 + 65, held.Bytes); // 513 value bits and 513 validity bits
     }
 
+    /// <summary>
+    /// A column whose null count is declared unknown (a negative <see cref="ArrayData.NullCount"/>) keeps its nulls
+    /// when held, and is sized with its bitmap (#945 review): <see cref="IArrowArray.NullCount"/> counts them then.
+    /// </summary>
+    [Fact]
+    public async Task AnUnknownNullCount_IsCounted_AndTheNullsAreHeld()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("i", Int32Type.Default, nullable: true))
+            .Field(new Field("s", StringType.Default, nullable: true))
+            .Build();
+        RecordBatch Unknown(RecordBatch batch) => new(schema,
+            Enumerable.Range(0, batch.ColumnCount).Select(c =>
+            {
+                var d = batch.Column(c).Data;
+                return ArrowArrayFactory.BuildArray(new ArrayData(d.DataType, d.Length, -1, d.Offset, d.Buffers));
+            }).ToList(),
+            batch.Length);
+
+        var ints = new Int32Array.Builder().Append(1).AppendNull().Append(3).AppendNull().Append(5).Build();
+        var strings = new StringArray.Builder().Append("a").Append("b").AppendNull().AppendNull().Append("e").Build();
+        var whole = new RecordBatch(schema, [ints, strings], 5);
+        var pieces = new[] { Unknown(whole.Slice(0, 2)), Unknown(whole.Slice(2, 3)) };
+        Assert.Equal(-1, pieces[0].Column(0).Data.NullCount);
+        Assert.Equal(-1, pieces[1].Column(1).Data.NullCount);
+        Assert.Equal(1, pieces[0].Column(0).NullCount);
+        Assert.Equal(2, pieces[1].Column(1).NullCount);
+
+        var held = HeldRows.For(pieces[0])!;
+        long bytes = held.BytesFor(pieces[0]);
+        Assert.Equal(2 * 4 + 1 + (2 + 4 * 2), bytes); // ints and their validity; strings ("a", "b": no nulls) and offsets
+
+        string path = await WriteAsync(pieces, new ParquetWriteOptions(), hold: true);
+        var (_, rows) = await ReadAsync(path);
+        Assert.Equal(Rows(whole), rows);
+    }
+
     [Fact]
     public async Task DisposingWithRowsHeld_WritesNothingOfThem()
     {
