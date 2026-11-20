@@ -10,20 +10,40 @@ public sealed partial class ParquetFileWriter
 {
     /// <summary>
     /// A batch of fewer rows than this is held (<see cref="HeldRows"/>), and the held rows are encoded together once
-    /// there would be more.
+    /// there would be more than <see cref="HeldRowsLimit"/>.
     /// </summary>
     /// <remarks>
-    /// MEASURED (24 cores, the #652 lineitem shape, 16 columns, ZSTD, 200,000 rows): one-row batches took 3.8 s
-    /// appended one at a time, and about 0.2 s held. Encoding 1,024 rows together costs about what a batch of 1,024
-    /// does, and their copies a few hundredths of a microsecond a cell. 1,024 is also <see cref="ProbeRows"/>: held
-    /// rows at the start of a file are encoded as the probe they would be cut to anyway.
+    /// MEASURED (24 cores, the #652 lineitem shape, 16 columns, ZSTD, best of 7): one-row batches of 200,000 rows
+    /// took 4.3 s appended one at a time, and about 0.2 s held. A held batch pays off only when others are encoded
+    /// with it: holding batches under 4,096 rows, 4,000-row batches were 8% slower than unheld, copied and then
+    /// encoded alone, since two pass <see cref="HeldBytesLimit"/>. Under 2,048, at least two lineitem batches fit
+    /// in it (four in <see cref="HeldRowsLimit"/>): 1,024-row batches took 161 ms a million rows held and 209 ms
+    /// not, and no batch size was slower than unheld.
     /// </remarks>
-    internal const int HoldRows = 1_024;
+    internal const int HoldRows = 2_048;
+
+    /// <summary>
+    /// The most rows held before they are encoded, unless <see cref="HeldBytesLimit"/> stops them first; at the start
+    /// of a file, <see cref="ProbeRows"/>.
+    /// </summary>
+    /// <remarks>
+    /// MEASURED (as <see cref="HoldRows"/>): encoding up to the byte limit (about 6,000 lineitem rows) rather than
+    /// 1,024 rows at a time took 10-row batches from 81 to 65 ms per 200,000 rows, 100-row from 64 to 47, and
+    /// 1,000-row from 61 to 45. The row count bounds a narrow schema, which 1 MiB would let hold far more rows: an
+    /// encoding failure surfaces at most this many rows after the batch that caused it.
+    /// </remarks>
+    internal const int HeldRowsLimit = 8_192;
 
     /// <summary>
     /// Batches of fewer rows than this are held: <see cref="HoldRows"/>, or 0 to hold none, which tests compare against.
     /// </summary>
     internal int HoldBelowRows { get; set; } = HoldRows;
+
+    /// <summary>The most rows held before they are encoded: <see cref="HeldRowsLimit"/>, which tests can lower.</summary>
+    internal int HoldUpToRows { get; set; } = HeldRowsLimit;
+
+    /// <summary>The rows held: for tests.</summary>
+    internal int HeldRowCount => _held?.Rows ?? 0;
 
     /// <summary>The bytes of the buffers rows are held in: for tests.</summary>
     internal long HeldBufferBytes => _held?.BufferBytes ?? 0;
@@ -58,13 +78,16 @@ public sealed partial class ParquetFileWriter
         if (batch.Length == 0 || batch.Length >= HoldBelowRows)
             return false;
 
+        // Until something says how large a row encodes, no more than the probe a batch would be cut to: the held rows
+        // are encoded whole, and the probe bounds how far the first rows of a file overshoot RowGroupMaxBytes.
         int heldRows = _held?.Rows ?? 0;
-        if (heldRows + batch.Length > HoldBelowRows)
+        long openRows = _open?.Rows ?? 0;
+        int limit = openRows == 0 && _lastBytesPerRow is null ? Math.Min(ProbeRows, HoldUpToRows) : HoldUpToRows;
+        if (heldRows + batch.Length > limit)
             return false;
 
         // A batch that fills the open row group by rows is encoded as it comes, so the row group is cut, and written,
         // by the call that fills it.
-        long openRows = _open?.Rows ?? 0;
         if (openRows + heldRows + batch.Length >= _options.RowGroupMaxRows)
             return false;
 

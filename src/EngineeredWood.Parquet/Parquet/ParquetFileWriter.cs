@@ -173,9 +173,10 @@ public sealed partial class ParquetFileWriter : IAsyncDisposable, IDisposable
     /// the open pages and the dictionary pages at their uncompressed size. A batch that would overfill it is split:
     /// by rows exactly, and by bytes at the encoded bytes per row so far. <see cref="FlushRowGroupAsync"/> cuts one
     /// early, and <see cref="CloseAsync"/> writes the last.</para>
-    /// <para>A batch of fewer than 1,024 rows of flat columns (booleans, fixed-width values, strings and binaries) is
-    /// copied and held, and encoded together with the batches after it once there are 1,024 rows or so: encoding a
-    /// batch costs about the same whatever its length (#941). The held rows are in the open row group, and are written
+    /// <para>A batch of fewer than 2,048 rows of flat columns (booleans, fixed-width values, strings and binaries) is
+    /// copied and held, and encoded together with the batches after it once there would be more than 8,192 rows or
+    /// 1 MiB held (1,024 rows at the start of a file): encoding a batch costs about the same whatever its length
+    /// (#941). The held rows are in the open row group, and are written
     /// as the same rows, row groups and statistics as batches encoded as they come (their pages may be cut at other
     /// rows, as pages always may be by how rows arrive). A held batch is checked as it is held, so a refusal is
     /// still this call's; a failure to encode it may be a later call's, and discards the open row group as any
