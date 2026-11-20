@@ -616,7 +616,11 @@ internal sealed class ColumnChunkWriter
     private void AppendToDictionary(Segment segment)
     {
         var dictionary = _dictionary!;
-        var feed = dictionary.Feed(segment.Array!, segment.ValueDef, segment.NonNull, IndexScratch(segment.NonNull));
+        // A run-end encoded append is fed in run form and takes no per-row indices, so it is lent no scratch: growing
+        // one here would make the run arm per-row in allocation (#943 review). Its UseRows fallback below takes one.
+        var feed = dictionary.Feed(
+            segment.Array!, segment.ValueDef, segment.NonNull,
+            segment.Array is RunEndEncodedArray ? null : IndexScratch(segment.NonNull));
         if (feed.Outcome == DictionaryEncoder.DictionaryFeed.UseRows)
         {
             segment.Array = RunEndEncoding.Expand((RunEndEncodedArray)segment.Array!);

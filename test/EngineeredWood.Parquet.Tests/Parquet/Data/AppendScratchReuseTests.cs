@@ -152,6 +152,35 @@ public class AppendScratchReuseTests
         GC.KeepAlive(array);
     }
 
+#if NET6_0_OR_GREATER
+    /// <summary>
+    /// A run-end encoded append is fed in run form, O(runs) in allocation: it must not take a per-row index scratch it
+    /// never uses (#943 review). A 1M-row single-run column would grow a 4 MB one.
+    /// </summary>
+    /// <remarks>.NET Framework has no per-thread allocation counter, so the pin runs on the modern targets only.</remarks>
+    [Fact]
+    public void RunEndEncodedAppend_TakesNoPerRowIndexScratch()
+    {
+        const int rows = 1_000_000;
+        var ends = new Int32Array.Builder().Append(rows).Build();
+        var values = new StringArray.Builder().Append("update_postimage").Build();
+        var array = new RunEndEncodedArray(ends, values);
+        ColumnChunkWriter NewWriter() =>
+            new(Path, PhysicalType.ByteArray, 0, maxDefLevel: 0, maxRepLevel: 0, ParquetWriteOptions.Default);
+
+        NewWriter().AppendFlat(array);
+
+        var writer = NewWriter();
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        writer.AppendFlat(array);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(allocated < 1024 * 1024,
+            $"Appending a 1,000,000-row single-run column allocated {allocated:N0} bytes.");
+        GC.KeepAlive(array);
+    }
+#endif
+
     private static ColumnChunkWriter.ColumnChunkResult InAppends(
         Func<ColumnChunkWriter> newWriter, IArrowArray values, bool varyingSizes, bool detach, int piece = 777)
     {
