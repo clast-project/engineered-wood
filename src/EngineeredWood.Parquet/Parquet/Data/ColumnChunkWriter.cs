@@ -243,18 +243,19 @@ internal sealed class ColumnChunkWriter
     }
 
     /// <summary>
-    /// A zeroed array of exactly <paramref name="count"/> definition levels: the fill helpers read its length, and the
-    /// run-end encoded one writes only the levels that hold a value.
+    /// An array of at least <paramref name="count"/> definition levels whose first <paramref name="count"/> are zero:
+    /// the run-end encoded fill writes only the levels that hold a value. It is reused by capacity, so batches of
+    /// varying size share it (#943 review); every reader takes the levels by range.
     /// </summary>
     private int[] DefScratch(int count)
     {
         if (!_appendDetached)
             return new int[count];
-        if (_defScratch is null || _defScratch.Length != count)
-            _defScratch = new int[count];
-        else
-            _defScratch.AsSpan().Clear();
-        return _defScratch;
+        bool reused = _defScratch is not null && _defScratch.Length >= count;
+        var levels = Grow(ref _defScratch, count);
+        if (reused)
+            levels.AsSpan(0, count).Clear();
+        return levels;
     }
 
     private int[]? IndexScratch(int count) =>
@@ -443,7 +444,7 @@ internal sealed class ColumnChunkWriter
             }
             else if (array is Apache.Arrow.Array plain)
             {
-                nonNullCount = FillDefLevelsFromValidity(plain, defLevels);
+                nonNullCount = FillDefLevelsFromValidity(plain, defLevels.AsSpan(0, rowCount));
             }
             else
             {
@@ -466,12 +467,12 @@ internal sealed class ColumnChunkWriter
     /// as <see cref="Apache.Arrow.Array.IsNull"/> row by row, which reads the bitmap only when the array
     /// has a null and a bitmap, and otherwise reports every row valid. Returns the non-null count.
     /// </summary>
-    private static int FillDefLevelsFromValidity(Apache.Arrow.Array array, int[] defLevels)
+    private static int FillDefLevelsFromValidity(Apache.Arrow.Array array, Span<int> defLevels)
     {
         var bitmap = array.NullBitmapBuffer.Span;
         if (array.NullCount == 0 || bitmap.IsEmpty)
         {
-            defLevels.AsSpan().Fill(1);
+            defLevels.Fill(1);
             return defLevels.Length;
         }
 
@@ -1641,7 +1642,10 @@ internal sealed class ColumnChunkWriter
                 parts.Add(SliceRows(piece.Array!, piece.Start, piece.Levels));
             if (segment is not null)
                 parts.Add(SliceRows(segment.Array!, offset, levels));
-            joined.Array = parts.Count == 1 ? TakeRows(parts[0], 0, parts[0].Length) : ArrowCompute.Concatenate(parts);
+            // The encoders read buffers from slot 0, so the result is never left a slice: Concatenate passes a lone
+            // non-empty input through as it is (#943 review).
+            var array = parts.Count == 1 ? parts[0] : ArrowCompute.Concatenate(parts);
+            joined.Array = TakeRows(array, 0, array.Length);
         }
 
         return joined;

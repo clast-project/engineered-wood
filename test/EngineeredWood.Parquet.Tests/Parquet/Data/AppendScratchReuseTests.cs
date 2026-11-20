@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Arrays;
 using Apache.Arrow.Types;
 using EngineeredWood.Parquet;
 using EngineeredWood.Parquet.Data;
@@ -80,16 +81,19 @@ public class AppendScratchReuseTests
     /// one length, so each reuses the last one's array, and their null runs fall in different places.
     /// </summary>
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void RunEndEncodedNullableAppends_ReuseZeroedLevels(bool dictionary)
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public void RunEndEncodedNullableAppends_ReuseZeroedLevels(bool dictionary, bool varyingLengths)
     {
-        const int appendLength = 1000;
+        // Varying lengths reuse a longer array, of which only the used prefix is cleared.
         var options = ParquetWriteOptions.Default with { DataPageSize = 4096, DictionaryEnabled = dictionary };
         var random = new Random(940);
         var appends = new List<RunEndEncodedArray>();
         for (int a = 0; a < 100; a++)
         {
+            int appendLength = varyingLengths ? 1 + random.Next(2000) : 1000;
             var ends = new Int32Array.Builder();
             var values = new StringArray.Builder();
             for (int end = 0; end < appendLength;)
@@ -178,6 +182,140 @@ public class AppendScratchReuseTests
         Assert.True(allocated < 1024 * 1024,
             $"Appending a 1,000,000-row single-run column allocated {allocated:N0} bytes.");
         GC.KeepAlive(array);
+    }
+#endif
+
+    /// <summary>
+    /// The non-dictionary join concatenates slices of the open page's pieces, and the encoders read a page's buffers from
+    /// slot 0. Small appends against a page write what one append writes, for fixed-width columns with nulls, where the
+    /// page cut does not depend on the append (#943 review). Unlike the reuse tests above, the oracle is not the join.
+    /// </summary>
+    [Theory]
+    [InlineData("double")]
+    [InlineData("decimal")]
+    [InlineData("fixed")]
+    [InlineData("boolean")]
+    public void NonDictionaryJoins_WriteWhatOneAppendWrites(string kind)
+    {
+        const int rows = 100_000;
+        var random = new Random(943);
+        IArrowArray values;
+        PhysicalType physicalType;
+        int typeLength = 0;
+        switch (kind)
+        {
+            case "double":
+            {
+                var builder = new DoubleArray.Builder();
+                for (int i = 0; i < rows; i++)
+                {
+                    if (random.Next(6) == 0) builder.AppendNull(); else builder.Append(random.NextDouble());
+                }
+                (values, physicalType) = (builder.Build(), PhysicalType.Double);
+                break;
+            }
+            case "decimal":
+            {
+                var builder = new Decimal128Array.Builder(new Decimal128Type(18, 2));
+                for (int i = 0; i < rows; i++)
+                {
+                    if (random.Next(6) == 0) builder.AppendNull(); else builder.Append((decimal)random.Next() / 100m);
+                }
+                (values, physicalType) = (builder.Build(), PhysicalType.Int64);
+                break;
+            }
+            case "fixed":
+            {
+                var bytes = new byte[rows * 16];
+                random.NextBytes(bytes);
+                var validity = new ArrowBuffer.BitmapBuilder(rows);
+                int nulls = 0;
+                for (int i = 0; i < rows; i++)
+                {
+                    bool valid = random.Next(6) != 0;
+                    validity.Append(valid);
+                    nulls += valid ? 0 : 1;
+                }
+                values = new FixedSizeBinaryArray(new ArrayData(
+                    new FixedSizeBinaryType(16), rows, nulls, 0, [validity.Build(), new ArrowBuffer(bytes)]));
+                (physicalType, typeLength) = (PhysicalType.FixedLenByteArray, 16);
+                break;
+            }
+            default:
+            {
+                var builder = new BooleanArray.Builder();
+                for (int i = 0; i < rows; i++)
+                {
+                    if (random.Next(6) == 0) builder.AppendNull(); else builder.Append(random.Next(2) == 0);
+                }
+                (values, physicalType) = (builder.Build(), PhysicalType.Boolean);
+                break;
+            }
+        }
+
+        var options = ParquetWriteOptions.Default with { DictionaryEnabled = false, DataPageSize = 4096 };
+        ColumnChunkWriter NewWriter() =>
+            new(Path, physicalType, typeLength, maxDefLevel: 1, maxRepLevel: 0, options);
+
+        var whole = NewWriter();
+        whole.AppendFlat(values);
+        var oneAppend = whole.Finish();
+        var appended = InAppends(NewWriter, values, varyingSizes: true, detach: true);
+
+        Assert.True(oneAppend.PageIndex!.PageLocations.Count > 10, $"{oneAppend.PageIndex.PageLocations.Count} pages");
+        Assert.Equal(oneAppend.Data.ToArray(), appended.Data.ToArray());
+        GC.KeepAlive(values);
+    }
+
+#if NET6_0_OR_GREATER
+    /// <summary>
+    /// Batches of varying size share one definition-level array, reused by capacity (#943 review): alternating sizes
+    /// allocate about what one size does, where an array reused only at the same length was allocated every time. The
+    /// column is dictionary-encoded, so its open-page join reuses scratch too: a non-dictionary join concatenates Arrow
+    /// arrays, whose cost itself varies with how pages and appends line up.
+    /// </summary>
+    /// <remarks>.NET Framework has no per-thread allocation counter, so the pin runs on the modern targets only.</remarks>
+    [Fact]
+    public void VaryingBatchSizes_ReuseOneDefinitionLevelArray()
+    {
+        var options = ParquetWriteOptions.Default;
+        Int32Array Values(int count)
+        {
+            var builder = new Int32Array.Builder();
+            for (int i = 0; i < count; i++)
+            {
+                if (i % 5 == 0) builder.AppendNull(); else builder.Append(i % 100);
+            }
+            return builder.Build();
+        }
+        var full = Values(50_000);
+        var shorter = Values(49_999);
+
+        long Allocated(bool alternate)
+        {
+            var writer = new ColumnChunkWriter(Path, PhysicalType.Int32, 0, maxDefLevel: 1, maxRepLevel: 0, options);
+            writer.AppendFlat(full);
+            writer.Detach();
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 40; i++)
+            {
+                writer.AppendFlat(alternate && i % 2 == 1 ? shorter : full);
+                writer.Detach();
+            }
+            return GC.GetAllocatedBytesForCurrentThread() - before;
+        }
+
+        Allocated(alternate: true);
+        long same = Allocated(alternate: false);
+        long alternating = Allocated(alternate: true);
+
+        // Reallocating at every change of size adds forty 200 KB arrays, about 8 MB: measured 11.1 MB more than one
+        // size, against 3.3 MB reused by capacity. That 3.3 MB is Detach copying the open page's tail, whose length
+        // depends on how appends line up with pages; it was there before.
+        Assert.True(alternating - same < 6 * 1024 * 1024,
+            $"Alternating batch sizes allocated {alternating:N0} bytes against {same:N0} for one size.");
+        GC.KeepAlive(full);
+        GC.KeepAlive(shorter);
     }
 #endif
 
