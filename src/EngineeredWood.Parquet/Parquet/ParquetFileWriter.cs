@@ -527,14 +527,6 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             perColumnLeaves[i] = results;
         });
 
-        long bytes = 0;
-        foreach (var leaves in perColumnLeaves)
-        {
-            foreach (var leaf in leaves)
-                bytes += leaf.MetaData.TotalCompressedSize;
-        }
-        _lastBytesPerRow = (double)bytes / open.Rows;
-
         await WriteChunksAsync(perColumnLeaves, open.Rows, cancellationToken).ConfigureAwait(false);
     }
 
@@ -547,8 +539,17 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     {
         // Flatten results in schema order
         var allLeafResults = new List<ColumnChunkWriter.ColumnChunkResult>();
+        long bytes = 0;
         foreach (var results in perColumnLeaves)
+        {
             allLeafResults.AddRange(results);
+            foreach (var leaf in results)
+                bytes += leaf.MetaData.TotalCompressedSize;
+        }
+
+        // Streamed or written whole, the latest row group is the best measure for cutting the next batch (#938 review).
+        if (rows > 0)
+            _lastBytesPerRow = (double)bytes / rows;
 
         // Written sequentially, since each chunk's offsets depend on the one before it.
         try

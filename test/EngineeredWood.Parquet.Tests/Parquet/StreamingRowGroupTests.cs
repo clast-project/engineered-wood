@@ -310,6 +310,47 @@ public class StreamingRowGroupTests : IDisposable
             Assert.True((await reader.GetCandidateRowGroupsAsync("v", value))[0], $"{value} not in the Bloom filter");
     }
 
+    /// <summary>
+    /// The FLOAT/DOUBLE case of the fallback above. The frozen dictionary cannot stand in for the earlier appends'
+    /// values there, since the NaN count counts values, not entries; those appends were scanned as they were encoded,
+    /// with or without a page index to fold their pages (#938 review).
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task DoubleDictionaryThatFillsInALaterBatch_KeepsTheEarlierBatchesStatistics(bool pageIndex)
+    {
+        var options = new ParquetWriteOptions
+        {
+            DictionaryPageSizeLimit = 1024,
+            RowGroupMaxRows = int.MaxValue,
+            WritePageIndex = pageIndex,
+        };
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("v", DoubleType.Default, nullable: false)).Build();
+        var batches = new List<RecordBatch>();
+        for (int b = 0; b < 30; b++)
+        {
+            var early = new DoubleArray.Builder();
+            for (int i = 0; i < 10_000; i++)
+                early.Append(i % 20 == 19 ? double.NaN : 1.5 + i % 20);
+            batches.Add(new RecordBatch(schema, [early.Build()], 10_000));
+        }
+        var late = new DoubleArray.Builder();
+        for (int i = 0; i < 300_000; i++)
+            late.Append(-5.0 - i);
+        batches.Add(new RecordBatch(schema, [late.Build()], 300_000));
+
+        string path = await WriteStreamedAsync(batches, options);
+        var (metadata, read) = await ReadAsync(path);
+        var chunk = metadata.RowGroups[0].Columns[0].MetaData!;
+
+        Assert.Contains(Encoding.RleDictionary, chunk.Encodings);
+        Assert.Equal(1.5 + 18, BitConverter.ToDouble(chunk.Statistics!.MaxValue!, 0));
+        Assert.Equal(-5.0 - 299_999, BitConverter.ToDouble(chunk.Statistics.MinValue!, 0));
+        Assert.Equal(30 * 500, chunk.Statistics.NanCount);
+        Assert.Equal(600_000, read.Sum(b => b.Length));
+    }
+
     private static Int32Array Int32Range(int start, int count, Func<int, int> value)
     {
         var builder = new Int32Array.Builder();
@@ -472,6 +513,45 @@ public class StreamingRowGroupTests : IDisposable
         var (metadata, read) = await ReadAsync(path);
         Assert.Equal(new long[] { 300, 300, 300 }, metadata.RowGroups.Select(g => g.NumRows));
         Assert.Equal(Rows([batch]), Rows(read));
+    }
+
+    /// <summary>
+    /// A row group written whole is the latest measure of encoded bytes per row, so the next batch is cut by it rather
+    /// than by an older streamed row group's (#938 review). Here that older one is a constant column of a few bytes in
+    /// all; by its measure the next batch would fit whole in a row group many times the byte limit.
+    /// </summary>
+    [Fact]
+    public async Task WriteRowGroup_UpdatesTheBytesPerRow_TheNextBatchIsCutBy()
+    {
+        var options = new ParquetWriteOptions { RowGroupMaxRows = int.MaxValue, RowGroupMaxBytes = 64 << 10 };
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("v", Int64Type.Default, nullable: false)).Build();
+        var random = new Random(17);
+        RecordBatch Random64(int rows)
+        {
+            var builder = new Int64Array.Builder();
+            for (int i = 0; i < rows; i++)
+                builder.Append(((long)random.Next() << 32) | (uint)random.Next());
+            return new RecordBatch(schema, [builder.Build()], rows);
+        }
+        var constant = new Int64Array.Builder();
+        for (int i = 0; i < 100_000; i++)
+            constant.Append(7);
+
+        string path = NewPath();
+        await using (var writer = new ParquetFileWriter(new LocalSequentialFile(path), ownsFile: true, options))
+        {
+            await writer.WriteBatchAsync(new RecordBatch(schema, [constant.Build()], 100_000));
+            await writer.FlushRowGroupAsync();
+            await writer.WriteRowGroupAsync(Random64(10_000));
+            await writer.WriteBatchAsync(Random64(50_000));
+            await writer.CloseAsync();
+        }
+
+        var (metadata, read) = await ReadAsync(path);
+        Assert.Equal(160_000, read.Sum(b => b.Length));
+        var streamed = metadata.RowGroups.Skip(2).ToList();
+        Assert.True(streamed.Count >= 5, $"row groups of {string.Join(", ", metadata.RowGroups.Select(g => g.NumRows))} rows");
+        Assert.All(streamed, g => Assert.True(g.TotalCompressedSize < 2 * options.RowGroupMaxBytes, $"{g.TotalCompressedSize} bytes"));
     }
 
     [Fact]
