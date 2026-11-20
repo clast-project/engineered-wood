@@ -386,7 +386,7 @@ internal static class CompactionExecutor
         var materializedPartition = MaterializedPartitionValues(snapshot, group[0], mappingMode);
 
         // The live rows stream straight into the output (#572). The rolling writer joins consecutive batches into
-        // row groups of up to RowGroupMaxRows rows / RowGroupMaxBytes, however the sources were cut, and closes a
+        // row groups of up to RowGroupMaxRows rows / RowGroupMaxBytes (estimated encoded), however the sources were cut, and closes a
         // file once its ACTUAL size reaches the target. Writing one row group per source batch carried every
         // source file's row groups over unchanged, and cutting files by a bytes-per-row estimate from the sources
         // went wrong whenever they were heavily deleted or encoded differently. Under a host writer the batches

@@ -9,9 +9,11 @@ using EngineeredWood.Parquet;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// When a writer lets go of a batch handed to it under a lease (#860): once the row group holding the batch's last row
-/// is written, not before, and on abandon. The end-to-end tests (<see cref="CompactionRawReleaseTests"/>) measure what is
-/// left once an operation is over, which an abandon at the end would also satisfy; these pin the release to the write.
+/// When a writer lets go of a batch handed to it under a lease (#860). Under the built-in Parquet writer, as soon as the
+/// batch is written: its rows are encoded into the open row group's pages as they arrive, and the writer keeps nothing
+/// of the batch (#936). Under a host writer, once the host has written the file, and on abandon. The end-to-end tests
+/// (<see cref="CompactionRawReleaseTests"/>) measure what is left once an operation is over, which an abandon at the end
+/// would also satisfy; these pin the release to the write.
 /// </summary>
 public class RollingDataFileWriterLeaseTests : IDisposable
 {
@@ -34,40 +36,39 @@ public class RollingDataFileWriterLeaseTests : IDisposable
     }
 
     [Fact]
-    public async Task ALease_IsHeldUntilTheRowGroupHoldingItsLastRowIsWritten()
+    public async Task ALease_IsReleasedOnceItsBatchIsWritten_ThoughItsRowGroupIsStillOpen()
     {
         await using var writer = Writer(rowGroupRows: 100);
         var (a, aLease) = Leased(60);
         var (b, bLease) = Leased(60);
 
+        // A's rows are in the open row group's pages, not in A.
         await writer.AddAsync(a, a, CancellationToken.None, aLease);
         aLease.Dispose();
-        Assert.False(aLease.Released); // pending
+        Assert.True(aLease.Released);
 
-        // B's first 40 rows fill the row group with A's 60; its last 20 are still pending.
+        // B's first 40 rows fill the row group with A's 60; its last 20 open the next.
         await writer.AddAsync(b, b, CancellationToken.None, bLease);
         bLease.Dispose();
-        Assert.True(aLease.Released);
-        Assert.False(bLease.Released);
-
-        await writer.CompleteAsync(CancellationToken.None);
         Assert.True(bLease.Released);
+
+        var files = await writer.CompleteAsync(CancellationToken.None);
+        Assert.Equal(120, Assert.Single(files).Rows);
     }
 
     [Fact]
-    public async Task ALeaseOverSeveralSlices_IsHeldUntilTheLastIsWritten()
+    public async Task ALeaseOverSeveralSlices_IsReleasedOnceTheLastIsWritten()
     {
         await using var writer = Writer(rowGroupRows: 100);
         var (parent, lease) = Leased(160);
 
         await writer.AddAsync(parent.Slice(0, 80), parent.Slice(0, 80), CancellationToken.None, lease);
-        // The first slice is written with the second's first 20 rows; the second's last 60 are pending.
         await writer.AddAsync(parent.Slice(80, 80), parent.Slice(80, 80), CancellationToken.None, lease);
+        Assert.False(lease.Released); // the caller's own hold
         lease.Dispose();
-        Assert.False(lease.Released);
+        Assert.True(lease.Released);
 
         await writer.CompleteAsync(CancellationToken.None);
-        Assert.True(lease.Released);
     }
 
     [Fact]
@@ -110,8 +111,13 @@ public class RollingDataFileWriterLeaseTests : IDisposable
     [Fact]
     public async Task AnAbandonedWrite_LetsGoOfItsLeases()
     {
+        // A host writer holds the file's batches until it writes them; abandoned, it never does.
         var (batch, lease) = Leased(20);
-        await using (var writer = Writer(rowGroupRows: 100))
+#pragma warning disable EWDELTA0001 // codec seam is experimental
+        await using (var writer = new RollingDataFileWriter(
+            _fs, new CountingHost(), ParquetWriteOptions.Default, targetFileSize: long.MaxValue, partitionDirectory: "",
+            written: null, collectStats: false, statsSelection: null, tableAllowsShredding: false))
+#pragma warning restore EWDELTA0001
         {
             await writer.AddAsync(batch, batch, CancellationToken.None, lease);
             lease.Dispose();

@@ -23,11 +23,10 @@ namespace EngineeredWood.DeltaLake.Table.ChangeDataFeed;
 /// <c>_change_type</c>, and every reader (Spark's <c>table_changes</c>, delta-rs, engineered-wood's own feed) reads
 /// a file of mixed types.</para>
 ///
-/// <para>Rows are held only until a row group fills. Across partitions the held bytes (counting the whole batch a
-/// held slice keeps alive) are capped at one row group's worth (<see cref="ParquetWriteOptions.RowGroupMaxBytes"/>):
-/// past it, the partition holding the most is written out as a row group, so an UPDATE moving rows across many
-/// partitions cannot buffer a row group for each. One partition alone may hold more, as a lone data writer does: the
-/// batch it keeps alive is one the caller held anyway.</para>
+/// <para>Each partition holds its open row group, as encoded pages (#936), until it fills. Across partitions what they
+/// hold is capped at one row group's worth (<see cref="ParquetWriteOptions.RowGroupMaxBytes"/>, an estimate of the
+/// encoded size): past it, the partition holding the most is written out as a row group, so an UPDATE moving rows
+/// across many partitions cannot hold a row group for each.</para>
 ///
 /// <para>At most <see cref="DefaultMaxOpenFiles"/> files are open at once: each holds a stream, and a cloud stream
 /// holds an upload buffer (4 MiB on Azure). Opening one more closes the least recently used, and that partition's
