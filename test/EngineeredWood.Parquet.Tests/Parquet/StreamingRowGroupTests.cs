@@ -639,13 +639,61 @@ public class StreamingRowGroupTests : IDisposable
         await writer.DisposeAsync();
     }
 
+    /// <summary>
+    /// A footer write that fails leaves the file without its end. The writer was marked closed before the footer was
+    /// written, so a second CloseAsync returned as if the file were finished (#938 review); it must throw.
+    /// </summary>
+    [Fact]
+    public async Task FailedFooterWrite_PoisonsTheWriter_InsteadOfClosingIt()
+    {
+        var file = new FailingFile(failAfterBytes: long.MaxValue);
+        var writer = new ParquetFileWriter(file, ownsFile: false);
+        await writer.WriteRowGroupAsync(Batch(100, 13));
+
+        file.Failing = true;
+        await Assert.ThrowsAsync<IOException>(async () => await writer.CloseAsync());
+
+        file.Failing = false;
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await writer.CloseAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await writer.WriteBatchAsync(Batch(10, 14)));
+        await writer.DisposeAsync();
+    }
+
+    /// <summary>
+    /// A column of nulls has no values to count: while its dictionary is undecided, only its levels are held. They
+    /// count toward the byte limit, so such a row group is cut by bytes like any other (#938 review).
+    /// </summary>
+    [Fact]
+    public async Task AllNullColumn_TakesPartInTheByteCut()
+    {
+        var options = new ParquetWriteOptions { RowGroupMaxRows = int.MaxValue, RowGroupMaxBytes = 64 << 10 };
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("v", Int64Type.Default, nullable: true)).Build();
+        var batches = new List<RecordBatch>();
+        for (int b = 0; b < 100; b++)
+        {
+            var builder = new Int64Array.Builder();
+            for (int i = 0; i < 10_000; i++)
+                builder.AppendNull();
+            batches.Add(new RecordBatch(schema, [builder.Build()], 10_000));
+        }
+
+        string path = await WriteStreamedAsync(batches, options);
+        var (metadata, read) = await ReadAsync(path);
+
+        Assert.Equal(1_000_000, read.Sum(b => b.Length));
+        Assert.True(metadata.RowGroups.Count >= 3, $"{metadata.RowGroups.Count} row groups of {string.Join(", ", metadata.RowGroups.Select(g => g.NumRows))} rows");
+    }
+
     private sealed class FailingFile(long failAfterBytes) : ISequentialFile
     {
         public long Position { get; private set; }
 
+        /// <summary>Whether every write fails from now on.</summary>
+        public bool Failing { get; set; }
+
         public ValueTask WriteAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
         {
-            if (Position + data.Length > failAfterBytes)
+            if (Failing || Position + data.Length > failAfterBytes)
                 throw new IOException("The disk is full.");
             Position += data.Length;
             return default;

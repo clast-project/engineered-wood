@@ -26,8 +26,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     private bool _disposed;
 
     /// <summary>
-    /// Set when writing a row group's bytes to the file failed partway: the file holds part of a row group, so
-    /// nothing more can be written to it (#936 decision 11).
+    /// Set when a write to the file failed partway (its header, a row group, or the footer): the file holds part of
+    /// it, so nothing more can be written to it, and it cannot be closed (#936 decision 11).
     /// </summary>
     private Exception? _fault;
 
@@ -135,7 +135,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             int maxRows = _options.RowGroupMaxRows;
             if (batch.Length > maxRows)
                 EnsureWholeBatchMatches(batch);
-            await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
+            await WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
             await FlushOpenRowGroupAsync(cancellationToken).ConfigureAwait(false);
 
             // Auto-split large batches into multiple row groups
@@ -175,8 +175,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     /// <para>If encoding fails, or the write is cancelled once the batch has rows in the open row group, the open row
     /// group is discarded, including the rows of earlier batches in it, and the writer stays usable: nothing of that
     /// row group reaches the file (rows of the batch in a row group already written stay). A batch refused before encoding (a
-    /// schema mismatch, a null in a required column) leaves the open row group as it was. If writing a row group to
-    /// the file fails, the writer is unusable afterwards.</para>
+    /// schema mismatch, a null in a required column) leaves the open row group as it was. If writing to the file fails
+    /// (a row group, or in <see cref="CloseAsync"/> the footer), the writer is unusable afterwards.</para>
     /// </remarks>
     /// <exception cref="ArgumentException">As for <see cref="WriteRowGroupAsync"/>.</exception>
     public async ValueTask WriteBatchAsync(RecordBatch batch, CancellationToken cancellationToken = default) =>
@@ -214,7 +214,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             if (firstRows < batch.Length)
                 EnsureWholeBatchMatches(batch);
 
-            await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
+            await WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
 
             int offset = 0;
             bool batchInOpenRowGroup = false;
@@ -284,7 +284,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         if (_closed)
             throw new InvalidOperationException("Writer has been closed.");
         if (_fault is not null)
-            throw new InvalidOperationException("An earlier row group failed partway into the file; the writer can take no more.", _fault);
+            throw new InvalidOperationException("An earlier write failed partway into the file; the writer can take no more.", _fault);
     }
 
     /// <summary>
@@ -923,16 +923,12 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         if (_closed)
             return;
         if (_fault is not null)
-            throw new InvalidOperationException("An earlier row group failed partway into the file; it cannot be closed.", _fault);
+            throw new InvalidOperationException("An earlier write failed partway into the file; it cannot be closed.", _fault);
 
-        // The row group WriteBatchAsync was filling is the file's last.
-        await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
+        // The row group WriteBatchAsync was filling is the file's last. This also writes the header of a file with no
+        // row groups, which is still a valid empty file.
+        await WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
         await FlushOpenRowGroupAsync(cancellationToken).ConfigureAwait(false);
-
-        _closed = true;
-
-        // If no row groups were written, still write a valid empty file
-        await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
 
         // The header is written before the first row group but the schema is captured during it, so a
         // row group that throws leaves this null. Falling back here keeps dispose from replacing that
@@ -948,8 +944,38 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
         _parquetSchema ??= [new SchemaElement { Name = "schema", NumChildren = 0 }];
 
-        await _assembler.WriteFooterAsync(_parquetSchema, _declaredSchema, cancellationToken)
-            .ConfigureAwait(false);
+        // Closed only once the footer is written. One that failed, or was cancelled, partway has left bytes of it in the
+        // file, which cannot be taken back: the writer is poisoned, and a second CloseAsync throws rather than
+        // returning as if the file were finished (#938 review).
+        try
+        {
+            await _assembler.WriteFooterAsync(_parquetSchema, _declaredSchema, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            _fault ??= e;
+            throw;
+        }
+
+        _closed = true;
+    }
+
+    /// <summary>
+    /// Writes the file's header, once. A failure here, like one writing a row group or the footer, leaves the file
+    /// part-written, so the writer takes nothing more.
+    /// </summary>
+    private async ValueTask WriteHeaderAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            _fault ??= e;
+            throw;
+        }
     }
 
     /// <summary>

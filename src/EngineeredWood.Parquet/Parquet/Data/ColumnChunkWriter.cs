@@ -838,18 +838,23 @@ internal sealed class ColumnChunkWriter
     /// <summary>
     /// The chunk's size as it would be written now, estimated without encoding anything more: the pages written,
     /// and the dictionary page, open page and held values at their uncompressed size. Values an undecided dictionary
-    /// holds count at the smaller of their two encodings, since its test keeps the smaller.
+    /// holds count at the smaller of their two encodings, since its test keeps the smaller. Levels not yet in a page,
+    /// open or held, count a quarter byte each, generously: without them a column of nulls estimated at nothing while
+    /// its dictionary held up to <see cref="HeldLevelLimit"/> of them, and never took part in a byte cut (#938 review).
     /// </summary>
     public long EstimatedSize
     {
         get
         {
             long size = (_output?.Length ?? 0) + (_prefix?.Length ?? 0);
+            bool hasLevels = _maxDefLevel > 0 || _maxRepLevel > 0;
             if (_held is not null)
             {
                 long dictionaryEncoded = _dictionary!.ByteCount
                     + (_heldValues * DictionaryEncoder.GetIndexBitWidth(_dictionary.Count) + 7) / 8;
                 size += Math.Min(_heldPlainBytes, dictionaryEncoded);
+                if (hasLevels)
+                    size += _heldLevels / 4;
             }
             else if (_dictionary is { Declined: false } dictionary)
             {
@@ -860,7 +865,8 @@ internal sealed class ColumnChunkWriter
                 size += _tailDictionary
                     ? ((long)_openNonNull * DictionaryEncoder.GetIndexBitWidth(DictionaryCount) + 7) / 8
                     : TailPlainBytes(_openNonNull);
-                size += _openLevels / 4; // levels, generously
+                if (hasLevels)
+                    size += _openLevels / 4;
             }
             return size;
         }
