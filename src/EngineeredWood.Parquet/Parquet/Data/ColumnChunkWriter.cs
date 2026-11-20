@@ -762,7 +762,7 @@ internal sealed class ColumnChunkWriter
             Indices = dictResult.Indices,
             Runs = dictResult.IndexRuns,
             Borrowed = true,
-        }, levelCount);
+        }, levelCount, scan: false); // no values to scan: Finish takes the statistics from the dictionary and indices
     }
 
     /// <summary>

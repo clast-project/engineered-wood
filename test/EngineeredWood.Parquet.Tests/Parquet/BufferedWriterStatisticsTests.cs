@@ -121,10 +121,15 @@ public class BufferedWriterStatisticsTests : IDisposable
     // nan_count counts VALUES, not distinct values — so it cannot come from the dictionary entries, where
     // every NaN collapses to one. Deriving it from the indices is the whole reason floating point is a
     // separate arm; this is the assertion that a dictionary-entry count, which would say 1, fails.
+    // With the page index off as well: then nothing folds page bounds, and the chunk's statistics must still come
+    // from the dictionary and its indices, since an append that arrives already encoded has no values to scan (#938
+    // review).
     [Theory]
-    [InlineData(FloatingPointCase.Double)]
-    [InlineData(FloatingPointCase.Float)]
-    public async Task FloatingPointColumn_CountsEveryNaNRow_NotEveryNaNEntry(FloatingPointCase which)
+    [InlineData(FloatingPointCase.Double, true)]
+    [InlineData(FloatingPointCase.Float, true)]
+    [InlineData(FloatingPointCase.Double, false)]
+    [InlineData(FloatingPointCase.Float, false)]
+    public async Task FloatingPointColumn_CountsEveryNaNRow_NotEveryNaNEntry(FloatingPointCase which, bool pageIndex)
     {
         const int rows = 200;
         int expectedNaN = 0;
@@ -154,7 +159,8 @@ public class BufferedWriterStatisticsTests : IDisposable
         }
 
         var batch = new RecordBatch(schema, [column], rows);
-        var (direct, buffered) = await WriteBothAsync($"nan_{which}", batch, DefaultOptions);
+        var (direct, buffered) = await WriteBothAsync(
+            $"nan_{which}_{pageIndex}", batch, DefaultOptions with { WritePageIndex = pageIndex });
 
         Assert.True(expectedNaN > 1, "the data must repeat NaN, or the test cannot tell the two counts apart");
         Assert.Equal(expectedNaN, buffered[0]!.NanCount);
