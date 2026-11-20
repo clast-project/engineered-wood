@@ -165,68 +165,65 @@ public class TargetFileSizeTests : IDisposable
 
     /// <summary>
     /// One batch larger than <see cref="ParquetWriteOptions.RowGroupMaxBytes"/> is cut at the byte budget too, as
-    /// smaller batches of the same rows would be, rather than becoming one oversized row group.
+    /// smaller batches of the same rows would be, rather than becoming one oversized row group. The budget counts
+    /// encoded bytes, as the Parquet writer estimates them (#936).
     /// </summary>
     [Fact]
     public async Task ABatchOverTheByteLimit_IsCutIntoRowGroupsWithinIt()
     {
-        long batchBytes = RollingDataFileWriter.EstimatedBytes(Batch(0, 1000));
+        // Random ids, which encode to some 8 bytes a row.
+        var random = new Random(11);
+        var idValues = Enumerable.Range(0, 20_000).Select(_ => (((long)random.Next() << 33) ^ ((long)random.Next() << 2) ^ random.Next(4))).ToList();
+        var ids = new Int64Array.Builder();
+        var parts = new StringArray.Builder();
+        foreach (long id in idValues)
+        {
+            ids.Append(id);
+            parts.Append("p");
+        }
+        var batch = new RecordBatch(BuildSchema(), [ids.Build(), parts.Build()], 20_000);
+
+        // The batch's encoded size as one row group.
+        long encoded;
+        string scratch = System.IO.Path.GetTempFileName();
+        try
+        {
+            await using (var writer = new ParquetFileWriter(new EngineeredWood.IO.Local.LocalSequentialFile(scratch)))
+            {
+                await writer.WriteRowGroupAsync(batch);
+                await writer.CloseAsync();
+                encoded = writer.WrittenMetadata!.RowGroups.Sum(g => g.Columns.Sum(c => c.MetaData!.TotalCompressedSize));
+            }
+        }
+        finally
+        {
+            File.Delete(scratch);
+        }
+
         var options = new DeltaTableOptions
         {
-            ParquetWriteOptions = ParquetWriteOptions.Default with { RowGroupMaxBytes = batchBytes / 4 },
+            ParquetWriteOptions = ParquetWriteOptions.Default with { RowGroupMaxBytes = encoded / 4 },
         };
         await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(), options);
-        await table.WriteAsync([Batch(0, 1000)]);
+        await table.WriteAsync([batch]);
 
         var file = Assert.Single(table.CurrentSnapshot.ActiveFiles.Values);
-        await using var stream = await Fs.OpenReadAsync(DeltaPath.Decode(file.Path));
-        using var reader = new ParquetFileReader(stream, ownsFile: false);
-        var groups = (await reader.ReadMetadataAsync()).RowGroups.Select(g => g.NumRows).ToList();
-        // A quarter of the batch's bytes is a quarter of its rows, rounded up; the last group takes what is left.
-        Assert.Equal(4, groups.Count);
-        Assert.All(groups, rows => Assert.InRange(rows, 249, 251));
-        Assert.Equal(1000, groups.Sum());
-        Assert.Equal(Range(0, 1000), await ReadIdsAsync(table));
+        var groups = await RowGroupsAsync(file.Path);
+        // About a quarter of the encoded bytes each; the estimate is not exact, the last group takes what is left.
+        Assert.InRange(groups.Count, 3, 6);
+        Assert.All(groups, g => Assert.True(
+            g.Columns.Sum(c => c.MetaData!.TotalCompressedSize) <= encoded / 4 * 3 / 2,
+            $"{g.NumRows} rows in {g.Columns.Sum(c => c.MetaData!.TotalCompressedSize)} bytes, limit {encoded / 4}"));
+        Assert.Equal(20_000, groups.Sum(g => g.NumRows));
+        Assert.Equal(idValues.OrderBy(v => v), (await ReadIdsAsync(table)).OrderBy(v => v));
     }
 
-    /// <summary>
-    /// A byte limit near <see cref="long.MaxValue"/> (cut by rows only) lets a whole batch through in one piece.
-    /// <c>byteRoom * rows</c> overflowed there, and the writer took one row per slice: the layout came out right,
-    /// but a write ran 10-40x slower (#870).
-    /// </summary>
-    [Theory]
-    [InlineData(long.MaxValue)]
-    [InlineData(long.MaxValue / 2)]
-    [InlineData(1L << 40)]
-    public void AHugeByteLimit_TakesTheWholeBatch(long byteRoom)
+    private async Task<IReadOnlyList<EngineeredWood.Parquet.Metadata.RowGroup>> RowGroupsAsync(string deltaPath)
     {
-        Assert.Equal(1_000_000, RollingDataFileWriter.RowsInByteRoom(byteRoom, 1_000_000, 150_000_000));
-        Assert.Equal(int.MaxValue, RollingDataFileWriter.RowsInByteRoom(byteRoom, int.MaxValue, 1L << 39));
+        await using var stream = await Fs.OpenReadAsync(DeltaPath.Decode(deltaPath));
+        using var reader = new ParquetFileReader(stream, ownsFile: false);
+        return (await reader.ReadMetadataAsync()).RowGroups;
     }
-
-    /// <summary>Below the batch's bytes, the room is the rows' share rounded up to a whole row, at least one, also
-    /// where <c>byteRoom * rows</c> exceeds a <see langword="long"/>.</summary>
-    [Theory]
-    [InlineData(250L, 1000L, 1000L, 250L)]
-    [InlineData(251L, 1000L, 1000L, 251L)]
-    [InlineData(1L, 1000L, 1000L, 1L)]
-    [InlineData(1L, 1000L, 1_000_000L, 1L)]
-    [InlineData(333L, 1000L, 999L, 334L)]
-    [InlineData((1L << 61) + 1, 8L, 1L << 62, 5L)]
-    [InlineData(long.MaxValue - 1, int.MaxValue, long.MaxValue, int.MaxValue)]
-    // The product (long.MaxValue - 1) fits, but adding batchBytes - 1 to round up would not (#871 review).
-    [InlineData(4294967298L, int.MaxValue, 8589934592L, 1073741824L)]
-    public void TheByteRoom_IsTheRowsShareRoundedUp(long byteRoom, long rows, long batchBytes, long expected) =>
-        Assert.Equal(expected, RollingDataFileWriter.RowsInByteRoom(byteRoom, rows, batchBytes));
-
-    /// <summary>A slice is charged its rows' share of the batch's bytes, rounded down, exactly even where
-    /// <c>batchBytes * rows</c> exceeds a <see langword="long"/>.</summary>
-    [Theory]
-    [InlineData(1000L, 250L, 1000L, 250L)]
-    [InlineData(1000L, 1L, 3L, 333L)]
-    [InlineData(long.MaxValue, int.MaxValue - 1L, int.MaxValue, long.MaxValue - 4294967298L - 1)]
-    public void ASlicesBytes_AreItsShareOfTheBatch(long batchBytes, long rows, long batchRows, long expected) =>
-        Assert.Equal(expected, RollingDataFileWriter.ShareOfBytes(batchBytes, rows, batchRows));
 
     /// <summary>End to end: with no byte limit to speak of, rows alone decide the row groups.</summary>
     [Fact]

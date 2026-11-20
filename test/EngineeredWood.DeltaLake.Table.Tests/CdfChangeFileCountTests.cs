@@ -389,28 +389,28 @@ public class CdfChangeFileCountTests : IDisposable
             Assert.Equal([1L, 1L], await RowGroupRowsAsync(file));
     }
 
-    // A held slice keeps its whole batch alive, so it is charged the whole batch: two partitions each holding the
-    // tail of a batch are over a budget of one and a half batches, and the fuller is written out.
+    // What the partitions hold is their open row groups' encoded pages (#936). Their total is capped at one row group:
+    // past it, the partition holding the most is written out.
     [Fact]
-    public async Task AHeldSlice_IsChargedTheBatchItKeepsAlive()
+    public async Task OpenRowGroups_AcrossPartitions_AreCappedAtOneRowGroup()
     {
         await using var table = await CreateAsync();
-        var batch = Rows(FlatSchema, Enumerable.Range(0, 10).Select(i => (long)i));
-        long batchBytes = RollingDataFileWriter.EstimatedBytes(
-            CdfWriter.PrepareRows(table.CurrentSnapshot, batch, CdfConfig.Delete, null, null));
-        var options = ParquetWriteOptions.Default with { RowGroupMaxRows = 4, RowGroupMaxBytes = batchBytes * 3 / 2 };
+        var random = new Random(3);
+        RecordBatch RandomRows(int count) =>
+            Rows(FlatSchema, Enumerable.Range(0, count).Select(_ => (((long)random.Next() << 33) ^ ((long)random.Next() << 2) ^ random.Next(4))).ToList());
+        // A row of a random id and its "v{id}" encodes to some 33 bytes: 6,000 rows about 200 KB, 5,000 about 165.
+        var options = ParquetWriteOptions.Default with { RowGroupMaxRows = int.MaxValue, RowGroupMaxBytes = 280_000 };
         await using var sink = new ChangeDataFileSink(Fs, table.CurrentSnapshot, options, long.MaxValue, written: null);
 
-        // a: row groups of 4 and 4 written, a tail of 2 held. b: the same, which puts the held total past the budget,
-        // so a's tail is written. a again: its next ten rows start a new row group.
-        await sink.AddAsync(batch, CdfConfig.Delete, PartitionNamed("a"), default);
-        await sink.AddAsync(batch, CdfConfig.Delete, PartitionNamed("b"), default);
-        await sink.AddAsync(batch, CdfConfig.Delete, PartitionNamed("a"), default);
+        // a alone is under the cap. b puts the total over it, and a, the larger, is written out. a's next rows open a
+        // new row group, and put the total over again: a, still the larger, is written out again.
+        await sink.AddAsync(RandomRows(6_000), CdfConfig.Delete, PartitionNamed("a"), default);
+        await sink.AddAsync(RandomRows(5_000), CdfConfig.Delete, PartitionNamed("b"), default);
+        await sink.AddAsync(RandomRows(6_000), CdfConfig.Delete, PartitionNamed("a"), default);
         var cdc = await sink.CompleteAsync(default);
 
-        var a = cdc.Single(f => f.PartitionValues["p"] == "a");
-        // Charged only its two rows' share, a's tail would have been held and joined by the next batch: 4,4,4,4,4.
-        Assert.Equal([4L, 4L, 2L, 4L, 4L, 2L], await RowGroupRowsAsync(a));
+        Assert.Equal([6_000L, 6_000L], await RowGroupRowsAsync(cdc.Single(f => f.PartitionValues["p"] == "a")));
+        Assert.Equal([5_000L], await RowGroupRowsAsync(cdc.Single(f => f.PartitionValues["p"] == "b")));
     }
 
     private static BooleanArray AllTrue(int length)

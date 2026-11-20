@@ -3,15 +3,18 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// When a writer lets go of a batch handed to it under a lease (#860): once the row group holding the batch's last row
-/// is written, not before, and on abandon. The end-to-end tests (<see cref="CompactionRawReleaseTests"/>) measure what is
-/// left once an operation is over, which an abandon at the end would also satisfy; these pin the release to the write.
+/// When a writer lets go of a batch handed to it under a lease (#860). Under the built-in Parquet writer, as soon as the
+/// batch is written: its rows are encoded into the open row group's pages as they arrive, and the writer keeps nothing
+/// of the batch (#936). Under a host writer, once the host has written the file, and on abandon. The end-to-end tests
+/// (<see cref="CompactionRawReleaseTests"/>) measure what is left once an operation is over, which an abandon at the end
+/// would also satisfy; these pin the release to the write.
 /// </summary>
 public class RollingDataFileWriterLeaseTests : IDisposable
 {
@@ -34,40 +37,72 @@ public class RollingDataFileWriterLeaseTests : IDisposable
     }
 
     [Fact]
-    public async Task ALease_IsHeldUntilTheRowGroupHoldingItsLastRowIsWritten()
+    public async Task ALease_IsReleasedOnceItsBatchIsWritten_ThoughItsRowGroupIsStillOpen()
     {
         await using var writer = Writer(rowGroupRows: 100);
         var (a, aLease) = Leased(60);
         var (b, bLease) = Leased(60);
 
+        // A's rows are in the open row group's pages, not in A.
         await writer.AddAsync(a, a, CancellationToken.None, aLease);
         aLease.Dispose();
-        Assert.False(aLease.Released); // pending
+        Assert.True(aLease.Released);
 
-        // B's first 40 rows fill the row group with A's 60; its last 20 are still pending.
+        // B's first 40 rows fill the row group with A's 60; its last 20 open the next.
         await writer.AddAsync(b, b, CancellationToken.None, bLease);
         bLease.Dispose();
-        Assert.True(aLease.Released);
-        Assert.False(bLease.Released);
-
-        await writer.CompleteAsync(CancellationToken.None);
         Assert.True(bLease.Released);
+
+        var files = await writer.CompleteAsync(CancellationToken.None);
+        Assert.Equal(120, Assert.Single(files).Rows);
     }
 
     [Fact]
-    public async Task ALeaseOverSeveralSlices_IsHeldUntilTheLastIsWritten()
+    public async Task ALeaseOverSeveralSlices_IsReleasedOnceTheLastIsWritten()
     {
         await using var writer = Writer(rowGroupRows: 100);
         var (parent, lease) = Leased(160);
 
         await writer.AddAsync(parent.Slice(0, 80), parent.Slice(0, 80), CancellationToken.None, lease);
-        // The first slice is written with the second's first 20 rows; the second's last 60 are pending.
         await writer.AddAsync(parent.Slice(80, 80), parent.Slice(80, 80), CancellationToken.None, lease);
+        Assert.False(lease.Released); // the caller's own hold
         lease.Dispose();
-        Assert.False(lease.Released);
+        Assert.True(lease.Released);
 
         await writer.CompleteAsync(CancellationToken.None);
+    }
+
+    /// <summary>
+    /// A batch that spans files: a row group fills a file, the file is closed, and the rest of the batch goes on into the
+    /// next. Closing a file lets go of no lease under the built-in writer, since the batch's tail is still to be
+    /// encoded; its lease goes once every row is written (#939 review). Here the caller lets go of its own hold as the
+    /// second file opens, so the writer's is the only one left.
+    /// </summary>
+    [Fact]
+    public async Task ALease_IsHeldAcrossAFileRollover_UntilTheBatchIsWritten()
+    {
+        var (batch, lease) = Leased(350);
+        int created = 0;
+        bool? releasedAtRollover = null;
+        var fs = new CreateHookFileSystem(_fs, () =>
+        {
+            if (++created == 2)
+            {
+                lease.Dispose();
+                releasedAtRollover = lease.Released;
+            }
+        });
+        await using var writer = new RollingDataFileWriter(
+            fs, host: null, new ParquetWriteOptions { RowGroupMaxRows = 100 }, targetFileSize: 1, partitionDirectory: "",
+            written: null, collectStats: false, statsSelection: null, tableAllowsShredding: false);
+
+        await writer.AddAsync(batch, batch, CancellationToken.None, lease);
+
+        Assert.False(releasedAtRollover);
         Assert.True(lease.Released);
+        var files = await writer.CompleteAsync(CancellationToken.None);
+        Assert.Equal(4, files.Count);
+        Assert.Equal(350, files.Sum(f => f.Rows));
     }
 
     [Fact]
@@ -107,11 +142,49 @@ public class RollingDataFileWriterLeaseTests : IDisposable
         Assert.True(largeLease.Released);
     }
 
+    /// <summary>
+    /// A batch of another layout closes the open file first, which lets go of that file's leases. The new batch's
+    /// lease is the next file's: it was taken before the close and let go with them, and the host then read buffers
+    /// its caller had freed (#939 review).
+    /// </summary>
+    [Fact]
+    public async Task UnderAHostWriter_ALayoutChange_KeepsTheNewBatchsLease()
+    {
+        var host = new CountingHost();
+#pragma warning disable EWDELTA0001 // codec seam is experimental
+        await using var writer = new RollingDataFileWriter(
+            _fs, host, ParquetWriteOptions.Default, targetFileSize: long.MaxValue, partitionDirectory: "", written: null,
+            collectStats: false, statsSelection: null, tableAllowsShredding: false);
+#pragma warning restore EWDELTA0001
+        var (first, firstLease) = Leased(10);
+        var otherSchema = new Apache.Arrow.Schema.Builder().Field(new Field("w", Int64Type.Default, false)).Build();
+        var second = new RecordBatch(otherSchema, [new Int64Array.Builder().Append(1).Append(2).Build()], 2);
+        var secondLease = BatchLease.Of(second);
+
+        await writer.AddAsync(first, first, CancellationToken.None, firstLease);
+        firstLease.Dispose();
+        await writer.AddAsync(second, second, CancellationToken.None, secondLease);
+        secondLease.Dispose();
+
+        Assert.Equal(1, host.Files);          // the first file, closed by the layout change
+        Assert.True(firstLease.Released);
+        Assert.False(secondLease.Released);   // the open file's, still to be written
+
+        await writer.CompleteAsync(CancellationToken.None);
+        Assert.Equal(2, host.Files);
+        Assert.True(secondLease.Released);
+    }
+
     [Fact]
     public async Task AnAbandonedWrite_LetsGoOfItsLeases()
     {
+        // A host writer holds the file's batches until it writes them; abandoned, it never does.
         var (batch, lease) = Leased(20);
-        await using (var writer = Writer(rowGroupRows: 100))
+#pragma warning disable EWDELTA0001 // codec seam is experimental
+        await using (var writer = new RollingDataFileWriter(
+            _fs, new CountingHost(), ParquetWriteOptions.Default, targetFileSize: long.MaxValue, partitionDirectory: "",
+            written: null, collectStats: false, statsSelection: null, tableAllowsShredding: false))
+#pragma warning restore EWDELTA0001
         {
             await writer.AddAsync(batch, batch, CancellationToken.None, lease);
             lease.Dispose();
@@ -144,6 +217,31 @@ public class RollingDataFileWriterLeaseTests : IDisposable
             values.Append(i);
         var batch = new RecordBatch(Schema, [values.Build()], rows);
         return (batch, BatchLease.Of(batch));
+    }
+
+    /// <summary>The table's file system, calling back as each file is created.</summary>
+    private sealed class CreateHookFileSystem(ITableFileSystem inner, Action onCreate) : ITableFileSystem
+    {
+        public PathNameConstraints PathConstraints => inner.PathConstraints;
+        public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
+            => inner.ReadAllBytesAsync(path, cancellationToken);
+        public ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default)
+            => inner.OpenReadAsync(path, cancellationToken);
+        public IAsyncEnumerable<TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default)
+            => inner.ListAsync(prefix, cancellationToken);
+        public ValueTask<ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default)
+        {
+            onCreate();
+            return inner.CreateAsync(path, overwrite, cancellationToken);
+        }
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
+            => inner.DeleteAsync(path, cancellationToken);
+        public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
+            => inner.ExistsAsync(path, cancellationToken);
+        public ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.TryWriteAllBytesAsync(path, data, cancellationToken);
+        public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.WriteAllBytesAsync(path, data, cancellationToken);
     }
 
 #pragma warning disable EWDELTA0001 // codec seam is experimental

@@ -183,11 +183,70 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         await WriteBatchCoreAsync(batch, stopAfterRowGroup: false, cancellationToken).ConfigureAwait(false);
 
     /// <summary>
-    /// <see cref="WriteBatchAsync"/>, stopping once a row group has been written: returns the rows of the batch taken,
-    /// all of them unless a row group filled first. For a caller that cuts files between row groups.
+    /// <see cref="WriteBatchAsync"/> of the rows of <paramref name="batch"/> from <paramref name="offset"/> on, stopping
+    /// once a row group has been written: returns the rows taken, all the rest unless a row group filled first. For a
+    /// caller that cuts files between row groups, and so calls again with the same batch and a later offset, on this
+    /// writer or the next file's.
     /// </summary>
-    internal ValueTask<int> WriteBatchUntilRowGroupAsync(RecordBatch batch, CancellationToken cancellationToken = default) =>
-        WriteBatchCoreAsync(batch, stopAfterRowGroup: true, cancellationToken);
+    /// <remarks>
+    /// A call at <paramref name="offset"/> 0 prepares and checks the whole batch, as <see cref="WriteBatchAsync"/> does.
+    /// A later one prepares only the rows it takes: preparing the rest of a large batch on every call (compacting its
+    /// offsets, checking it whole) made a batch spanning many row groups cost quadratically in them (#939 review).
+    /// The batch was checked whole by the call that took its first rows, and every writer it reaches has its layout.
+    /// </remarks>
+    internal async ValueTask<int> WriteBatchUntilRowGroupAsync(
+        RecordBatch batch, int offset, CancellationToken cancellationToken = default)
+    {
+        if (offset == 0)
+            return await WriteBatchCoreAsync(batch, stopAfterRowGroup: true, cancellationToken).ConfigureAwait(false);
+
+        EnsureWritable();
+        if (offset < 0 || offset > batch.Length)
+            throw new ArgumentOutOfRangeException(nameof(offset));
+
+        // A writer the batch reaches past its first rows, the next file's after a rollover, decides its variant layout
+        // from up to a row group of the rows it is about to take, as the rolling writer once did from each file's first
+        // row group: not from the first slice it takes, a probe's worth of rows. Not from the whole rest of the batch
+        // either, which every file the batch spans would read again (#939 review). Only the variant columns are read;
+        // the decision does not depend on how the other columns are laid out.
+        if (_variantShredDecisions is null && (_options.ShredVariants is not null || _options.VariantShredSchemas is not null))
+            EnsureVariantShredDecisions(batch.Slice(offset, Math.Min(batch.Length - offset, _options.RowGroupMaxRows)));
+
+        int start = offset;
+        bool batchInOpenRowGroup = false;
+        try
+        {
+            while (offset < batch.Length)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                int rows = RowsToAppend(batch, batch.Length - offset);
+                var slice = PrepareBatch(batch.Slice(offset, rows));
+                await WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
+                AppendToOpenRowGroup(slice);
+                batchInOpenRowGroup = true;
+                offset += rows;
+
+                if (_open!.Rows >= _options.RowGroupMaxRows || _open.EstimatedBytes() >= _options.RowGroupMaxBytes)
+                {
+                    batchInOpenRowGroup = false;
+                    await FlushOpenRowGroupAsync(cancellationToken).ConfigureAwait(false);
+                    break;
+                }
+            }
+        }
+        catch when (batchInOpenRowGroup)
+        {
+            // As in WriteBatchCoreAsync: rows of the batch in the open row group cannot be taken back out.
+            _open = null;
+            throw;
+        }
+        finally
+        {
+            GC.KeepAlive(batch);
+        }
+
+        return offset - start;
+    }
 
     private async ValueTask<int> WriteBatchCoreAsync(
         RecordBatch batch, bool stopAfterRowGroup, CancellationToken cancellationToken)

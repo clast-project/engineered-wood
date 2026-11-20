@@ -71,11 +71,13 @@ internal readonly record struct RolledDataFile(string FileName, long Size, long 
 /// allows, however the caller happened to batch them (#559). Before this, every input batch became a file of its
 /// own, with a single row group the size of that batch.
 ///
-/// <para>With the built-in Parquet writer, consecutive batches are joined into one row group until
-/// <see cref="ParquetWriteOptions.RowGroupMaxRows"/> rows or (estimated from the Arrow buffers)
-/// <see cref="ParquetWriteOptions.RowGroupMaxBytes"/> is reached. After each row group the file's actual size is
-/// checked, and at or past the target the file is closed and the next row group starts a new one. A file can
-/// therefore overshoot the target by up to one row group, as delta-rs's and Spark's can.</para>
+/// <para>With the built-in Parquet writer, each batch is handed to <see cref="ParquetFileWriter.WriteBatchAsync"/> as it
+/// comes, which encodes it into the open row group's pages and cuts row groups itself, at
+/// <see cref="ParquetWriteOptions.RowGroupMaxRows"/> rows or <see cref="ParquetWriteOptions.RowGroupMaxBytes"/> of
+/// estimated encoded bytes (#936). Nothing of a batch is held once it is written, only the open row group's
+/// compressed pages. After each row group the file's actual size is checked, and at or past the target the file is
+/// closed and the next row group starts a new one. A file can therefore overshoot the target by up to one row group,
+/// as delta-rs's and Spark's can.</para>
 ///
 /// <para>A host <see cref="IDataFileWriter"/> is handed each file's batches as they came, and cuts its own row
 /// groups. Its output size is known only once it returns, so its files are cut by the batches' Arrow size
@@ -105,7 +107,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     private Apache.Arrow.Schema? _idsFrom;
     private Apache.Arrow.Schema? _idsTo;
 
-    // The file being filled: its layout, rows and stats so far. Its Parquet writer is opened by the first row group.
+    // The file being filled: its layout, rows and stats so far. Its Parquet writer is opened by the first rows.
     private Apache.Arrow.Schema? _fileSchema;
     private long _fileRows;
     private Stats.StatsCollector.Accumulator? _fileStats;
@@ -113,16 +115,13 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     private ISequentialFile? _file;
     private ParquetFileWriter? _writer;
 
-    // Batches not yet written: the row group being built, or under a host writer the whole file.
+    // Under a host writer, the batches of the file being filled, which it is handed whole.
     private readonly List<RecordBatch> _pending = new();
-    private long _pendingRows;
     private long _pendingBytes;
-    private long _retainedBytes;
 
-    // Leases of the batches given under one (#860): released once every row of theirs is written. The batch being added
-    // is among them, but its rows may not all be appended yet, so a row group flushed meanwhile keeps it.
+    // Leases of the batches given under one (#860): under the built-in writer released once a batch is written, which
+    // encodes it; under a host writer held until the file is.
     private readonly List<BatchLease> _leases = new();
-    private BatchLease? _appending;
 
     /// <param name="partitionDirectory">The file's Hive-style directory relative to the table root, or empty.</param>
     /// <param name="collectStats">Whether to collect per-file stats, over the batches <see cref="AddAsync"/> is
@@ -166,111 +165,60 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         if (writeBatch.Length == 0)
             return;
 
-        if (lease is not null)
-        {
-            _leases.Add(lease.Acquire());
-            _appending = lease;
-        }
-        try
-        {
-            await AddCoreAsync(writeBatch, statsBatch, cancellationToken).ConfigureAwait(false);
-        }
-        finally
-        {
-            // Every row is appended, or the add failed: either way the next flush or the abandon lets go.
-            _appending = null;
-        }
-    }
-
-    private async ValueTask AddCoreAsync(RecordBatch writeBatch, RecordBatch statsBatch, CancellationToken cancellationToken)
-    {
         if (_columnFieldIds is not null)
             writeBatch = WithColumnFieldIds(writeBatch);
 
         if (_fileSchema is not null && !SameLayout(_fileSchema.FieldsList, writeBatch.Schema.FieldsList))
             await CloseFileAsync(cancellationToken).ConfigureAwait(false);
 
-        long batchBytes = EstimatedBytes(writeBatch);
+        // Held only once the previous file is closed: closing a host's file lets go of every lease it holds, and this
+        // batch is the next file's (#939 review).
+        if (lease is not null)
+            _leases.Add(lease.Acquire());
+
         if (_host is not null)
         {
-            Append(writeBatch, statsBatch, batchBytes, batchBytes);
-            _appending = null;
+            long batchBytes = EstimatedBytes(writeBatch);
+            Account(writeBatch, statsBatch);
+            _pending.Add(writeBatch);
+            _pendingBytes += batchBytes;
             if (_pendingBytes >= _targetFileSize)
                 await CloseFileAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        // The batch is cut where a row group fills, by rows or by bytes, and the target is checked after each one.
-        // Handing the Parquet writer more than RowGroupMaxRows rows would have it split them into several row
-        // groups itself, unseen here, and nothing downstream honours RowGroupMaxBytes: either way the layout would
-        // depend on how the caller batched its rows. Each piece is charged its share of the batch's bytes, and the
-        // byte budget rounds up to whole rows, so a row group by bytes ends at most one row past the limit.
-        long maxRows = Math.Max(1, _options.RowGroupMaxRows);
+        // The Parquet writer cuts row groups, by rows and by encoded bytes, splitting the batch where one fills; it
+        // stops at each, so the file's size is checked between row groups and a full file is closed there.
         int offset = 0;
         while (offset < writeBatch.Length)
         {
-            long take = Math.Min(writeBatch.Length - offset, maxRows - _pendingRows);
-            if (batchBytes > 0)
-            {
-                long byteRoom = Math.Max(1, _options.RowGroupMaxBytes - _pendingBytes);
-                take = Math.Min(take, RowsInByteRoom(byteRoom, writeBatch.Length, batchBytes));
-            }
-            int rows = (int)take;
-            bool whole = rows == writeBatch.Length;
-            Append(
-                whole ? writeBatch : writeBatch.Slice(offset, rows),
-                whole ? statsBatch : statsBatch.Slice(offset, rows),
-                whole ? batchBytes : ShareOfBytes(batchBytes, rows, writeBatch.Length),
-                batchBytes);
+            var writer = await OpenWriterAsync(cancellationToken).ConfigureAwait(false);
+            // The whole batch and where to go on from, not the rest as a slice: the writer prepares only the rows each
+            // call takes, so a batch spanning many row groups is not prepared again for every one (#939 review).
+            int rows = await writer.WriteBatchUntilRowGroupAsync(writeBatch, offset, cancellationToken).ConfigureAwait(false);
+            Account(
+                rows == writeBatch.Length ? writeBatch : writeBatch.Slice(offset, rows),
+                rows == writeBatch.Length ? statsBatch : statsBatch.Slice(offset, rows));
             offset += rows;
-            if (offset == writeBatch.Length)
-                _appending = null;
 
-            if (_pendingRows >= maxRows || _pendingBytes >= _options.RowGroupMaxBytes)
-            {
-                await FlushRowGroupAsync(cancellationToken).ConfigureAwait(false);
-                if (_file!.Position >= _targetFileSize)
-                    await CloseFileAsync(cancellationToken).ConfigureAwait(false);
-            }
+            // Only between row groups: the file holds its header from the first rows on.
+            if (writer.OpenRowGroupRows == 0 && _file!.Position >= _targetFileSize)
+                await CloseFileAsync(cancellationToken).ConfigureAwait(false);
         }
+
+        // Every row is encoded, and the Parquet writer keeps nothing of the batch.
+        ReleaseLeases();
     }
 
-    /// <summary>
-    /// How many of a batch's <paramref name="batchRows"/> rows fit in <paramref name="byteRoom"/> bytes, when the
-    /// whole batch is <paramref name="batchBytes"/>: the share rounded up to a whole row, at least 1, and never more
-    /// than the batch. Exact for any <see cref="ParquetWriteOptions.RowGroupMaxBytes"/>: the product
-    /// <c>byteRoom * batchRows</c> overflowed a <see langword="long"/> for a byte limit near
-    /// <see cref="long.MaxValue"/> (one that means "cut by rows only"), and the writer then took one row per slice (#870).
-    /// </summary>
-    internal static long RowsInByteRoom(long byteRoom, long batchRows, long batchBytes)
+    private async ValueTask<ParquetFileWriter> OpenWriterAsync(CancellationToken cancellationToken)
     {
-        if (byteRoom >= batchBytes)
-            return batchRows;
-        // The exact integer form wherever the product fits (byteRoom below 2^32 for any batch of int rows); past
-        // that, decimal, whose 28 digits may land one row off a whole-row boundary: the bytes are an estimate.
-        // The ceiling is taken from the remainder, not by adding batchBytes - 1: a product just under long.MaxValue
-        // passes the guard and the addition would overflow it (#871 review).
-        long rows;
-        if (byteRoom <= long.MaxValue / batchRows)
+        if (_writer is null)
         {
-            long product = byteRoom * batchRows;
-            rows = product / batchBytes + (product % batchBytes == 0 ? 0 : 1);
+            _fileName = NewFileName();
+            _file = await _fs.CreateAsync(_fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
+            _writer = new ParquetFileWriter(_file, ownsFile: false, _options);
         }
-        else
-        {
-            rows = (long)Math.Ceiling((decimal)byteRoom * batchRows / batchBytes);
-        }
-        return Math.Min(batchRows, Math.Max(1, rows));
-    }
-
-    /// <summary><paramref name="rows"/> rows' share of a batch's <paramref name="batchBytes"/>, rounded down; computed
-    /// exactly, without the <see langword="long"/> overflow of <c>batchBytes * rows</c> (#870): with
-    /// <c>batchBytes = q * batchRows + r</c>, the share is <c>q * rows + r * rows / batchRows</c>, and neither product
-    /// can overflow while <paramref name="rows"/> &lt;= <paramref name="batchRows"/> &lt;= <see cref="int.MaxValue"/>.</summary>
-    internal static long ShareOfBytes(long batchBytes, long rows, long batchRows)
-    {
-        long q = batchBytes / batchRows, r = batchBytes % batchRows;
-        return q * rows + r * rows / batchRows;
+        return _writer;
     }
 
     private RecordBatch WithColumnFieldIds(RecordBatch batch)
@@ -322,46 +270,41 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         return builder.Build();
     }
 
-    // Adds rows to the file being filled. They are written to it: the file closes only once they are flushed.
-    // `bytes` is the rows' share of their batch, which sizes the row group; `retained` is what holding them keeps
-    // alive, the whole batch, since a slice shares its batch's buffers.
-    private void Append(RecordBatch writeBatch, RecordBatch statsBatch, long bytes, long retained)
+    // Counts rows into the file being filled, and its stats.
+    private void Account(RecordBatch writeBatch, RecordBatch statsBatch)
     {
         _fileSchema ??= writeBatch.Schema;
         _fileRows += writeBatch.Length;
         if (_collectStats)
             (_fileStats ??= new Stats.StatsCollector.Accumulator(_statsSelection)).Add(statsBatch);
-
-        _pending.Add(writeBatch);
-        _pendingRows += writeBatch.Length;
-        _pendingBytes += bytes;
-        _retainedBytes += retained;
     }
 
-    /// <summary>The estimated Arrow bytes the pending rows (the row group being built; under a host writer, the
-    /// whole file) keep alive, which <see cref="FlushPendingAsync"/> releases. A pending slice keeps its whole batch's
-    /// buffers, so this counts the whole batch, and can exceed the row group's size.</summary>
-    public long RetainedBytes => _retainedBytes;
+    /// <summary>What the writer holds for the file being filled: under the built-in writer the open row group's
+    /// estimated encoded size (<see cref="ParquetFileWriter.OpenRowGroupBytes"/>), which
+    /// <see cref="FlushPendingAsync"/> writes out; under a host writer the estimated Arrow bytes of the batches it
+    /// will be handed.</summary>
+    public long RetainedBytes => _host is not null ? _pendingBytes : _writer?.OpenRowGroupBytes ?? 0;
 
-    /// <summary>Whether a file is open: a row group has been written to it and it is not yet closed.</summary>
+    /// <summary>Whether a file is open: rows have been written to it and it is not yet closed.</summary>
     public bool HasOpenFile => _writer is not null;
 
 
     /// <summary>
-    /// Writes the pending rows as a row group now, before it is full, and closes the file if that takes it to the
-    /// target; for a caller that holds several writers and bounds the memory of all of them. A host writer's
-    /// pending rows are its whole file, so under one this closes the file.
+    /// Writes the open row group now, before it is full, and closes the file if that takes it to the target; for a
+    /// caller that holds several writers and bounds the memory of all of them. A host writer's pending rows are its
+    /// whole file, so under one this closes the file.
     /// </summary>
     public async ValueTask FlushPendingAsync(CancellationToken cancellationToken)
     {
-        if (_pending.Count == 0)
-            return;
         if (_host is not null)
         {
-            await CloseFileAsync(cancellationToken).ConfigureAwait(false);
+            if (_pending.Count > 0)
+                await CloseFileAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
-        await FlushRowGroupAsync(cancellationToken).ConfigureAwait(false);
+        if (_writer is null || _writer.OpenRowGroupRows == 0)
+            return;
+        await _writer.FlushRowGroupAsync(cancellationToken).ConfigureAwait(false);
         if (_file!.Position >= _targetFileSize)
             await CloseFileAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -384,32 +327,11 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         return fileName;
     }
 
-    private async ValueTask FlushRowGroupAsync(CancellationToken cancellationToken)
+    private void ReleaseLeases()
     {
-        if (_pending.Count == 0)
-            return;
-
-        if (_writer is null)
-        {
-            _fileName = NewFileName();
-            _file = await _fs.CreateAsync(_fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
-            _writer = new ParquetFileWriter(_file, ownsFile: false, _options);
-        }
-
-        var rowGroup = Concatenate(_pending);
-        ClearPending();
-        await _writer.WriteRowGroupAsync(rowGroup, cancellationToken).ConfigureAwait(false);
-        ReleaseWrittenLeases();
-    }
-
-    // Lets go of the leases whose rows are all written: every lease but the batch still being appended (the last one
-    // taken), whose later rows are still to come. One lease may be held more than once, a hold per batch given under it.
-    private void ReleaseWrittenLeases()
-    {
-        int written = _appending is null ? _leases.Count : _leases.Count - 1;
-        for (int i = 0; i < written; i++)
-            _leases[i].Release();
-        _leases.RemoveRange(0, written);
+        foreach (var lease in _leases)
+            lease.Release();
+        _leases.Clear();
     }
 
     /// <summary>Writes what is pending and closes the file being filled, so the next rows start a new one; also for a
@@ -425,17 +347,17 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         {
             fileName = NewFileName();
             var batches = _pending.ToArray();
-            ClearPending();
+            _pending.Clear();
+            _pendingBytes = 0;
             size = await _host.WriteAsync(batches.ToAsyncEnumerable(), fileName, cancellationToken)
                 .ConfigureAwait(false);
-            ReleaseWrittenLeases();
+            ReleaseLeases();
             await AddVariantBoundsAsync(writtenFooter: null, fileName, size, cancellationToken).ConfigureAwait(false);
         }
         else
         {
-            await FlushRowGroupAsync(cancellationToken).ConfigureAwait(false);
             fileName = _fileName!;
-            // CloseAsync writes the footer and publishes the file before Position is read.
+            // CloseAsync writes the open row group and the footer, and publishes the file before Position is read.
             await _writer!.CloseAsync(cancellationToken).ConfigureAwait(false);
             size = _file!.Position;
             await AddVariantBoundsAsync(_writer.WrittenMetadata, fileName, size, cancellationToken).ConfigureAwait(false);
@@ -468,14 +390,6 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
 
     private int StringPrefixLength => (_statsSelection ?? Stats.StatsColumnSelection.All).StringPrefixLength;
 
-    private void ClearPending()
-    {
-        _pending.Clear();
-        _pendingRows = 0;
-        _pendingBytes = 0;
-        _retainedBytes = 0;
-    }
-
     private async ValueTask DisposeOpenFileAsync()
     {
         var writer = _writer;
@@ -498,32 +412,10 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         }
         finally
         {
-            foreach (var lease in _leases)
-                lease.Release();
-            _leases.Clear();
-            _appending = null;
-            ClearPending();
+            ReleaseLeases();
+            _pending.Clear();
+            _pendingBytes = 0;
         }
-    }
-
-    private static RecordBatch Concatenate(List<RecordBatch> batches)
-    {
-        if (batches.Count == 1)
-            return batches[0];
-
-        var first = batches[0];
-        var columns = new IArrowArray[first.ColumnCount];
-        var parts = new IArrowArray[batches.Count];
-        int rows = 0;
-        foreach (var batch in batches)
-            rows += batch.Length;
-        for (int c = 0; c < columns.Length; c++)
-        {
-            for (int b = 0; b < batches.Count; b++)
-                parts[b] = batches[b].Column(c);
-            columns[c] = ArrowCompute.Concatenate(parts);
-        }
-        return new RecordBatch(first.Schema, columns, rows);
     }
 
     /// <summary>The bytes of a batch's Arrow buffers. A sliced batch is counted whole, so this can only
