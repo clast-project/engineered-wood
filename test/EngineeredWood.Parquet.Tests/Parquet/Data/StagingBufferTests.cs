@@ -18,17 +18,26 @@ public class StagingBufferTests
 
     private static readonly ParquetWriteOptions Plain = ParquetWriteOptions.Default with { DictionaryEnabled = false };
 
+    /// <summary>
+    /// An 8 MiB value's page is written by the append that brings it at the default page size, and by
+    /// <see cref="ColumnChunkWriter.Finish"/> at 16 MiB pages, which leave it open until then (#948 review). Either
+    /// call lets its buffers go.
+    /// </summary>
     [Theory]
-    [InlineData(DataPageVersion.V1)]
-    [InlineData(DataPageVersion.V2)]
-    public void AHugeValue_LeavesNoBufferOfItsSize(DataPageVersion version)
+    [InlineData(DataPageVersion.V1, false)]
+    [InlineData(DataPageVersion.V2, false)]
+    [InlineData(DataPageVersion.V1, true)]
+    [InlineData(DataPageVersion.V2, true)]
+    public void AHugeValue_LeavesNoBufferOfItsSize(DataPageVersion version, bool writtenByFinish)
     {
         var big = new string('x', 8 << 20);
         var values = new StringArray.Builder().Append("a").Append(big).Append("b").Build();
-        var writer = new ColumnChunkWriter(
-            Path, PhysicalType.ByteArray, 0, maxDefLevel: 0, maxRepLevel: 0, Plain with { DataPageVersion = version });
+        var options = Plain with { DataPageVersion = version };
+        if (writtenByFinish)
+            options = options with { DataPageSize = 16 << 20 };
+        var writer = new ColumnChunkWriter(Path, PhysicalType.ByteArray, 0, maxDefLevel: 0, maxRepLevel: 0, options);
 
-        writer.AppendFlat(values); // the huge value's page is written here
+        writer.AppendFlat(values);
         Assert.True(ColumnChunkWriter.StagingBytes <= 2L * ColumnChunkWriter.StagingRetainLimit,
             $"{ColumnChunkWriter.StagingBytes:N0} bytes of staging buffers kept after the append");
 
@@ -36,6 +45,8 @@ public class StagingBufferTests
         Assert.True(ColumnChunkWriter.StagingBytes <= 2L * ColumnChunkWriter.StagingRetainLimit,
             $"{ColumnChunkWriter.StagingBytes:N0} bytes of staging buffers kept after the chunk was finished");
         Assert.True(result.MetaData.TotalUncompressedSize > 8 << 20);
+        // One page of all three values, open until Finish; or a page a value, the append's.
+        Assert.Equal(writtenByFinish, result.PageIndex!.PageLocations.Count == 1);
         GC.KeepAlive(values);
     }
 
