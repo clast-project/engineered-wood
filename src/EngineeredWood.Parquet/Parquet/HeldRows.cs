@@ -154,8 +154,11 @@ internal sealed class HeldRows
 
     private enum Layout { Bits, Fixed, Binary }
 
-    /// <summary>One column's held values, validity and (for strings and binaries) offsets.</summary>
-    private sealed class Column
+    /// <summary>
+    /// One column's held values, validity and (for strings and binaries) offsets. Also the open page of a flat
+    /// column that is not dictionary-encoded (<see cref="Data.ColumnChunkWriter"/>, #940).
+    /// </summary>
+    internal sealed class Column
     {
         private readonly Layout _layout;
         private readonly ArrowTypeId _typeId;
@@ -164,7 +167,8 @@ internal sealed class HeldRows
         private byte[] _values = new byte[256];
         private int _valueBytes; // bytes of _values in use; for Bits, unused (Rows bits are)
         private byte[] _offsets = new byte[4 * 65]; // int32 offsets
-        private byte[]? _validity; // null while every held row is valid
+        private byte[]? _validity; // the held rows' validity once _tracksNulls; kept, for reuse, after a Clear
+        private bool _tracksNulls; // false while every held row is valid
         private int _nulls;
 
         private Column(Layout layout, ArrowTypeId typeId, int width)
@@ -209,7 +213,7 @@ internal sealed class HeldRows
         {
             _valueBytes = 0;
             _nulls = 0;
-            _validity = null;
+            _tracksNulls = false;
         }
 
         /// <summary>
@@ -226,7 +230,7 @@ internal sealed class HeldRows
                 Layout.Fixed => (long)length * _width,
                 _ => BinaryBytes(array) + 4L * length,
             };
-            if (_validity is not null)
+            if (_tracksNulls)
                 bytes += bitmapGrowth;
             else if (length > 0 && array.NullCount > 0)
                 bytes += (rows + length + 7) / 8;
@@ -248,18 +252,23 @@ internal sealed class HeldRows
             int offset = data.Offset;
 
             int nulls = length == 0 ? 0 : array.NullCount;
-            if (nulls > 0 && _validity is null)
+            if (nulls > 0 && !_tracksNulls)
             {
-                _validity = new byte[Math.Max(32, (rows + length + 7) / 8 * 2)];
+                int needed = (rows + length + 7) / 8;
+                if (_validity is null || _validity.Length < needed)
+                    _validity = new byte[Math.Max(32, needed * 2)];
                 SetBits(_validity, 0, rows);
+                _tracksNulls = true;
             }
-            if (_validity is not null)
+            if (_tracksNulls)
             {
-                Grow(ref _validity, (rows + length + 7) / 8);
+                var validity = _validity!; // allocated by the first null
+                Grow(ref validity, (rows + length + 7) / 8);
+                _validity = validity;
                 if (nulls > 0)
-                    CopyBits(data.Buffers[0].Span, offset, _validity, rows, length);
+                    CopyBits(data.Buffers[0].Span, offset, validity, rows, length);
                 else
-                    SetBits(_validity, rows, length);
+                    SetBits(validity, rows, length);
                 _nulls += nulls;
             }
 
@@ -300,9 +309,9 @@ internal sealed class HeldRows
 
         public IArrowArray Build(IArrowType type, int rows)
         {
-            var validity = _validity is null || _nulls == 0
+            var validity = !_tracksNulls || _nulls == 0
                 ? ArrowBuffer.Empty
-                : new ArrowBuffer(_validity.AsMemory(0, (rows + 7) / 8));
+                : new ArrowBuffer(_validity!.AsMemory(0, (rows + 7) / 8));
             ArrowBuffer[] buffers = _layout switch
             {
                 Layout.Bits => [validity, new ArrowBuffer(_values.AsMemory(0, (rows + 7) / 8))],
@@ -311,7 +320,7 @@ internal sealed class HeldRows
                     new ArrowBuffer(_offsets.AsMemory(0, 4 * (rows + 1))),
                     new ArrowBuffer(_values.AsMemory(0, _valueBytes))],
             };
-            return ArrowArrayFactory.BuildArray(new ArrayData(type, rows, _validity is null ? 0 : _nulls, 0, buffers));
+            return ArrowArrayFactory.BuildArray(new ArrayData(type, rows, _tracksNulls ? _nulls : 0, 0, buffers));
         }
 
         private static void Grow<T>(ref T[] array, int needed)
