@@ -50,6 +50,44 @@ public class StagingBufferTests
         GC.KeepAlive(values);
     }
 
+    /// <summary>
+    /// A chunk appended already dictionary-encoded, as the buffered writer builds one, lets go of its buffers too
+    /// (#948 review). At 4 MiB pages, 16-bit indices make pages of 2M: the append writes two full ones (4 MiB each,
+    /// compressed in a staging buffer of their size) and leaves the last index open for Finish.
+    /// </summary>
+    [Fact]
+    public void AHugePrebuiltDictionaryPage_LeavesNoBufferOfItsSize()
+    {
+        const int entries = 1 << 16;
+        const int rows = (4 << 20) + 1;
+        var random = new Random(948);
+        var dictionary = new byte[entries * 4];
+        for (int i = 0; i < entries; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(dictionary.AsSpan(i * 4), i);
+        var indices = new int[rows];
+        for (int i = 0; i < rows; i++)
+            indices[i] = random.Next(entries);
+        var result = new DictionaryEncoder.DictionaryResult
+        {
+            DictionaryPageData = dictionary,
+            DictionaryCount = entries,
+            Indices = indices,
+        };
+        var options = ParquetWriteOptions.Default with { DataPageSize = 4 << 20, DataPageRowCountLimit = null };
+        var writer = new ColumnChunkWriter(Path, PhysicalType.Int32, 0, maxDefLevel: 0, maxRepLevel: 0, options);
+
+        writer.AppendDictionaryEncoded(
+            result, Apache.Arrow.Types.Int32Type.Default, null, null, nonNullCount: rows, levelCount: rows);
+        Assert.True(ColumnChunkWriter.StagingBytes <= 2L * ColumnChunkWriter.StagingRetainLimit,
+            $"{ColumnChunkWriter.StagingBytes:N0} bytes of staging buffers kept after the append");
+
+        var chunk = writer.Finish();
+        Assert.True(ColumnChunkWriter.StagingBytes <= 2L * ColumnChunkWriter.StagingRetainLimit,
+            $"{ColumnChunkWriter.StagingBytes:N0} bytes of staging buffers kept after the chunk was finished");
+        Assert.True(chunk.MetaData.TotalUncompressedSize > 8 << 20);
+        Assert.Equal(3, chunk.PageIndex!.PageLocations.Count); // two by the append, the last by Finish
+    }
+
     /// <summary>Pages of the default size keep their buffers, for the next call on the thread to reuse.</summary>
     [Fact]
     public void DefaultPages_KeepTheirBuffers()
