@@ -234,6 +234,28 @@ internal sealed class ColumnChunkWriter
     // The joined open page (JoinOpen) lives only until it is emitted, so its arrays are reused from page to page.
     private int[]? _joinDef, _joinRep, _joinValueDef, _joinIndices;
 
+    // The open page of a flat column that is not dictionary-encoded, held in buffers reused from page to page (#940).
+    // Detach appends the borrowed pieces to them, where it would copy each into arrays of its own, and the join
+    // appends the entries that complete the page, where it would concatenate every piece into new arrays again: each
+    // value is copied once, and nothing is allocated per page. While they are in use (_openAccumulated), _open[0] is
+    // the one segment over them, and any later piece is not in them yet. A segment over them is valid only until they
+    // are next added to or cleared: the joined page is encoded at once, and what its encoding keeps (page bounds,
+    // statistics, Bloom filter hashes) is copied out of it. Nested, dictionary-encoded and FSST pages, and arrays
+    // whose layout the buffers do not take, are held and joined as before.
+
+    /// <summary>Whether the open page may be held in the reused buffers: false for tests to compare against.</summary>
+    internal bool AccumulatesOpenPage { get; set; } = true;
+
+    /// <summary>Whether the open page is in the reused buffers now: for tests.</summary>
+    internal bool OpenPageAccumulated => _openAccumulated;
+
+    private HeldRows.Column? _openValues;
+    private IArrowType? _openValuesType;
+    private bool _openValuesRefused;
+    private int[]? _openDef;
+    private int _openAccumulatedLevels, _openAccumulatedNonNull;
+    private bool _openAccumulated;
+
     /// <summary><paramref name="scratch"/>, grown to at least <paramref name="count"/> entries.</summary>
     private static int[] Grow(ref int[]? scratch, int count)
     {
@@ -277,7 +299,90 @@ internal sealed class ColumnChunkWriter
         _indexScratch = null;
         _narrowScratch = null;
         _joinDef = _joinRep = _joinValueDef = _joinIndices = null;
+        _openValues = null;
+        _openValuesType = null;
+        _openDef = null;
+        _openAccumulated = false;
+        _openAccumulatedLevels = _openAccumulatedNonNull = 0;
     }
+
+    /// <summary>Whether a piece of the open page can be added to <see cref="_openValues"/>.</summary>
+    private bool Accumulates(Segment piece)
+    {
+        if (!AccumulatesOpenPage || _tailDictionary || _maxRepLevel > 0 || _maxDefLevel > 1 || piece.Fsst is not null || piece.Array is null)
+            return false;
+        if (_openValues is null)
+        {
+            if (_openValuesRefused)
+                return false;
+            _openValuesType = piece.Array.Data.DataType;
+            _openValues = HeldRows.Column.For(_openValuesType);
+            if (_openValues is null)
+            {
+                _openValuesRefused = true;
+                return false;
+            }
+        }
+        // The same layout and width: one column's arrays differ at most in type instances (a decimal narrowed per
+        // append), never in what the encoders read.
+        return _openValues.Takes(piece.Array);
+    }
+
+    /// <summary>Whether every open piece not yet accumulated, and the optional segment's entries, accumulate.</summary>
+    private bool OpenAccumulates(Segment? segment)
+    {
+        for (int i = _openAccumulated ? 1 : 0; i < _open!.Count; i++)
+        {
+            if (!Accumulates(_open[i]))
+                return false;
+        }
+        return segment is null || Accumulates(segment);
+    }
+
+    /// <summary>Adds level entries [<paramref name="start"/>, +<paramref name="levels"/>) of a segment to the accumulated open page.</summary>
+    private void Accumulate(Segment from, int start, int levels, int nonNull)
+    {
+        if (levels == 0)
+            return;
+        var values = from.Array!;
+        _openValues!.Append(SliceRows(values, start, levels), _openAccumulatedLevels);
+        if (_maxDefLevel > 0)
+        {
+            int total = _openAccumulatedLevels + levels;
+            if (_openDef is null || _openDef.Length < total)
+            {
+                var grown = new int[Math.Max(total, Math.Max(256, (_openDef?.Length ?? 0) * 2))];
+                _openDef?.AsSpan(0, _openAccumulatedLevels).CopyTo(grown);
+                _openDef = grown;
+            }
+            from.Def.AsSpan(start, levels).CopyTo(_openDef.AsSpan(_openAccumulatedLevels));
+        }
+        _openAccumulatedLevels += levels;
+        _openAccumulatedNonNull += nonNull;
+    }
+
+    /// <summary>Accumulates the open pieces not yet accumulated, leaving <see cref="_open"/> the one segment over them.</summary>
+    private void AccumulateOpen()
+    {
+        var pieces = _open!;
+        for (int i = _openAccumulated ? 1 : 0; i < pieces.Count; i++)
+            Accumulate(pieces[i], pieces[i].Start, pieces[i].Levels, pieces[i].NonNull);
+        pieces.Clear();
+        pieces.Add(AccumulatedSegment());
+        _openAccumulated = true;
+    }
+
+    /// <summary>A segment over the accumulated open page, valid until it is next added to or cleared.</summary>
+    private Segment AccumulatedSegment() => new()
+    {
+        Array = _openValues!.Build(_openValuesType!, _openAccumulatedLevels),
+        Def = _maxDefLevel > 0 ? _openDef : null,
+        ValueDef = _maxDefLevel > 0 ? _openDef : null,
+        Start = 0,
+        End = _openAccumulatedLevels,
+        ValueStart = 0,
+        NonNull = _openAccumulatedNonNull,
+    };
 
     /// <summary>
     /// The chunk's FSST symbol table: trained on the first values the chunk writes in its own encoding (retried on later
@@ -936,10 +1041,17 @@ internal sealed class ColumnChunkWriter
 
         if (_open is not null)
         {
-            for (int i = _openDetached; i < _open.Count; i++)
+            if (_openDetached < _open.Count && OpenAccumulates(null))
             {
-                if (_open[i].Borrowed)
-                    _open[i] = _open[i].Copy(withArray: !_tailDictionary, withIndices: _tailDictionary);
+                AccumulateOpen();
+            }
+            else
+            {
+                for (int i = _openDetached; i < _open.Count; i++)
+                {
+                    if (_open[i].Borrowed)
+                        _open[i] = _open[i].Copy(withArray: !_tailDictionary, withIndices: _tailDictionary);
+                }
             }
             _openDetached = _open.Count;
         }
@@ -1580,6 +1692,9 @@ internal sealed class ColumnChunkWriter
 
     private void ClearOpenPage()
     {
+        _openValues?.Clear();
+        _openAccumulated = false;
+        _openAccumulatedLevels = _openAccumulatedNonNull = 0;
         _open = null;
         _openDetached = 0;
         _openLevels = 0;
@@ -1608,6 +1723,16 @@ internal sealed class ColumnChunkWriter
         var pieces = _open!;
         int nextNonNull = segment is null ? 0
             : _maxDefLevel > 0 ? CountNonNull(segment.Def!, offset, levels, _maxDefLevel) : levels;
+
+        // A flat page that is not dictionary-encoded is added to the accumulated open page: each value copied once.
+        if (!dictionary && OpenAccumulates(segment))
+        {
+            AccumulateOpen();
+            if (segment is not null)
+                Accumulate(segment, offset, levels, nextNonNull);
+            return AccumulatedSegment();
+        }
+
         int total = _openLevels + levels;
         var joined = new Segment
         {
