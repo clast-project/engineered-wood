@@ -57,10 +57,9 @@ internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
         {
             if (elementCount < 0)
                 throw new ArgumentOutOfRangeException(nameof(elementCount));
-            _pooled = new PooledMemoryManager(checked(elementCount * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()));
+            _pooled = new PooledMemoryManager(
+                checked(elementCount * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()), zeroFill);
             _pooledLength = elementCount;
-            if (zeroFill)
-                _pooled.GetSpan().Clear();
             return;
         }
 #endif
@@ -105,6 +104,16 @@ internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
         {
             var owner = _pooled;
             _pooled = null;
+            // Same policy as the unpooled path below: a buffer at most half used is cut down to what was used.
+            if (usedBytes >= 0 && usedBytes <= owner.Length / 2)
+            {
+                if (usedBytes == 0)
+                {
+                    ((IDisposable)owner).Dispose();
+                    return ArrowBuffer.Empty;
+                }
+                owner.TrimTo(usedBytes);
+            }
             return NativeBufferPool.CreateOwnedArrowBuffer(owner);
         }
 #endif
@@ -136,6 +145,16 @@ internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
     /// </summary>
     public void GrowExact(int newElementCount)
     {
+#if NET8_0_OR_GREATER
+        if (_pooled != null)
+        {
+            if (newElementCount <= _pooledLength)
+                return;
+            _pooled.Reallocate(checked(newElementCount * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()));
+            _pooledLength = newElementCount;
+            return;
+        }
+#endif
         var inner = _inner ?? throw new ObjectDisposedException(nameof(NativeBuffer<T>));
         if (newElementCount <= inner.Length)
             return;

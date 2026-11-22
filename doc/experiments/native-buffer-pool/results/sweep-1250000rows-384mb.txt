@@ -1,0 +1,31 @@
+job commit limit 384 MiB per process; 1 rep(s)
+RESULT double_plain off steady median_ms=3.200 p90_ms=3.838 n=827 peak_commit_mb=63.1 end_commit_mb=54.5 hits=0 misses=0 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=fa5ded75f656265d
+RESULT double_plain classic steady median_ms=1.777 p90_ms=2.415 n=1566 peak_commit_mb=75.6 end_commit_mb=73.7 hits=3057 misses=2 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=fa5ded75f656265d
+RESULT double_plain commit steady median_ms=1.852 p90_ms=2.421 n=1513 peak_commit_mb=65.6 end_commit_mb=63.0 hits=2959 misses=2 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=fa5ded75f656265d
+RESULT int32_plain off steady median_ms=1.415 p90_ms=1.618 n=1871 peak_commit_mb=45.7 end_commit_mb=40.1 hits=0 misses=0 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=0e0bec2afd9ba1b8
+RESULT int32_plain classic steady median_ms=0.671 p90_ms=0.945 n=4029 peak_commit_mb=52.1 end_commit_mb=51.2 hits=7903 misses=2 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=0e0bec2afd9ba1b8
+RESULT int32_plain commit steady median_ms=0.682 p90_ms=0.823 n=4212 peak_commit_mb=45.5 end_commit_mb=44.7 hits=8484 misses=2 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=0e0bec2afd9ba1b8
+RESULT int32_w11 off steady median_ms=1.724 p90_ms=1.858 n=1593 peak_commit_mb=39.7 end_commit_mb=33.6 hits=0 misses=0 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=512a537c46141b01
+RESULT int32_w11 classic steady median_ms=1.136 p90_ms=1.218 n=2595 peak_commit_mb=47.0 end_commit_mb=47.0 hits=4884 misses=2 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=512a537c46141b01
+RESULT int32_w11 commit steady median_ms=1.140 p90_ms=1.232 n=2584 peak_commit_mb=41.4 end_commit_mb=41.3 hits=5089 misses=2 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=512a537c46141b01
+RESULT int64_opt off steady median_ms=5.581 p90_ms=6.158 n=500 peak_commit_mb=66.4 end_commit_mb=57.8 hits=0 misses=0 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=73715b41886a97bb
+RESULT int64_opt classic steady median_ms=4.032 p90_ms=4.407 n=728 peak_commit_mb=86.5 end_commit_mb=86.5 hits=2862 misses=4 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=73715b41886a97bb
+RESULT int64_opt commit steady median_ms=4.256 p90_ms=4.850 n=688 peak_commit_mb=71.5 end_commit_mb=71.5 hits=2750 misses=4 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=73715b41886a97bb
+RESULT string_plain off steady median_ms=17.915 p90_ms=18.727 n=161 peak_commit_mb=110.1 end_commit_mb=82.4 hits=0 misses=0 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=784a9c5a684196cb
+RESULT string_plain classic steady median_ms=16.895 p90_ms=18.840 n=168 peak_commit_mb=146.0 end_commit_mb=114.9 hits=1009 misses=343 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=784a9c5a684196cb
+RESULT string_plain commit steady median_ms=16.717 p90_ms=17.366 n=172 peak_commit_mb=112.5 end_commit_mb=94.4 hits=1027 misses=349 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=784a9c5a684196cb
+RESULT double_plain off window8 median_ms=3.152 p90_ms=3.570 n=845 peak_commit_mb=129.7 end_commit_mb=121.1 hits=0 misses=0 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=fa5ded75f656265d
+RESULT double_plain classic window8 median_ms=1.978 p90_ms=2.332 n=1482 peak_commit_mb=188.5 end_commit_mb=186.9 hits=2929 misses=9 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=fa5ded75f656265d
+RESULT double_plain commit window8 median_ms=1.962 p90_ms=2.663 n=1416 peak_commit_mb=130.6 end_commit_mb=130.5 hits=2784 misses=9 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=fa5ded75f656265d
+RESULT int32_plain off window8 median_ms=1.364 p90_ms=1.502 n=1930 peak_commit_mb=78.9 end_commit_mb=73.2 hits=0 misses=0 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=0e0bec2afd9ba1b8
+RESULT int32_plain classic window8 median_ms=0.756 p90_ms=1.090 n=3599 peak_commit_mb=108.5 end_commit_mb=106.9 hits=7277 misses=9 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=0e0bec2afd9ba1b8
+RESULT int32_plain commit window8 median_ms=0.768 p90_ms=0.922 n=3690 peak_commit_mb=79.5 end_commit_mb=78.4 hits=7360 misses=9 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=0e0bec2afd9ba1b8
+RESULT int32_w11 off window8 median_ms=1.648 p90_ms=1.784 n=1641 peak_commit_mb=72.6 end_commit_mb=66.7 hits=0 misses=0 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=512a537c46141b01
+RESULT int32_w11 classic window8 median_ms=1.191 p90_ms=1.315 n=2465 peak_commit_mb=102.2 end_commit_mb=100.9 hits=4622 misses=9 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=512a537c46141b01
+RESULT int32_w11 commit window8 median_ms=1.166 p90_ms=1.250 n=2533 peak_commit_mb=74.2 end_commit_mb=74.2 hits=4761 misses=9 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=512a537c46141b01
+RESULT int64_opt off window8 median_ms=5.420 p90_ms=5.792 n=516 peak_commit_mb=134.7 end_commit_mb=126.1 hits=0 misses=0 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=73715b41886a97bb
+RESULT int64_opt classic window8 median_ms=4.152 p90_ms=4.502 n=707 peak_commit_mb=196.4 end_commit_mb=196.4 hits=2776 misses=18 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=73715b41886a97bb
+RESULT int64_opt commit window8 median_ms=4.335 p90_ms=4.787 n=682 peak_commit_mb=143.1 end_commit_mb=143.1 hits=2684 misses=18 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=73715b41886a97bb
+RESULT string_plain off window8 median_ms=18.116 p90_ms=19.552 n=158 peak_commit_mb=275.9 end_commit_mb=248.2 hits=0 misses=0 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=784a9c5a684196cb
+FAILED string_plain classic window8 exit=-532462766 
+RESULT string_plain commit window8 median_ms=16.780 p90_ms=19.000 n=169 peak_commit_mb=280.8 end_commit_mb=262.7 hits=1007 misses=361 trims=0 cap_mb=24 job_limit_mb=384 gc_limit_mb=288 checksum=784a9c5a684196cb
