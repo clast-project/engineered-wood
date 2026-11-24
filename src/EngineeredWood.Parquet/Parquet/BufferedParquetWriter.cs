@@ -88,39 +88,52 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        // As in ParquetFileWriter: the caller's schema is kept for ARROW:schema, and the batch is
-        // rescaled out of second precision before its schema is captured, so the footer declares
-        // what the encoders write.
-        var declared = batch.Schema;
-        batch = TimeUnitRescaler.ToParquetUnits(batch);
-        batch = ByteArrayLayoutNormalizer.ToOffsetLayout(batch);
-
-        if (!_assembler.HeaderWritten)
+        var source = batch;
+        try
         {
-            // As in ParquetFileWriter: a null in a required column would be written as a value. Checked before
-            // anything is captured or written, so a refused first batch leaves the writer as it was.
-            RowGroupSchemaCheck.EnsureWritable(batch);
-            _declaredSchema ??= declared;
-            _arrowSchema = batch.Schema;
-            _parquetSchema = ArrowToSchemaConverter.Convert(_arrowSchema, _options);
-            await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
+            // As in ParquetFileWriter: the caller's schema is kept for ARROW:schema, and the batch is
+            // rescaled out of second precision before its schema is captured, so the footer declares
+            // what the encoders write.
+            var declared = batch.Schema;
+            batch = TimeUnitRescaler.ToParquetUnits(batch);
+            batch = ByteArrayLayoutNormalizer.ToOffsetLayout(batch);
+
+            if (!_assembler.HeaderWritten)
+            {
+                // As in ParquetFileWriter: a null in a required column would be written as a value. Checked before
+                // anything is captured or written, so a refused first batch leaves the writer as it was.
+                RowGroupSchemaCheck.EnsureWritable(batch);
+                _declaredSchema ??= declared;
+                _arrowSchema = batch.Schema;
+                _parquetSchema = ArrowToSchemaConverter.Convert(_arrowSchema, _options);
+                await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                // As in ParquetFileWriter: later batches are encoded against the first one's schema.
+                RowGroupSchemaCheck.EnsureMatches(_arrowSchema!, batch);
+            }
+
+            // Initialize column states on first batch
+            if (_columnStates == null)
+            {
+                InitializeColumnStates(batch);
+            }
+
+            // Dictionary-encode each column and append indices
+            AppendBatchToBuffers(batch);
+
+            // Auto-flush if we've reached the row group limit
+            while (_bufferedRows >= _options.RowGroupMaxRows)
+            {
+                await FlushRowGroupAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
-        else
+        finally
         {
-            // As in ParquetFileWriter: later batches are encoded against the first one's schema.
-            RowGroupSchemaCheck.EnsureMatches(_arrowSchema!, batch);
+            // Normalized batches can borrow native buffers whose owner is still the original batch.
+            GC.KeepAlive(source);
         }
-
-        // Initialize column states on first batch
-        if (_columnStates == null)
-            InitializeColumnStates(batch);
-
-        // Dictionary-encode each column and append indices
-        AppendBatchToBuffers(batch);
-
-        // Auto-flush if we've reached the row group limit
-        while (_bufferedRows >= _options.RowGroupMaxRows)
-            await FlushRowGroupAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -220,7 +233,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 {
                     // Cardinality too high: reconstruct Arrow array from dictionary + indices
                     // and encode via the standard non-dictionary path (delta, BSS, plain, etc.)
-                    var array = ReconstructArrowArray(s, dictResults[i]!.Value, pageLengths[i],
+                    using var array = ReconstructArrowArray(s, dictResults[i]!.Value, pageLengths[i],
                         PresenceLevels(s, defLevelsPerColumn[i]), s.LevelCount);
                     var options = overLimit[i] ? _options : _options with { DictionaryEnabled = false };
                     columnResults[i] = WriteLeaf(
@@ -228,7 +241,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 }
                 else if (s.BooleanValues != null)
                 {
-                    var boolArr = BuildBooleanArray(s);
+                    using var boolArr = BuildBooleanArray(s);
                     columnResults[i] = WriteLeaf(s, boolArr, defLevelsPerColumn[i], repLevelsPerColumn[i], _options);
                 }
                 else
@@ -318,6 +331,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        DiscardBuffers();
 
         if (_ownsFile)
             await _file.DisposeAsync().ConfigureAwait(false);
@@ -328,7 +342,15 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        DiscardBuffers();
         if (_ownsFile) _file.Dispose();
+    }
+
+    private void DiscardBuffers()
+    {
+        _columnStates = null;
+        _firstLeaf = null;
+        _bufferedRows = 0;
     }
 
     // ───── Initialization ─────
@@ -377,6 +399,10 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             IArrowType encodingType = field.DataType is ExtensionType ext
                 ? ext.StorageType
                 : field.DataType;
+            if (encodingType is RunEndEncodedType runs)
+            {
+                encodingType = runs.ValuesDataType;
+            }
 
             // A promoted timestamp reaches the encoders as the twelve-byte carrier, not as int64. The
             // schema element already says FIXED_LEN_BYTE_ARRAY(12); if the encoder still dispatched on
@@ -441,10 +467,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             }
 
             var state = _columnStates[first];
-            // Mirror InitializeColumnStates: hand the encoder the storage
-            // array so it dispatches on the Arrow storage type.
-            if (array is ExtensionArray ea)
-                array = ea.Storage;
+            array = LeafValues(array);
             if (state.ExtendedTimestamp)
                 array = ExtendedTimestamp.EncodeColumn(array);
             prepared[c] = [new PreparedLeaf(state.Prepare(array), rowCount, null, null)];
@@ -472,7 +495,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     private readonly record struct PreparedLeaf(IArrowArray Array, int LevelCount, int[]? DefLevels, int[]? RepLevels);
 
     /// <summary>
-    /// A nested leaf as the state buffers it: the storage of an extension, since the encoders dispatch on that, and a
+    /// A leaf as the state buffers it: the storage of an extension, since the encoders dispatch on that, and a
     /// run-end encoded leaf expanded to its values. NestedLevelWriter hands a run-end encoded leaf over as runs when the
     /// batch needs no rebuild and as plain values when it does, so its layout can change from batch to batch, while a
     /// state reads every batch by the type it took from the first. The values are dictionary-encoded one by one either
@@ -786,7 +809,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 "which BufferedParquetWriter cannot buffer. Write it with ParquetFileWriter instead.");
         }
 
-        var array = ReconstructArrowArray(
+        using var array = ReconstructArrowArray(
             state,
             new DictionaryEncoder.DictionaryResult
             {
@@ -905,6 +928,16 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         public IArrowArray Prepare(IArrowArray array)
         {
             array = NarrowDecimal(array);
+
+            if (ArrowType is not (BooleanType or Int8Type or UInt8Type or Int16Type or UInt16Type
+                or HalfFloatType or Int32Type or UInt32Type or Date32Type or Time32Type
+                or Int64Type or UInt64Type or Date64Type or Time64Type or TimestampType or DurationType
+                or FloatType or DoubleType or Apache.Arrow.Types.StringType or BinaryType or FixedSizeBinaryType))
+            {
+                throw new NotSupportedException(
+                    $"Column '{string.Join(".", PathInSchema)}' has Arrow type {ArrowType.Name}, " +
+                    "which BufferedParquetWriter cannot buffer. Write it with ParquetFileWriter instead.");
+            }
 
             // The encoders read a batch's raw buffers as ArrowType, taken from the first batch. A leaf whose layout
             // changed since would be misread, so it is refused; LeafValues keeps the known case (runs) from reaching
