@@ -29,6 +29,98 @@ public class BufferedParquetWriterTests : IDisposable
 
     private string TempPath(string name) => Path.Combine(_tempDir, name);
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RunEndEncodedColumns_SlicedNullableBatches_RoundTrip(bool dictionaryEnabled)
+    {
+        using var runEnds = new Int32Array.Builder().Append(2).Append(5).Append(8).Build();
+        using var numbers = new RunEndEncodedArray(runEnds,
+            new Int32Array.Builder().Append(10).AppendNull().Append(20).Build());
+        using var names = new RunEndEncodedArray(runEnds,
+            new StringArray.Builder().Append("first").AppendNull().Append("last").Build());
+        using var flags = new RunEndEncodedArray(runEnds,
+            new BooleanArray.Builder().Append(true).AppendNull().Append(false).Build());
+        using var batch = new RecordBatch(new Apache.Arrow.Schema(
+            [
+                new Field("number", numbers.Data.DataType, true),
+                new Field("name", names.Data.DataType, true),
+                new Field("flag", flags.Data.DataType, true),
+            ], null), [numbers, names, flags], 8);
+        using var slice = batch.Slice(1, 6);
+        string path = TempPath("runs.parquet");
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new BufferedParquetWriter(file, ownsFile: false,
+            new ParquetWriteOptions
+            {
+                DictionaryEnabled = dictionaryEnabled,
+                RowGroupMaxRows = 10,
+                Compression = CompressionCodec.Uncompressed,
+            }))
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                await writer.AppendAsync(slice);
+            }
+            await writer.CloseAsync();
+        }
+
+        int?[] expectedNumbers = [10, null, null, null, 20, 20];
+        string?[] expectedNames = ["first", null, null, null, "last", "last"];
+        bool?[] expectedFlags = [true, null, null, null, false, false];
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        Assert.Equal(18, metadata.NumRows);
+        Assert.Equal(2, metadata.RowGroups.Count);
+        int row = 0;
+        for (int group = 0; group < metadata.RowGroups.Count; group++)
+        {
+            using var actual = await reader.ReadRowGroupAsync(group);
+            for (int i = 0; i < actual.Length; i++, row++)
+            {
+                Assert.Equal(expectedNumbers[row % 6], ((Int32Array)actual.Column(0)).GetValue(i));
+                Assert.Equal(expectedNames[row % 6], ((StringArray)actual.Column(1)).GetString(i));
+                Assert.Equal(expectedFlags[row % 6], ((BooleanArray)actual.Column(2)).GetValue(i));
+            }
+        }
+    }
+
+    [Fact]
+    public async Task UnsupportedBufferLayout_IsRejectedDuringAppend()
+    {
+        using var values = new RunEndEncodedArray(
+            new Int32Array.Builder().Append(2).Append(3).Build(),
+            new Int32Array.Builder().Append(10).Append(20).Build());
+        using var runs = new RunEndEncodedArray(
+            new Int32Array.Builder().Append(2).Append(5).Append(8).Build(), values);
+        using var batch = new RecordBatch(new Apache.Arrow.Schema(
+            [
+                new Field("supported", Int32Type.Default, false),
+                new Field("unsupported", runs.Data.DataType, false),
+            ], null),
+            [new Int32Array.Builder().AppendRange(Enumerable.Range(0, 8)).Build(), runs], 8);
+        string path = TempPath("unsupported.parquet");
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new BufferedParquetWriter(file, ownsFile: false))
+        {
+            var error = await Assert.ThrowsAsync<AggregateException>(() => writer.AppendAsync(batch).AsTask());
+            Assert.All(error.Flatten().InnerExceptions, e =>
+            {
+                Assert.IsType<NotSupportedException>(e);
+                Assert.Contains("unsupported", e.Message);
+            });
+            Assert.Equal(0, writer.BufferedRows);
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        Assert.Equal(0, metadata.NumRows);
+        Assert.Empty(metadata.RowGroups);
+    }
+
     [Fact]
     public async Task SingleBatch_RoundTrip()
     {
@@ -497,13 +589,26 @@ public class BufferedParquetWriterTests : IDisposable
     /// Dispose used to flush the buffered rows and write the footer. Without <c>CloseAsync</c> it now
     /// abandons the file, so rows buffered by a write that failed part-way are not published.
     /// </summary>
-    [Fact]
-    public async Task DisposeWithoutClose_PublishesNothing()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task DisposeWithoutClose_DropsBufferedRowsAndPublishesNothing(bool asyncDispose)
     {
         string path = TempPath("abandoned.parquet");
+        using var batch = MakeMixedBatch(100);
         await using (var writer = new BufferedParquetWriter(new LocalSequentialFile(path), ownsFile: true))
         {
-            await writer.AppendAsync(MakeMixedBatch(100));
+            await writer.AppendAsync(batch);
+            if (asyncDispose)
+            {
+                await writer.DisposeAsync();
+            }
+            else
+            {
+                writer.Dispose();
+            }
+            Assert.Equal(0, writer.BufferedRows);
+            Assert.NotNull(((Int32Array)batch.Column(0)).GetValue(0));
         }
 
         Assert.False(File.Exists(path));
