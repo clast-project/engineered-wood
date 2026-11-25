@@ -34,7 +34,7 @@ internal static class BufferedWriteAb
         var options = ParquetWriteOptions.Default with
         {
             Compression = CompressionCodec.Uncompressed,
-            RowGroupMaxRows = rows,
+            RowGroupMaxRows = rows + 1, // the flush lands in Close, so append and flush time apart
         };
 
         Console.WriteLine($"{rows:N0} rows in {batchRows:N0}-row appends, one row group, uncompressed; best of {rounds} after 3 s warm-up (ms).");
@@ -50,7 +50,10 @@ internal static class BufferedWriteAb
                 ? double.NaN
                 : Time(rounds, () => StreamingAsync(batch, batchRows, options).GetAwaiter().GetResult());
             double buffered = Time(rounds, () => BufferedAsync(batch, batchRows, options).GetAwaiter().GetResult());
-            Console.WriteLine($"| {name} | {streaming:F2} | {buffered:F2} | {buffered / streaming:F2}x |");
+            _appendMs = _closeMs = double.MaxValue;
+            for (int i = 0; i < rounds; i++)
+                await BufferedAsync(batch, batchRows, options);
+            Console.WriteLine($"| {name} | {streaming:F2} | {buffered:F2} | {buffered / streaming:F2}x | append {_appendMs:F2} / flush {_closeMs:F2} |");
         }
 
         return 0;
@@ -125,10 +128,18 @@ internal static class BufferedWriteAb
     private static async Task BufferedAsync(RecordBatch batch, int batchRows, ParquetWriteOptions options)
     {
         await using var writer = new BufferedParquetWriter(new CountingSequentialFile(), ownsFile: true, options);
+        var clock = Stopwatch.StartNew();
         for (int start = 0; start < batch.Length; start += batchRows)
             await writer.AppendAsync(batch.Slice(start, Math.Min(batchRows, batch.Length - start)));
+        double append = clock.Elapsed.TotalMilliseconds;
         await writer.CloseAsync();
+        double close = clock.Elapsed.TotalMilliseconds - append;
+        if (append + close < _appendMs + _closeMs)
+            (_appendMs, _closeMs) = (append, close);
     }
+
+    // The append and flush split of the fastest buffered round, since the last reset.
+    private static double _appendMs = double.MaxValue, _closeMs = double.MaxValue;
 
     private static double Time(int rounds, Action action)
     {

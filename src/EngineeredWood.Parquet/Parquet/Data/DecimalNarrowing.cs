@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Arrow;
@@ -152,6 +153,34 @@ internal static class DecimalNarrowing
         int length = array.Length;
         ReadOnlySpan<byte> src = array.Data.Buffers[1].Span.Slice(array.Data.Offset * slot, length * slot);
         bool checkNulls = array.NullCount != 0;
+
+        // A Decimal128 to INT32/INT64, the common narrowing: each slot read as two words, the low one fitting when
+        // the high word (and for INT32 the low word's top half) only repeats its sign.
+        if (slot == 16 && !bigEndian && (width == 8 || width == 4) && BitConverter.IsLittleEndian)
+        {
+            var words = MemoryMarshal.Cast<byte, long>(src);
+            var longs = MemoryMarshal.Cast<byte, long>(values.AsSpan(0, width == 8 ? length * 8 : 0));
+            var ints = MemoryMarshal.Cast<byte, int>(values.AsSpan(0, width == 4 ? length * 4 : 0));
+            for (int i = 0; i < length; i++)
+            {
+                long low = words[2 * i], high = words[2 * i + 1];
+                bool fits = width == 8 ? high == low >> 63 : high == low >> 63 && low == (int)low;
+                if (!fits)
+                {
+                    if (!checkNulls || !array.IsNull(i))
+                        throw OutOfRange(slot, width);
+                    low = 0; // The bytes under a null are arbitrary; written zero, as below.
+                }
+
+                if (width == 8)
+                    longs[i] = low;
+                else
+                    ints[i] = (int)low;
+            }
+
+            GC.KeepAlive(array);
+            return;
+        }
 
         for (int i = 0; i < length; i++)
         {

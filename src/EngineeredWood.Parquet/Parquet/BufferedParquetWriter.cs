@@ -158,7 +158,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         try
         {
-            Parallel.For(0, states.Length, i => columnResults[i] = EncodeColumn(states[i]));
+            ForEachColumn(states.Length, inline: states.Length == 1, i => columnResults[i] = EncodeColumn(states[i]));
         }
         catch
         {
@@ -439,7 +439,11 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         // ahead of the rest and of _bufferedRows, and the next flush would write columns that disagree on the row
         // group's row count.
         var prepared = new PreparedLeaf[batch.ColumnCount][];
-        Parallel.For(0, batch.ColumnCount, c =>
+
+        // As ParquetFileWriter decides for an append (InlineCells): a batch of one column, or too small for the
+        // threads to pay, runs its columns inline.
+        bool inline = batch.ColumnCount == 1 || (long)rowCount * batch.ColumnCount < ParquetFileWriter.InlineCells;
+        ForEachColumn(batch.ColumnCount, inline, c =>
         {
             var array = batch.Column(c);
             int first = _firstLeaf![c];
@@ -465,7 +469,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             prepared[c] = [new PreparedLeaf(state.Prepare(array), rowCount, null, null)];
         });
 
-        Parallel.For(0, batch.ColumnCount, c =>
+        ForEachColumn(batch.ColumnCount, inline, c =>
         {
             int first = _firstLeaf![c];
             var column = prepared[c];
@@ -481,6 +485,27 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         });
 
         _bufferedRows += rowCount;
+    }
+
+    private static void ForEachColumn(int columns, bool inline, Action<int> body)
+    {
+        if (inline)
+        {
+            // A failure surfaces as Parallel.For surfaces it, whichever way the columns ran.
+            try
+            {
+                for (int c = 0; c < columns; c++)
+                    body(c);
+            }
+            catch (Exception e)
+            {
+                throw new AggregateException(e);
+            }
+        }
+        else
+        {
+            Parallel.For(0, columns, body);
+        }
     }
 
     /// <summary>One leaf of a batch as <see cref="BufferedColumnState.Prepare"/> left it, with its levels when nested.</summary>
@@ -1038,7 +1063,32 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             bool hasLevels = DefLevels is not null;
             ReadOnlySpan<int> levels = hasLevels ? DefLevels!.Slice(LevelCount, levelCount) : default;
             int max = MaxDefLevel;
-            for (int i = 0; i < levelCount; i++)
+            int first = 0;
+
+            // Both ends on a byte boundary, as appends of whole bytes of rows leave them: whole bytes are copied, and
+            // for a flat column the values under nulls are cleared by its validity bitmap, which a nested leaf's
+            // levels do not mirror (it goes bit by bit).
+            if (((sourceOffset | at) & 7) == 0 && !IsNested)
+            {
+                var validity = data.Buffers[0].Span;
+                int bytes = levelCount >> 3;
+                var from = source.Slice(sourceOffset >> 3, bytes);
+                var to = target.Slice(at >> 3, bytes);
+                if (validity.IsEmpty)
+                {
+                    from.CopyTo(to);
+                }
+                else
+                {
+                    var valid = validity.Slice(sourceOffset >> 3, bytes);
+                    for (int b = 0; b < bytes; b++)
+                        to[b] = (byte)(from[b] & valid[b]);
+                }
+
+                first = bytes << 3;
+            }
+
+            for (int i = first; i < levelCount; i++)
             {
                 if (hasLevels && levels[i] != max)
                     continue;
@@ -1051,13 +1101,16 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             }
         }
 
-        /// <summary>The buffered booleans as an array of a slot per level, null where a level holds no value.</summary>
+        /// <summary>
+        /// The buffered booleans as an array of a slot per level, null where a level holds no value. It borrows this
+        /// state's bits: encode it before the state takes another value.
+        /// </summary>
         public Apache.Arrow.BooleanArray BuildBooleanArray(int[]? presence)
         {
             int length = LevelCount;
-            var values = _booleanBits.AsSpan(0, (length + 7) / 8).ToArray();
+            var values = new ArrowBuffer(_booleanBits.AsMemory(0, (length + 7) / 8));
             var (validity, nullCount) = ValidityBitmap(presence, length);
-            return new Apache.Arrow.BooleanArray(new ArrowBuffer(values), validity, length, nullCount, 0);
+            return new Apache.Arrow.BooleanArray(values, validity, length, nullCount, 0);
         }
 
         /// <summary>
@@ -1135,12 +1188,15 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                     if (neededOffsets > DictionaryEncoder.BytesHashTable.MaxArrayLength)
                         throw new InvalidOperationException(
                             "A column's values in one row group exceed the largest array .NET can allocate; flush row groups sooner.");
-                    System.Array.Resize(ref _plainOffsets, (int)Math.Min(DictionaryEncoder.BytesHashTable.MaxArrayLength,
+                    _plainOffsets = Grown(_plainOffsets, (_plainLevels + 1) * sizeof(int), (int)Math.Min(DictionaryEncoder.BytesHashTable.MaxArrayLength,
                         Math.Max(neededOffsets, Math.Max(1024, (long)(_plainOffsets?.Length ?? 0) * 2))));
                 }
 
-                // offsets[0] is already the end of the values before (0 for the first append).
+                // offsets[0] is already the end of the values before, and is set here for the first append: a grown
+                // buffer is not zeroed.
                 var offsets = MemoryMarshal.Cast<byte, int>(_plainOffsets.AsSpan()).Slice(_plainLevels, levelCount + 1);
+                if (_plainLevels == 0)
+                    offsets[0] = 0;
 
                 if (!HasLargeValue(sourceOffsets))
                 {
@@ -1230,6 +1286,23 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             return (int)((key * 0x9E3779B97F4A7C15UL) >> 54); // the top 10 bits: RecentSlots = 1 << 10
         }
 
+        /// <summary>
+        /// <paramref name="array"/> moved to one of <paramref name="length"/> bytes holding its first
+        /// <paramref name="used"/>. The rest is not zeroed where the runtime allows: every byte past them is written
+        /// before it is read, and zeroing a buffer the size of the column was a measurable share of an append.
+        /// </summary>
+        private static byte[] Grown(byte[]? array, int used, int length)
+        {
+#if NET5_0_OR_GREATER
+            var grown = GC.AllocateUninitializedArray<byte>(length);
+#else
+            var grown = new byte[length];
+#endif
+            if (array is not null)
+                array.AsSpan(0, used).CopyTo(grown);
+            return grown;
+        }
+
         /// <summary><paramref name="count"/> new bytes at the end of the plain values, for the caller to fill.</summary>
         private Span<byte> PlainSpace(int count)
         {
@@ -1239,7 +1312,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 if (needed > DictionaryEncoder.BytesHashTable.MaxArrayLength)
                     throw new InvalidOperationException(
                         "A column's values in one row group exceed the largest array .NET can allocate; flush row groups sooner.");
-                System.Array.Resize(ref _plainValues, (int)Math.Min(DictionaryEncoder.BytesHashTable.MaxArrayLength,
+                _plainValues = Grown(_plainValues, (int)_plainLength, (int)Math.Min(DictionaryEncoder.BytesHashTable.MaxArrayLength,
                     Math.Max(needed, Math.Max(1024, (long)_plainValues.Length * 2))));
             }
 
@@ -1439,8 +1512,19 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                     EncodeByteArray(array.Data, srcOffset, rowCount);
                     break;
 
-                // Every decimal derives from FixedSizeBinaryType and lands here. A Decimal32/64 (one written as
-                // INT32/INT64, #504) keeps its raw little-endian slot, which is the INT32/INT64 dictionary entry.
+                // A Decimal32/64 (one written as INT32/INT64, #504) keeps its raw little-endian slot, which is the
+                // INT32/INT64 dictionary entry, so it is looked up as that integer.
+                case Apache.Arrow.Types.Decimal32Type:
+                    EncodeFixedInt(MemoryMarshal.Cast<byte, int>(
+                        array.Data.Buffers[1].Span), srcOffset, rowCount);
+                    break;
+
+                case Apache.Arrow.Types.Decimal64Type:
+                    EncodeFixedLong(MemoryMarshal.Cast<byte, long>(
+                        array.Data.Buffers[1].Span), srcOffset, rowCount);
+                    break;
+
+                // The other decimals derive from FixedSizeBinaryType and land here.
                 case Apache.Arrow.Types.FixedSizeBinaryType fsb:
                     EncodeFixedLenByteArray(
                         array.Data.Buffers[1].Span, srcOffset, rowCount, fsb.ByteWidth, EntryWidth(fsb.ByteWidth));
@@ -1833,8 +1917,20 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         public void Add(int value)
         {
             if (_count >= _data.Length)
-                System.Array.Resize(ref _data, _data.Length * 2);
+                Resize(_data.Length * 2);
             _data[_count++] = value;
+        }
+
+        // Every element is written before it is read, so a grown array is not zeroed where the runtime allows.
+        private void Resize(int length)
+        {
+#if NET5_0_OR_GREATER
+            var grown = GC.AllocateUninitializedArray<int>(length);
+#else
+            var grown = new int[length];
+#endif
+            _data.AsSpan(0, _count).CopyTo(grown);
+            _data = grown;
         }
 
         /// <summary><paramref name="count"/> new elements at the end, for the caller to fill.</summary>
@@ -1846,7 +1942,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 if (needed > DictionaryEncoder.BytesHashTable.MaxArrayLength / sizeof(int))
                     throw new InvalidOperationException(
                         "A column's levels in one row group exceed the largest array .NET can allocate; flush row groups sooner.");
-                System.Array.Resize(ref _data, (int)Math.Min(
+                Resize((int)Math.Min(
                     DictionaryEncoder.BytesHashTable.MaxArrayLength / sizeof(int), Math.Max(needed, (long)_data.Length * 2)));
             }
 
