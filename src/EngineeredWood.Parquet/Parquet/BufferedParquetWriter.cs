@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers.Binary;
+using System.IO.Hashing;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -205,13 +206,16 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         // before the first page decided, else kept for the pages before the cut and the rest written in the column's
         // own encoding. The column is rebuilt and written through that writer's own path, so the two writers agree;
         // this costs a second pass of hashing, only for such a column.
-        bool overLimit = s.DictionaryPageLength > _options.DictionaryPageSizeLimit;
+        // Only a wide FIXED_LEN_BYTE_ARRAY gets here with its dictionary disabled (see CanHoldPlain). Its values were
+        // held as deduplicated entries, and are rebuilt and written without a dictionary.
+        bool enabled = s.DictionaryEnabled;
+        bool overLimit = enabled && s.DictionaryPageLength > _options.DictionaryPageSizeLimit;
 
         var indices = s.Indices!.ToArray(s.NonNullCount);
         DictionaryEncoder.DictionaryResult dictionary;
         int pageLength;
         bool useNonDictionary;
-        if (overLimit && s.TryBorrowPage(out byte[] page))
+        if ((!enabled || overLimit) && s.TryBorrowPage(out byte[] page))
         {
             // Rebuilt, never written: the rebuild reads the buffered entries where they are, without the copy a
             // written page needs. Past the limit they are the values themselves, as large as the rebuilt column, so
@@ -238,7 +242,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             // Otherwise the file writer's first-page test (DictionaryEncoder.FirstPagePays): a dictionary that does
             // not pay is declined, and the values are rebuilt and written in the column's own encoding. A column whose
             // values reached a first page was tested as they arrived, and is Plain above if it failed.
-            useNonDictionary = overLimit
+            useNonDictionary = !enabled || overLimit
                 || !DictionaryEncoder.FirstPagePays(
                     dictionary, s.NonNullCount, s.PhysicalType, s.TypeLength, DictionaryEncoder.FirstPageBytes);
         }
@@ -877,7 +881,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         private bool _dictionaryFull;
 
         /// <summary>Whether values are appended raw rather than looked up.</summary>
-        private bool Raw => _dictionaryFull;
+        private bool Raw => _dictionaryFull || !DictionaryEnabled;
 
         // Raw, the fixed-width arms still deduplicate against a small cache of recent values (the byte-keyed arms'
         // is in BytesHashTable.AppendRecent): per slot, the value's bits and its entry's number plus one.
@@ -1041,7 +1045,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             NonNullCount += batchNonNull;
             GC.KeepAlive(array);
 
-            if (!Plain && PhysicalType != PhysicalType.Boolean)
+            if (!Plain && CanHoldPlain)
             {
                 // A dictionary that filled before its first-page test is declined, as ParquetFileWriter declines it,
                 // whatever the test would have said: the column moves to plain values at the end of the append that
@@ -1164,7 +1168,17 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         /// Whether values are held plain: the column has no dictionary, or the first-page test declined it. Such a
         /// column takes no lookups, and is written in its own encoding.
         /// </summary>
-        public bool Plain => (_declined || !DictionaryEnabled) && PhysicalType != PhysicalType.Boolean;
+        public bool Plain => (_declined || !DictionaryEnabled) && CanHoldPlain;
+
+        /// <summary>
+        /// Whether this column can be held as plain values. Booleans can't: their bits are held separately. Nor can a
+        /// FIXED_LEN_BYTE_ARRAY of <see cref="LargeValueBytes"/> or more. Held plain, a few such values repeated over
+        /// many rows would cost a copy per row, whereas entries deduplicated against the <see cref="RecentSlots"/>
+        /// most recent ones cost a copy per distinct value. Such a column keeps its dictionary state until the flush,
+        /// which decides.
+        /// </summary>
+        private bool CanHoldPlain => PhysicalType != PhysicalType.Boolean
+            && !(PhysicalType == PhysicalType.FixedLenByteArray && TypeLength >= LargeValueBytes);
 
         /// <summary>An Arrow slot's width for <see cref="ArrowType"/>; 0 for BYTE_ARRAY, whose values have offsets.</summary>
         private int SlotWidth => ArrowType switch
@@ -1206,7 +1220,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 if (_plainLevels == 0)
                     offsets[0] = 0;
 
-                if (!HasLargeValue(sourceOffsets))
+                if (!HasLargeValue(sourceOffsets) && !HasNullPayload(data, sourceOffsets))
                 {
                     // The common case: the append's values end to end, copied whole, their offsets moved.
                     int start = sourceOffsets[0];
@@ -1218,7 +1232,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 }
                 else
                 {
-                    AppendPlainWithLargeValues(sourceOffsets, sourceData, offsets);
+                    AppendPlainValueByValue(data, sourceOffsets, sourceData, offsets);
                 }
             }
 
@@ -1251,15 +1265,49 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             return false;
         }
 
-        private void AppendPlainWithLargeValues(ReadOnlySpan<int> sourceOffsets, ReadOnlySpan<byte> sourceData, Span<int> offsets)
+        /// <summary>
+        /// Whether a null slot of <paramref name="data"/> spans bytes, which Arrow allows. Those bytes are not a
+        /// value. Held, they would cost memory and count toward the average value size that pages are cut by, which
+        /// the dictionary path (and so this writer's output before the plain store) never saw.
+        /// </summary>
+        private static bool HasNullPayload(ArrayData data, ReadOnlySpan<int> offsets)
+        {
+            if (data.NullCount == 0)
+                return false;
+            var validity = data.Buffers[0].Span;
+            if (validity.IsEmpty)
+                return false;
+            int offset = data.Offset;
+            for (int i = 1; i < offsets.Length; i++)
+            {
+                int bit = offset + i - 1;
+                if (offsets[i] != offsets[i - 1] && ((validity[bit >> 3] >> (bit & 7)) & 1) == 0)
+                    return true;
+            }
+
+            return false;
+        }
+
+        // Value by value: a null slot gets no bytes, and a large value is looked up among recent ones.
+        private void AppendPlainValueByValue(
+            ArrayData data, ReadOnlySpan<int> sourceOffsets, ReadOnlySpan<byte> sourceData, Span<int> offsets)
         {
             _recentLargeStarts ??= new int[RecentSlots];
             _recentLargeLengths ??= new int[RecentSlots];
+            var validity = data.NullCount == 0 ? default : data.Buffers[0].Span;
+            int bitOffset = data.Offset;
             int levelCount = sourceOffsets.Length - 1;
             for (int i = 0; i < levelCount; i++)
             {
                 int start = sourceOffsets[i];
                 int length = sourceOffsets[i + 1] - start;
+                int bit = bitOffset + i;
+                if (length != 0 && !validity.IsEmpty && ((validity[bit >> 3] >> (bit & 7)) & 1) == 0)
+                {
+                    offsets[i + 1] = offsets[i];
+                    continue;
+                }
+
                 var value = sourceData.Slice(start, length);
                 if (length >= LargeValueBytes)
                 {
@@ -1282,17 +1330,13 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             }
         }
 
-        /// <summary>A large value's cache slot, from its length and three of its words: cheap, and checked on a hit.</summary>
-        private static int LargeValueSlot(ReadOnlySpan<byte> value)
-        {
-            ulong middle = MemoryMarshal.Read<ulong>(value.Slice(value.Length / 2));
-            ulong last = MemoryMarshal.Read<ulong>(value.Slice(value.Length - 8));
-            ulong key = (ulong)value.Length
-                ^ MemoryMarshal.Read<ulong>(value)
-                ^ ((middle << 21) | (middle >> 43))
-                ^ ((last << 42) | (last >> 22));
-            return (int)((key * 0x9E3779B97F4A7C15UL) >> 54); // the top 10 bits: RecentSlots = 1 << 10
-        }
+        /// <summary>
+        /// A large value's cache slot, from a hash of the whole value, as <c>BytesHashTable.AppendRecent</c> finds its
+        /// slot. Values that match in a few sampled words but differ elsewhere would otherwise share a slot and evict
+        /// each other on every repeat.
+        /// </summary>
+        private static int LargeValueSlot(ReadOnlySpan<byte> value) =>
+            (int)((XxHash3.HashToUInt64(value) * 0x9E3779B97F4A7C15UL) >> 54); // the top 10 bits: RecentSlots = 1 << 10
 
         /// <summary>
         /// <paramref name="array"/> moved to one of <paramref name="length"/> bytes holding its first

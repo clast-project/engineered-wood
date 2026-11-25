@@ -207,6 +207,116 @@ public class BufferedDictionaryLimitTests : IDisposable
         await AssertSameRowsAsync(batch, buffered);
     }
 
+    [Fact]
+    public async Task RepetitiveValues_AlikeWhereSampled_TakeAnEntryEach()
+    {
+        // Four 4 KiB strings that differ only at byte 24 hash apart: a slot chosen from a few sampled words would
+        // put them all in one slot, each evicting the last, and every row would take a copy.
+        var big = Enumerable.Range(0, 4).Select(k => new string('x', 24) + (char)('a' + k) + new string('x', 4071)).ToArray();
+        var builder = new StringArray.Builder();
+        for (int i = 0; i < 20_000; i++)
+            builder.Append(big[i % 4]);
+        var batch = Batch(builder.Build(), nullable: false);
+
+        await AssertAppendsAllocateLittleAsync(batch); // the values would be 82 MB
+        var (direct, buffered) = await WriteBothAsync(batch, DataPageVersion.V1, Limit, dictionary: false);
+        await AssertSameChunksAsync(direct, buffered);
+        await AssertSameRowsAsync(batch, buffered);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RepetitiveWideFixedSizeValues_TakeAnEntryEach(bool dictionary)
+    {
+        // A FIXED_LEN_BYTE_ARRAY this wide keeps its deduplicated entries rather than going plain: four distinct
+        // 4 KiB values over 20,000 rows are four entries, not 82 MB.
+        const int width = 4096, rows = 20_000;
+        var values = new byte[rows * width];
+        for (int i = 0; i < rows; i++)
+            values.AsSpan(i * width, width).Fill((byte)('a' + i % 4));
+        var array = new Apache.Arrow.Arrays.FixedSizeBinaryArray(new ArrayData(
+            new FixedSizeBinaryType(width), rows, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(values)]));
+        var batch = Batch(array, nullable: false);
+
+        if (!dictionary)
+            await AssertAppendsAllocateLittleAsync(batch);
+        var (direct, buffered) = await WriteBothAsync(batch, DataPageVersion.V1, Limit, dictionary);
+        await AssertSameChunksAsync(direct, buffered);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task BytesUnderNulls_AreNotHeld(bool dictionary)
+    {
+        // Arrow lets a null BYTE_ARRAY slot span bytes. They are not a value: the column must come out as it does
+        // when its nulls span none, with pages cut by the average size of its values alone.
+        const int rows = 200_000;
+        var validity = new byte[(rows + 7) / 8];
+        var offsets = new int[rows + 1];
+        var dirty = new List<byte>();
+        var clean = new StringArray.Builder();
+        for (int i = 0; i < rows; i++)
+        {
+            bool isNull = i % 2 == 1;
+            var text = isNull ? new string('n', 200) : "v" + i;
+            dirty.AddRange(System.Text.Encoding.UTF8.GetBytes(text));
+            offsets[i + 1] = dirty.Count;
+            if (isNull)
+            {
+                clean.AppendNull();
+            }
+            else
+            {
+                validity[i >> 3] |= (byte)(1 << (i & 7));
+                clean.Append(text);
+            }
+        }
+
+        var offsetBytes = new byte[offsets.Length * sizeof(int)];
+        Buffer.BlockCopy(offsets, 0, offsetBytes, 0, offsetBytes.Length);
+        var withPayloads = new StringArray(new ArrayData(StringType.Default, rows, rows / 2, 0,
+            [new ArrowBuffer(validity), new ArrowBuffer(offsetBytes), new ArrowBuffer(dirty.ToArray())]));
+
+        var expected = await WriteBufferedAsync(Batch(clean.Build(), nullable: true), dictionary);
+        var actual = await WriteBufferedAsync(Batch(withPayloads, nullable: true), dictionary);
+        var e = (await ReadMetadataAsync(expected)).RowGroups.Single().Columns.Single().MetaData!;
+        var a = (await ReadMetadataAsync(actual)).RowGroups.Single().Columns.Single().MetaData!;
+        Assert.Equal(ChunkBytes(expected, e), ChunkBytes(actual, a));
+    }
+
+    private async Task<string> WriteBufferedAsync(RecordBatch batch, bool dictionary)
+    {
+        var options = ParquetWriteOptions.Default with { DictionaryEnabled = dictionary, RowGroupMaxRows = 1_000_000 };
+        string path = Path.Combine(_tempDir, $"buffered-{Guid.NewGuid():N}.parquet");
+        await using (var writer = new BufferedParquetWriter(new LocalSequentialFile(path), ownsFile: true, options))
+        {
+            for (int start = 0; start < batch.Length; start += 37_000)
+                await writer.AppendAsync(batch.Slice(start, Math.Min(37_000, batch.Length - start)));
+            await writer.CloseAsync();
+        }
+
+        return path;
+    }
+
+    // Appends batch with dictionaries off, in slices, and asserts they allocate a fraction of its values' size.
+    private async Task AssertAppendsAllocateLittleAsync(RecordBatch batch)
+    {
+        var options = ParquetWriteOptions.Default with { DictionaryEnabled = false, RowGroupMaxRows = 1_000_000 };
+        await using var writer = new BufferedParquetWriter(
+            new LocalSequentialFile(Path.Combine(_tempDir, $"alloc-{Guid.NewGuid():N}.parquet")), ownsFile: true, options);
+#if NET8_0_OR_GREATER
+        long before = GC.GetAllocatedBytesForCurrentThread();
+#endif
+        for (int start = 0; start < batch.Length; start += 2_000)
+            await writer.AppendAsync(batch.Slice(start, Math.Min(2_000, batch.Length - start)));
+#if NET8_0_OR_GREATER
+        Assert.InRange(GC.GetAllocatedBytesForCurrentThread() - before, 0, 16L << 20);
+#endif
+        await writer.CloseAsync();
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
