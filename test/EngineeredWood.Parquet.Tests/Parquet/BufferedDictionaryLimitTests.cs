@@ -90,7 +90,7 @@ public class BufferedDictionaryLimitTests : IDisposable
         await AssertSameRowsAsync(batch, buffered);
     }
 
-    public static TheoryData<string> Types() => new() { "int8", "int32", "int64", "float", "double", "string", "decimal", "list" };
+    public static TheoryData<string> Types() => new() { "int8", "int32", "int64", "float", "double", "string", "decimal", "decimal9", "decimal18", "list" };
 
     [Theory]
     [MemberData(nameof(Types))]
@@ -133,6 +133,13 @@ public class BufferedDictionaryLimitTests : IDisposable
                 var m = new Decimal128Array.Builder(new Decimal128Type(30, 2));
                 for (int i = 0; i < rows; i++) m.Append((i % 300 - 150) * 1.25m);
                 array = m.Build();
+                break;
+            case "decimal9":
+            case "decimal18":
+                // Narrowed to INT32 / INT64 (Decimal32Type / Decimal64Type), so held plain in 4- and 8-byte slots.
+                var n = new Decimal128Array.Builder(new Decimal128Type(type == "decimal9" ? 9 : 18, 2));
+                for (int i = 0; i < rows; i++) n.Append((i % 300 - 150) * 1.25m);
+                array = n.Build();
                 break;
             default:
                 array = ListBatch(rows / 4, rows / 8, nullable: true).Column(0);
@@ -563,11 +570,17 @@ public class BufferedDictionaryLimitTests : IDisposable
         Int32Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
         FloatArray a => BitConverter.ToInt32(BitConverter.GetBytes(a.GetValue(i)!.Value), 0).ToString(System.Globalization.CultureInfo.InvariantCulture),
         DoubleArray a => BitConverter.DoubleToInt64Bits(a.GetValue(i)!.Value).ToString(System.Globalization.CultureInfo.InvariantCulture),
-        Decimal128Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        Decimal128Array a => RenderDecimal(a.GetValue(i)!.Value),
+        Decimal32Array a => RenderDecimal(a.GetValue(i)!.Value),
+        Decimal64Array a => RenderDecimal(a.GetValue(i)!.Value),
         ListArray a => string.Join(",", Enumerable.Range(a.ValueOffsets[i], a.GetValueLength(i))
             .Select(k => ((Int64Array)a.Values).GetValue(k))),
         _ => throw new InvalidOperationException(array.GetType().Name),
     };
+
+    // By value: the decimal arrays differ in whether a value keeps its scale's trailing zeros.
+    private static string RenderDecimal(decimal value) =>
+        (value / 1.0000000000000000000000000000m).ToString(System.Globalization.CultureInfo.InvariantCulture);
 
     private static async Task<FileMetaData> ReadMetadataAsync(string path)
     {
