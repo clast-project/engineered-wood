@@ -1041,8 +1041,16 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             NonNullCount += batchNonNull;
             GC.KeepAlive(array);
 
-            if (!Plain && !_firstPageTested && PhysicalType != PhysicalType.Boolean)
-                TakeFirstPageTest();
+            if (!Plain && PhysicalType != PhysicalType.Boolean)
+            {
+                // A dictionary that filled before its first-page test is declined, as ParquetFileWriter declines it,
+                // whatever the test would have said: the column moves to plain values at the end of the append that
+                // filled it, rather than taking a raw entry per value until a first page of them has arrived.
+                if (_filledBeforeTest)
+                    DeclineToPlain();
+                else if (!_firstPageTested)
+                    TakeFirstPageTest();
+            }
         }
 
         // ───── Booleans ─────
@@ -1419,7 +1427,36 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 return;
 
             // Declined, as ParquetFileWriter declines it: whether or not the dictionary also filled first, it would
-            // have declined. The values so far are rebuilt once, and the dictionary dropped.
+            // have declined.
+            DeclineToPlain();
+        }
+
+        /// <summary>
+        /// Set when the dictionary passes <see cref="DictionaryLimit"/> on a value that comes before the first-page
+        /// test's last value, i.e. while the values before it are still short of
+        /// <see cref="DictionaryEncoder.FirstPageBytes"/> written plain. ParquetFileWriter checks the limit on each
+        /// insert before it takes the test, so such a dictionary is declined there however the test would go.
+        /// </summary>
+        private bool _filledBeforeTest;
+
+        /// <summary>Marks the dictionary full, and notes whether that came before the first-page test.</summary>
+        /// <param name="plainBytesBefore">The plain bytes of the values fed before the one that filled it.</param>
+        private void MarkFull(long plainBytesBefore)
+        {
+            if (_dictionaryFull)
+                return;
+            _dictionaryFull = true;
+            if (!_firstPageTested && plainBytesBefore < DictionaryEncoder.FirstPageBytes)
+                _filledBeforeTest = true;
+        }
+
+        /// <summary>
+        /// Drops a declined dictionary: the values so far are rebuilt once from it, and the column holds plain values
+        /// from then on.
+        /// </summary>
+        private void DeclineToPlain()
+        {
+            byte[] page;
             int pageLength;
             if (TryBorrowPage(out byte[] borrowed))
             {
@@ -1438,7 +1475,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 {
                     DictionaryPageData = page,
                     DictionaryCount = DictionaryCount,
-                    Indices = Indices.ToArray(NonNullCount),
+                    Indices = Indices!.ToArray(NonNullCount),
                 },
                 pageLength,
                 PresenceLevels(this, DefLevels?.ToArray(LevelCount)),
@@ -1465,6 +1502,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             _bytesTable = null;
             _dictPageSize = 0;
             _dictionaryFull = false;
+            _filledBeforeTest = false;
             if (_recentEntries is not null)
                 System.Array.Clear(_recentEntries, 0, _recentEntries.Length);
             DictionaryCount = 0;
@@ -1708,9 +1746,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 int start = arrowOffsets[srcOffset + i];
                 int len = arrowOffsets[srcOffset + i + 1] - start;
                 ReadOnlySpan<byte> valueBytes = arrowData.Slice(start, len);
+                Indices!.Add(AddBytes(valueBytes, _byteArrayPlainBytes + plainBytes));
                 plainBytes += 4 + len;
-
-                Indices!.Add(AddBytes(valueBytes));
             }
 
             _byteArrayPlainBytes += plainBytes;
@@ -1777,8 +1814,10 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             var entry = _fixedPage.AsSpan(_dictPageSize, size);
             _dictPageSize += size;
             index = DictionaryCount++;
+            // An entry's size is its value's plain width, and the value's index is not added yet: the values before it
+            // are the indices so far.
             if (_dictPageSize > DictionaryLimit)
-                _dictionaryFull = true;
+                MarkFull((long)Indices!.Count * size);
             return entry;
         }
 
@@ -1786,7 +1825,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         /// A byte-keyed value's entry: looked up, and added if new, while the dictionary is under the limit; appended
         /// as an entry of its own after (see <see cref="Raw"/>).
         /// </summary>
-        private int AddBytes(ReadOnlySpan<byte> valueBytes)
+        /// <param name="plainBytesBefore">The plain bytes of the values fed before this one (see <see cref="MarkFull"/>).</param>
+        private int AddBytes(ReadOnlySpan<byte> valueBytes, long plainBytesBefore)
         {
             if (Raw)
             {
@@ -1801,7 +1841,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             {
                 DictionaryCount++;
                 if (_bytesTable.ByteCount > DictionaryLimit)
-                    _dictionaryFull = true;
+                    MarkFull(plainBytesBefore);
             }
 
             return idx;
@@ -1840,7 +1880,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                     valueBytes = narrowed;
                 }
 
-                Indices!.Add(AddBytes(valueBytes));
+                Indices!.Add(AddBytes(valueBytes, (long)Indices.Count * entryWidth));
             }
         }
 
@@ -1955,6 +1995,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         /// <summary>The backing array, whose first elements are the list; longer than it.</summary>
         public int[] Buffer => _data;
+
+        public int Count => _count;
 
         public int Get(int index) => _data[index];
 

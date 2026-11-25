@@ -277,6 +277,36 @@ public class BufferedDictionaryLimitTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task FilledBeforeTheFirstPage_HeldPlainAtOnce()
+    {
+        // A dictionary that passes its limit before a first page of values has arrived is declined, whatever the
+        // test would say, so the column is held as values from the append that filled it, not a first page later.
+        var options = ParquetWriteOptions.Default with { DictionaryPageSizeLimit = 64 * 1024, RowGroupMaxRows = 1_000_000 };
+        var distinct = Int64Batch(200_000, 0, nullable: true);
+        await using (var writer = new BufferedParquetWriter(
+            new LocalSequentialFile(Path.Combine(_tempDir, "filled.parquet")), ownsFile: true, options))
+        {
+            await writer.AppendAsync(distinct.Slice(0, 20_000)); // 137 KiB of values: full, a first page is 1 MiB
+            Assert.True(StateArrayLength(writer, "_plainValues") >= 20_000 * sizeof(long));
+            Assert.Equal(0, StateArrayLength(writer, "_fixedPage"));
+            await writer.CloseAsync();
+        }
+
+        foreach (var nullable in new[] { false, true })
+        {
+            var ints = Int64Batch(400_000, 0, nullable);
+            var (direct, buffered) = await WriteBothAsync(ints, DataPageVersion.V2, options.DictionaryPageSizeLimit, dictionary: true);
+            await AssertSameChunksAsync(direct, buffered);
+            await AssertSameRowsAsync(ints, buffered);
+
+            var strings = StringBatch(400_000, 0, nullable);
+            (direct, buffered) = await WriteBothAsync(strings, DataPageVersion.V1, options.DictionaryPageSizeLimit, dictionary: true);
+            await AssertSameChunksAsync(direct, buffered);
+            await AssertSameRowsAsync(strings, buffered);
+        }
+    }
+
     private static int StateArrayLength(BufferedParquetWriter writer, string field)
     {
         var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;

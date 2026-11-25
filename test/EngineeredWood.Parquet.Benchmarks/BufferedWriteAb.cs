@@ -37,6 +37,10 @@ internal static class BufferedWriteAb
             RowGroupMaxRows = rows + 1, // the flush lands in Close, so append and flush time apart
         };
 
+        // EW_DICT_LIMIT overrides DictionaryPageSizeLimit (bytes).
+        if (Environment.GetEnvironmentVariable("EW_DICT_LIMIT") is { Length: > 0 } limit)
+            options = options with { DictionaryPageSizeLimit = int.Parse(limit, CultureInfo.InvariantCulture) };
+
         Console.WriteLine($"{rows:N0} rows in {batchRows:N0}-row appends, one row group, uncompressed; best of {rounds} after 3 s warm-up (ms).");
         Console.WriteLine("| Shape | Streaming | Buffered | Ratio |");
         Console.WriteLine("|---|---|---|---|");
