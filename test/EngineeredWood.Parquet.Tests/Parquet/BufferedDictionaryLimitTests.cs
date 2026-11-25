@@ -207,28 +207,82 @@ public class BufferedDictionaryLimitTests : IDisposable
         await AssertSameRowsAsync(batch, buffered);
     }
 
-    [Fact]
-    public async Task ResetReleasesARawPage()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RepeatedLargeValues_AmongNullsAndSmallOnes_WriteAsTheFileWriterDoes(bool dictionary)
     {
-        // A page that held a row group's raw values is as large as the column was; once the row group is flushed
-        // it must not stay rooted for the writer's lifetime. Read through reflection: the state is private.
+        // A plain column holds a repeated large value by reference, beside small values copied whole and nulls; the
+        // flush resolves the references in level order. With the dictionary on, distinct values decline it first.
+        var big = Enumerable.Range(0, 4).Select(k => new string((char)('a' + k), 100 + k)).ToArray();
+        var builder = new StringArray.Builder();
+        for (int i = 0; i < 300_000; i++)
+        {
+            if (i % 3 == 0) builder.AppendNull();
+            else if (i % 2 == 0 && i > 60_000) builder.Append(big[i % 4]);
+            else builder.Append("unique-value-" + i);
+        }
+
+        var batch = Batch(builder.Build(), nullable: true);
+        var (direct, buffered) = await WriteBothAsync(batch, DataPageVersion.V2, 1 << 20, dictionary);
+        await AssertSameChunksAsync(direct, buffered);
+        await AssertSameRowsAsync(batch, buffered);
+    }
+
+    [Fact]
+    public async Task ResetReleasesPlainValues()
+    {
+        // Values held plain are as large as the column was; once the row group is flushed they must not stay rooted
+        // for the writer's lifetime. Read through reflection: the state is private.
         var options = ParquetWriteOptions.Default with { DictionaryEnabled = false, RowGroupMaxRows = 1_000_000 };
         await using var writer = new BufferedParquetWriter(
             new LocalSequentialFile(Path.Combine(_tempDir, "reset.parquet")), ownsFile: true, options);
         await writer.AppendAsync(Int64Batch(300_000, 0, nullable: false)); // all distinct: 2.4 MB raw
-        Assert.True(FixedPageLength(writer) > options.DictionaryPageSizeLimit);
+        Assert.True(StateArrayLength(writer, "_plainValues") > options.DictionaryPageSizeLimit);
 
         await writer.FlushRowGroupAsync();
-        Assert.Equal(0, FixedPageLength(writer));
+        Assert.Equal(0, StateArrayLength(writer, "_plainValues"));
         await writer.CloseAsync();
     }
 
-    private static int FixedPageLength(BufferedParquetWriter writer)
+    [Fact]
+    public async Task DeclinedOnTheFirstPage_HeldPlainWithoutADictionary()
+    {
+        // Distinct values decline the dictionary once a first page of them has arrived; from then the column is
+        // held as its values, and its dictionary is dropped rather than kept growing until the flush.
+        var options = ParquetWriteOptions.Default with { RowGroupMaxRows = 1_000_000 };
+        await using (var writer = new BufferedParquetWriter(
+            new LocalSequentialFile(Path.Combine(_tempDir, "declined.parquet")), ownsFile: true, options))
+        {
+            var distinct = Int64Batch(200_000, 0, nullable: true);
+            await writer.AppendAsync(distinct.Slice(0, 100_000)); // 685 KiB of values: still undecided
+            Assert.Equal(0, StateArrayLength(writer, "_plainValues"));
+            await writer.AppendAsync(distinct.Slice(100_000, 100_000)); // past the first page: declined
+            Assert.True(StateArrayLength(writer, "_plainValues") >= 200_000 * sizeof(long));
+            Assert.Equal(0, StateArrayLength(writer, "_fixedPage"));
+            await writer.CloseAsync();
+        }
+
+        foreach (var nullable in new[] { false, true })
+        {
+            var ints = Int64Batch(400_000, 0, nullable);
+            var (direct, buffered) = await WriteBothAsync(ints, DataPageVersion.V2, options.DictionaryPageSizeLimit, dictionary: true);
+            await AssertSameChunksAsync(direct, buffered);
+            await AssertSameRowsAsync(ints, buffered);
+
+            var strings = StringBatch(400_000, 0, nullable);
+            (direct, buffered) = await WriteBothAsync(strings, DataPageVersion.V1, options.DictionaryPageSizeLimit, dictionary: true);
+            await AssertSameChunksAsync(direct, buffered);
+            await AssertSameRowsAsync(strings, buffered);
+        }
+    }
+
+    private static int StateArrayLength(BufferedParquetWriter writer, string field)
     {
         var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
         var states = (System.Array)typeof(BufferedParquetWriter).GetField("_columnStates", flags)!.GetValue(writer)!;
         var state = states.GetValue(0)!;
-        return ((byte[])state.GetType().GetField("_fixedPage", flags)!.GetValue(state)!).Length;
+        return ((System.Array)state.GetType().GetField(field, flags)!.GetValue(state)!).Length;
     }
 
     private static RecordBatch Int64Batch(int rows, int lowRows, bool nullable)

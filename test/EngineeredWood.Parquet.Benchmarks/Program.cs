@@ -89,6 +89,12 @@ if (args.Length > 0 && args[0] == "dict-profile")
     return;
 }
 
+if (args.Length > 0 && args[0] == "buffered-ab")
+{
+    Environment.ExitCode = await BufferedWriteAb.RunAsync(args);
+    return;
+}
+
 if (args.Length > 0 && args[0] == "stats-profile")
 {
     Environment.ExitCode = await StatisticsProfile.RunAsync(args);

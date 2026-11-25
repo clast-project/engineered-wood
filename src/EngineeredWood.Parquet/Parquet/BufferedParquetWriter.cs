@@ -153,102 +153,12 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         int numRows = _bufferedRows;
         var states = _columnStates!;
 
-        // Build DictionaryResult for each column, and decide encoding strategy
-        var dictResults = new DictionaryEncoder.DictionaryResult?[states.Length];
-        var useNonDictionary = new bool[states.Length]; // true when the dictionary is not written as built
-        var overLimit = new bool[states.Length]; // true when it passed DictionaryPageSizeLimit
-        var pageLengths = new int[states.Length]; // the dictionary page's bytes, which a borrowed buffer exceeds
-        int[]?[] defLevelsPerColumn = new int[]?[states.Length];
-        int[]?[] repLevelsPerColumn = new int[]?[states.Length];
-
-        for (int i = 0; i < states.Length; i++)
-        {
-            var s = states[i];
-            defLevelsPerColumn[i] = s.DefLevels?.ToArray(s.LevelCount);
-            repLevelsPerColumn[i] = s.RepLevels?.ToArray(s.LevelCount);
-            if (s.DictionaryCount > 0)
-            {
-                // Per-column resolution, not the file-wide flag: an option that held for one writer and not the
-                // other would be worse than not having it.
-                bool enabled = _options.GetDictionaryEnabled(s.PathInSchema);
-
-                // A dictionary over the page size limit is one ParquetFileWriter would have cut short: declined if
-                // it filled before the first page decided, else kept for the pages before the cut and the rest
-                // written in the column's own encoding. The column is rebuilt and written through that writer's
-                // own path, so the two writers agree; this costs a second pass of hashing, only for such a column.
-                overLimit[i] = enabled && s.DictionaryPageLength > _options.DictionaryPageSizeLimit;
-
-                var indices = s.Indices!.ToArray(s.NonNullCount);
-                if ((!enabled || overLimit[i]) && s.TryBorrowPage(out byte[] page))
-                {
-                    // Rebuilt, never written: the rebuild reads the buffered entries where they are, without the
-                    // copy a written page needs. Past the limit they are the values themselves, as large as the
-                    // rebuilt column, so a copy would have been a third instance of it at flush.
-                    dictResults[i] = new DictionaryEncoder.DictionaryResult
-                    {
-                        DictionaryPageData = page,
-                        DictionaryCount = s.DictionaryCount,
-                        Indices = indices,
-                    };
-                    pageLengths[i] = s.DictionaryPageLength;
-                    useNonDictionary[i] = true;
-                    continue;
-                }
-
-                var built = new DictionaryEncoder.DictionaryResult
-                {
-                    DictionaryPageData = s.BuildDictionaryPage(),
-                    DictionaryCount = s.DictionaryCount,
-                    Indices = indices,
-                };
-                dictResults[i] = built;
-                pageLengths[i] = built.DictionaryPageData.Length;
-
-                // Otherwise the file writer's first-page test (DictionaryEncoder.FirstPagePays): a dictionary that
-                // does not pay is declined, and the values are rebuilt and written in the column's own encoding.
-                useNonDictionary[i] = !enabled
-                    || overLimit[i]
-                    || !DictionaryEncoder.FirstPagePays(
-                        built, s.NonNullCount, s.PhysicalType, s.TypeLength, DictionaryEncoder.FirstPageBytes);
-            }
-        }
-
-        // Encode all columns into page bytes
+        // Encode all columns into page bytes, each column's preparation included.
         var columnResults = new ColumnChunkWriter.ColumnChunkResult[states.Length];
 
         try
         {
-            Parallel.For(0, states.Length, i =>
-            {
-                var s = states[i];
-                if (dictResults[i] != null && !useNonDictionary[i])
-                {
-                    // Dictionary encoding: cardinality is within threshold
-                    columnResults[i] = ColumnChunkWriter.WriteDictionaryColumnFromResult(
-                        dictResults[i]!.Value, s.LevelCount, s.NonNullCount, s.PathInSchema, s.PhysicalType,
-                        s.TypeLength, s.ArrowType,
-                        s.MaxDefLevel, s.MaxRepLevel, defLevelsPerColumn[i], repLevelsPerColumn[i], _options);
-                }
-                else if (dictResults[i] != null && useNonDictionary[i])
-                {
-                    // Cardinality too high: reconstruct Arrow array from dictionary + indices
-                    // and encode via the standard non-dictionary path (delta, BSS, plain, etc.)
-                    using var array = ReconstructArrowArray(s, dictResults[i]!.Value, pageLengths[i],
-                        PresenceLevels(s, defLevelsPerColumn[i]), s.LevelCount);
-                    var options = overLimit[i] ? _options : _options with { DictionaryEnabled = false };
-                    columnResults[i] = WriteLeaf(
-                        s, array, defLevelsPerColumn[i], repLevelsPerColumn[i], options);
-                }
-                else if (s.BooleanValues != null)
-                {
-                    using var boolArr = BuildBooleanArray(s);
-                    columnResults[i] = WriteLeaf(s, boolArr, defLevelsPerColumn[i], repLevelsPerColumn[i], _options);
-                }
-                else
-                {
-                    columnResults[i] = WriteValuelessColumn(s, defLevelsPerColumn[i], repLevelsPerColumn[i]);
-                }
-            });
+            Parallel.For(0, states.Length, i => columnResults[i] = EncodeColumn(states[i]));
         }
         catch
         {
@@ -262,6 +172,88 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         // Reset buffers for next row group
         ResetBuffers();
+    }
+
+    /// <summary>One column's buffered row group, encoded: its dictionary decided, or its values rebuilt and written.</summary>
+    private ColumnChunkWriter.ColumnChunkResult EncodeColumn(BufferedColumnState s)
+    {
+        int[]? defLevels = s.DefLevels?.ToArray(s.LevelCount);
+        int[]? repLevels = s.RepLevels?.ToArray(s.LevelCount);
+
+        if (s.PhysicalType == PhysicalType.Boolean)
+        {
+            using var booleans = s.BuildBooleanArray(PresenceLevels(s, defLevels));
+            return WriteLeaf(s, booleans, defLevels, repLevels, _options);
+        }
+
+        if (s.Plain)
+        {
+            // Held as values (no dictionary, or one its first-page test declined): written in the column's own
+            // encoding, as ParquetFileWriter writes a column whose dictionary it declined.
+            using var values = s.BuildPlainArray(PresenceLevels(s, defLevels));
+            return WriteLeaf(s, values, defLevels, repLevels, _options with
+            {
+                DictionaryEnabled = false,
+                ColumnDictionaryEnabled = null,
+            });
+        }
+
+        if (s.DictionaryCount == 0)
+            return WriteValuelessColumn(s, defLevels, repLevels);
+
+        // A dictionary over the page size limit is one ParquetFileWriter would have cut short: declined if it filled
+        // before the first page decided, else kept for the pages before the cut and the rest written in the column's
+        // own encoding. The column is rebuilt and written through that writer's own path, so the two writers agree;
+        // this costs a second pass of hashing, only for such a column.
+        bool overLimit = s.DictionaryPageLength > _options.DictionaryPageSizeLimit;
+
+        var indices = s.Indices!.ToArray(s.NonNullCount);
+        DictionaryEncoder.DictionaryResult dictionary;
+        int pageLength;
+        bool useNonDictionary;
+        if (overLimit && s.TryBorrowPage(out byte[] page))
+        {
+            // Rebuilt, never written: the rebuild reads the buffered entries where they are, without the copy a
+            // written page needs. Past the limit they are the values themselves, as large as the rebuilt column, so
+            // a copy would have been a third instance of it at flush.
+            dictionary = new DictionaryEncoder.DictionaryResult
+            {
+                DictionaryPageData = page,
+                DictionaryCount = s.DictionaryCount,
+                Indices = indices,
+            };
+            pageLength = s.DictionaryPageLength;
+            useNonDictionary = true;
+        }
+        else
+        {
+            dictionary = new DictionaryEncoder.DictionaryResult
+            {
+                DictionaryPageData = s.BuildDictionaryPage(),
+                DictionaryCount = s.DictionaryCount,
+                Indices = indices,
+            };
+            pageLength = dictionary.DictionaryPageData.Length;
+
+            // Otherwise the file writer's first-page test (DictionaryEncoder.FirstPagePays): a dictionary that does
+            // not pay is declined, and the values are rebuilt and written in the column's own encoding. A column whose
+            // values reached a first page was tested as they arrived, and is Plain above if it failed.
+            useNonDictionary = overLimit
+                || !DictionaryEncoder.FirstPagePays(
+                    dictionary, s.NonNullCount, s.PhysicalType, s.TypeLength, DictionaryEncoder.FirstPageBytes);
+        }
+
+        if (!useNonDictionary)
+        {
+            return ColumnChunkWriter.WriteDictionaryColumnFromResult(
+                dictionary, s.LevelCount, s.NonNullCount, s.PathInSchema, s.PhysicalType, s.TypeLength, s.ArrowType,
+                s.MaxDefLevel, s.MaxRepLevel, defLevels, repLevels, _options);
+        }
+
+        // Reconstruct the Arrow array from dictionary + indices and encode it through the standard non-dictionary
+        // path (delta, BSS, plain, etc.).
+        using var array = ReconstructArrowArray(s, dictionary, pageLength, PresenceLevels(s, defLevels), s.LevelCount);
+        return WriteLeaf(s, array, defLevels, repLevels, overLimit ? _options : _options with { DictionaryEnabled = false });
     }
 
     /// <summary>
@@ -764,24 +756,6 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         return Data.ArrowArrayFactory.BuildArray(arrayData);
     }
 
-    // ───── Boolean array reconstruction ─────
-
-    private static Apache.Arrow.BooleanArray BuildBooleanArray(BufferedColumnState state)
-    {
-        var builder = new Apache.Arrow.BooleanArray.Builder();
-        var values = state.BooleanValues!;
-
-        for (int i = 0; i < state.LevelCount; i++)
-        {
-            if (!state.IsValue(i))
-                builder.AppendNull();
-            else
-                builder.Append(values.Get(i) != 0);
-        }
-
-        return builder.Build();
-    }
-
     // ───── Fallback for columns with no dictionary ─────
 
     /// <summary>
@@ -868,8 +842,9 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         /// <summary><see cref="ParquetWriteOptions.DictionaryPageSizeLimit"/>.</summary>
         public int DictionaryLimit { get; init; } = int.MaxValue;
 
-        // Set once this row group's dictionary passes DictionaryLimit. From then on, and for a column without a
-        // dictionary from the start, each value is appended as an entry of its own with no lookup: the "dictionary"
+        // Set once this row group's dictionary passes DictionaryLimit (after it passed its first-page test: one that
+        // fails the test is moved to plain values, see Plain). From then on each value is appended as an entry of its
+        // own with no lookup: the "dictionary"
         // is just the values, the hash table stops growing, and at flush the column is rebuilt and written through
         // ParquetFileWriter's path, which makes the real decision (see FlushRowGroupAsync). Deduplicating every value
         // into a dictionary that was never going to be written cost 100 ms per million random INT64s, against 7 for
@@ -877,7 +852,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         private bool _dictionaryFull;
 
         /// <summary>Whether values are appended raw rather than looked up.</summary>
-        private bool Raw => _dictionaryFull || !DictionaryEnabled;
+        private bool Raw => _dictionaryFull;
 
         // Raw, the fixed-width arms still deduplicate against a small cache of recent values (the byte-keyed arms'
         // is in BytesHashTable.AppendRecent): per slot, the value's bits and its entry's number plus one.
@@ -904,9 +879,6 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         // Accumulated repetition levels (a leaf under a list or map)
         public GrowableIntList? RepLevels { get; private set; }
-
-        // Accumulated boolean values (for Boolean columns that can't be dictionary-encoded)
-        public GrowableIntList? BooleanValues { get; private set; }
 
         // The fixed-width arms' entries, end to end: the PLAIN dictionary page (copied out on flush). The byte-keyed
         // arms' are in _bytesTable.
@@ -964,25 +936,25 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         /// </summary>
         public void AppendLevels(IArrowArray array, int levelCount, int[] defLevels, int[]? repLevels)
         {
+            int values = levelCount;
             if (MaxDefLevel > 0)
             {
                 DefLevels ??= new GrowableIntList(levelCount);
-                for (int i = 0; i < levelCount; i++)
-                    DefLevels.Add(defLevels[i]);
+                var source = defLevels.AsSpan(0, levelCount);
+                source.CopyTo(DefLevels.AppendSpan(levelCount));
+                values = 0;
+                int max = MaxDefLevel;
+                foreach (int level in source)
+                {
+                    if (level == max)
+                        values++;
+                }
             }
 
             if (MaxRepLevel > 0)
             {
                 RepLevels ??= new GrowableIntList(levelCount);
-                for (int i = 0; i < levelCount; i++)
-                    RepLevels.Add(repLevels![i]);
-            }
-
-            int values = 0;
-            for (int i = 0; i < levelCount; i++)
-            {
-                if (IsValue(LevelCount + i))
-                    values++;
+                repLevels.AsSpan(0, levelCount).CopyTo(RepLevels.AppendSpan(levelCount));
             }
 
             AppendValues(array, levelCount, values);
@@ -991,27 +963,30 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         /// <summary>Appends a flat column from <see cref="Prepare"/>.</summary>
         public void AppendArray(IArrowArray array, int rowCount)
         {
-            // Build def levels
+            int batchNonNull = rowCount;
             if (IsNullable)
             {
+                // The levels straight off the validity bitmap: every type buffered here keeps its nulls there.
                 DefLevels ??= new GrowableIntList(rowCount);
-                for (int i = 0; i < rowCount; i++)
+                var levels = DefLevels.AppendSpan(rowCount);
+                var data = array.Data;
+                var validity = data.Buffers[0].Span;
+                if (validity.IsEmpty)
                 {
-                    bool isNull = array.IsNull(i);
-                    DefLevels.Add(isNull ? 0 : 1);
+                    levels.Fill(1);
                 }
-            }
-
-            // Count non-nulls
-            int batchNonNull = 0;
-            if (!IsNullable)
-            {
-                batchNonNull = rowCount;
-            }
-            else
-            {
-                for (int i = 0; i < rowCount; i++)
-                    if (!array.IsNull(i)) batchNonNull++;
+                else
+                {
+                    int offset = data.Offset;
+                    batchNonNull = 0;
+                    for (int i = 0; i < rowCount; i++)
+                    {
+                        int bit = offset + i;
+                        int level = (validity[bit >> 3] >> (bit & 7)) & 1;
+                        levels[i] = level;
+                        batchNonNull += level;
+                    }
+                }
             }
 
             AppendValues(array, rowCount, batchNonNull);
@@ -1022,19 +997,14 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         {
             int srcOffset = array.Data.Offset;
 
-            // Dictionary-encode based on the Arrow type, or buffer boolean values
             if (PhysicalType == PhysicalType.Boolean)
             {
-                // Boolean can't be dictionary-encoded — buffer raw values for flush-time encoding
-                BooleanValues ??= new GrowableIntList(rowCount);
-                var boolArr = (Apache.Arrow.BooleanArray)array;
-                for (int i = 0; i < rowCount; i++)
-                {
-                    if (!IsValue(LevelCount + i))
-                        BooleanValues.Add(0); // placeholder for null position
-                    else
-                        BooleanValues.Add(boolArr.GetValue(i) == true ? 1 : 0);
-                }
+                // Boolean can't be dictionary-encoded: its value bits are buffered as they are, a bit per level.
+                AppendBooleanBits(array.Data, rowCount);
+            }
+            else if (Plain)
+            {
+                AppendPlain(array.Data, rowCount);
             }
             else if (batchNonNull > 0)
             {
@@ -1044,6 +1014,387 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
             LevelCount += rowCount;
             NonNullCount += batchNonNull;
+            GC.KeepAlive(array);
+
+            if (!Plain && !_firstPageTested && PhysicalType != PhysicalType.Boolean)
+                TakeFirstPageTest();
+        }
+
+        // ───── Booleans ─────
+
+        // A bit per level: the value at a level that holds one, 0 at one that does not.
+        private byte[] _booleanBits = [];
+
+        private void AppendBooleanBits(ArrayData data, int levelCount)
+        {
+            long neededBytes = ((long)LevelCount + levelCount + 7) / 8;
+            if (neededBytes > _booleanBits.Length)
+                System.Array.Resize(ref _booleanBits, (int)Math.Min(
+                    DictionaryEncoder.BytesHashTable.MaxArrayLength, Math.Max(neededBytes, Math.Max(64, (long)_booleanBits.Length * 2))));
+
+            var source = data.Buffers[1].Span;
+            var target = _booleanBits.AsSpan();
+            int sourceOffset = data.Offset, at = LevelCount;
+            bool hasLevels = DefLevels is not null;
+            ReadOnlySpan<int> levels = hasLevels ? DefLevels!.Slice(LevelCount, levelCount) : default;
+            int max = MaxDefLevel;
+            for (int i = 0; i < levelCount; i++)
+            {
+                if (hasLevels && levels[i] != max)
+                    continue;
+                int bit = sourceOffset + i;
+                if (((source[bit >> 3] >> (bit & 7)) & 1) != 0)
+                {
+                    int to = at + i;
+                    target[to >> 3] |= (byte)(1 << (to & 7));
+                }
+            }
+        }
+
+        /// <summary>The buffered booleans as an array of a slot per level, null where a level holds no value.</summary>
+        public Apache.Arrow.BooleanArray BuildBooleanArray(int[]? presence)
+        {
+            int length = LevelCount;
+            var values = _booleanBits.AsSpan(0, (length + 7) / 8).ToArray();
+            var (validity, nullCount) = ValidityBitmap(presence, length);
+            return new Apache.Arrow.BooleanArray(new ArrowBuffer(values), validity, length, nullCount, 0);
+        }
+
+        /// <summary>
+        /// A validity bitmap from presence levels (1 where a level holds a value), and its null count; an empty buffer
+        /// and none for a column that cannot hold a null.
+        /// </summary>
+        private (ArrowBuffer Bitmap, int NullCount) ValidityBitmap(int[]? presence, int length)
+        {
+            if (!IsNullable)
+                return (ArrowBuffer.Empty, 0);
+
+            var bitmap = new byte[(length + 7) / 8];
+            int valid = 0;
+            for (int i = 0; i < length; i++)
+            {
+                if (presence is null || presence[i] != 0)
+                {
+                    bitmap[i >> 3] |= (byte)(1 << (i & 7));
+                    valid++;
+                }
+            }
+
+            return (new ArrowBuffer(bitmap), length - valid);
+        }
+
+        // ───── Plain values ─────
+
+        // Declined by the first-page test (or never tried): values are held as Arrow lays them out, a slot per level,
+        // with no lookup, and at flush handed to ParquetFileWriter's path as an array with no rebuild. For a fixed
+        // width, _plainValues holds the slots; for BYTE_ARRAY, the values' bytes, and _plainOffsets their offsets.
+        private bool _declined;
+        private byte[] _plainValues = [];
+        private long _plainLength;
+        private byte[]? _plainOffsets;
+        private int _plainLevels;
+
+        // The first-page test: the plain bytes of the values fed while it is pending (BYTE_ARRAY; a fixed width
+        // counts NonNullCount instead), and whether it has been taken.
+        private long _byteArrayPlainBytes;
+        private bool _firstPageTested;
+
+        /// <summary>
+        /// Whether values are held plain: the column has no dictionary, or the first-page test declined it. Such a
+        /// column takes no lookups, and is written in its own encoding.
+        /// </summary>
+        public bool Plain => (_declined || !DictionaryEnabled) && PhysicalType != PhysicalType.Boolean;
+
+        /// <summary>An Arrow slot's width for <see cref="ArrowType"/>; 0 for BYTE_ARRAY, whose values have offsets.</summary>
+        private int SlotWidth => ArrowType switch
+        {
+            Int8Type or UInt8Type => 1,
+            Int16Type or UInt16Type or HalfFloatType => 2,
+            Int32Type or UInt32Type or Date32Type or Time32Type or FloatType => 4,
+            Int64Type or UInt64Type or Date64Type or Time64Type or TimestampType or DurationType or DoubleType => 8,
+            FixedSizeBinaryType fsb => fsb.ByteWidth,
+            _ => 0,
+        };
+
+        private void AppendPlain(ArrayData data, int levelCount)
+        {
+            int width = SlotWidth;
+            if (width > 0)
+            {
+                var source = data.Buffers[1].Span.Slice(data.Offset * width, levelCount * width);
+                source.CopyTo(PlainSpace(source.Length));
+            }
+            else
+            {
+                var sourceOffsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span).Slice(data.Offset, levelCount + 1);
+                var sourceData = data.Buffers[2].Span;
+
+                long neededOffsets = ((long)_plainLevels + levelCount + 1) * sizeof(int);
+                if (_plainOffsets is null || neededOffsets > _plainOffsets.Length)
+                {
+                    if (neededOffsets > DictionaryEncoder.BytesHashTable.MaxArrayLength)
+                        throw new InvalidOperationException(
+                            "A column's values in one row group exceed the largest array .NET can allocate; flush row groups sooner.");
+                    System.Array.Resize(ref _plainOffsets, (int)Math.Min(DictionaryEncoder.BytesHashTable.MaxArrayLength,
+                        Math.Max(neededOffsets, Math.Max(1024, (long)(_plainOffsets?.Length ?? 0) * 2))));
+                }
+
+                // offsets[0] is already the end of the values before (0 for the first append).
+                var offsets = MemoryMarshal.Cast<byte, int>(_plainOffsets.AsSpan()).Slice(_plainLevels, levelCount + 1);
+
+                if (!HasLargeValue(sourceOffsets))
+                {
+                    // The common case: the append's values end to end, copied whole, their offsets moved.
+                    int start = sourceOffsets[0];
+                    int length = sourceOffsets[levelCount] - start;
+                    int delta = checked((int)(_plainLength - start));
+                    sourceData.Slice(start, length).CopyTo(PlainSpace(length));
+                    for (int i = 1; i <= levelCount; i++)
+                        offsets[i] = sourceOffsets[i] + delta;
+                }
+                else
+                {
+                    AppendPlainWithLargeValues(sourceOffsets, sourceData, offsets);
+                }
+            }
+
+            _plainLevels += levelCount;
+        }
+
+        // ───── Large repeated values ─────
+
+        // A plain BYTE_ARRAY value this long is looked up in a small cache of recent large values, and a repeat is
+        // held as a reference to the earlier copy rather than copied again, so a few distinct large values repeated
+        // over many rows cost a few copies and a reference per row, as they did when every value was looked up.
+        // Shorter values are copied without a lookup: a reference would cost as much as the value.
+        private const int LargeValueBytes = 64;
+
+        // Per slot: where in _plainValues a recent large value's copy starts, plus one, and its length.
+        private int[]? _recentLargeStarts;
+        private int[]? _recentLargeLengths;
+
+        // The levels held by reference, in level order: their offsets give them no bytes of their own. Null when none.
+        private List<(int Level, int Start, int Length)>? _plainReferences;
+
+        private static bool HasLargeValue(ReadOnlySpan<int> offsets)
+        {
+            for (int i = 1; i < offsets.Length; i++)
+            {
+                if (offsets[i] - offsets[i - 1] >= LargeValueBytes)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private void AppendPlainWithLargeValues(ReadOnlySpan<int> sourceOffsets, ReadOnlySpan<byte> sourceData, Span<int> offsets)
+        {
+            _recentLargeStarts ??= new int[RecentSlots];
+            _recentLargeLengths ??= new int[RecentSlots];
+            int levelCount = sourceOffsets.Length - 1;
+            for (int i = 0; i < levelCount; i++)
+            {
+                int start = sourceOffsets[i];
+                int length = sourceOffsets[i + 1] - start;
+                var value = sourceData.Slice(start, length);
+                if (length >= LargeValueBytes)
+                {
+                    int slot = LargeValueSlot(value);
+                    int cached = _recentLargeStarts[slot] - 1;
+                    if (cached >= 0 && _recentLargeLengths[slot] == length
+                        && value.SequenceEqual(_plainValues.AsSpan(cached, length)))
+                    {
+                        (_plainReferences ??= []).Add((_plainLevels + i, cached, length));
+                        offsets[i + 1] = offsets[i];
+                        continue;
+                    }
+
+                    _recentLargeStarts[slot] = checked((int)_plainLength + 1);
+                    _recentLargeLengths[slot] = length;
+                }
+
+                value.CopyTo(PlainSpace(length));
+                offsets[i + 1] = checked((int)_plainLength);
+            }
+        }
+
+        /// <summary>A large value's cache slot, from its length and three of its words: cheap, and checked on a hit.</summary>
+        private static int LargeValueSlot(ReadOnlySpan<byte> value)
+        {
+            ulong middle = MemoryMarshal.Read<ulong>(value.Slice(value.Length / 2));
+            ulong last = MemoryMarshal.Read<ulong>(value.Slice(value.Length - 8));
+            ulong key = (ulong)value.Length
+                ^ MemoryMarshal.Read<ulong>(value)
+                ^ ((middle << 21) | (middle >> 43))
+                ^ ((last << 42) | (last >> 22));
+            return (int)((key * 0x9E3779B97F4A7C15UL) >> 54); // the top 10 bits: RecentSlots = 1 << 10
+        }
+
+        /// <summary><paramref name="count"/> new bytes at the end of the plain values, for the caller to fill.</summary>
+        private Span<byte> PlainSpace(int count)
+        {
+            long needed = _plainLength + count;
+            if (needed > _plainValues.Length)
+            {
+                if (needed > DictionaryEncoder.BytesHashTable.MaxArrayLength)
+                    throw new InvalidOperationException(
+                        "A column's values in one row group exceed the largest array .NET can allocate; flush row groups sooner.");
+                System.Array.Resize(ref _plainValues, (int)Math.Min(DictionaryEncoder.BytesHashTable.MaxArrayLength,
+                    Math.Max(needed, Math.Max(1024, (long)_plainValues.Length * 2))));
+            }
+
+            var span = _plainValues.AsSpan((int)_plainLength, count);
+            _plainLength = needed;
+            return span;
+        }
+
+        /// <summary>
+        /// The plain values as an array of a slot per level, of the type <see cref="ReconstructArrowArray"/> rebuilds
+        /// a dictionary column as, so the two reach ParquetFileWriter's path alike. It borrows this state's buffers:
+        /// encode it before the state takes another value.
+        /// </summary>
+        public IArrowArray BuildPlainArray(int[]? presence)
+        {
+            int length = LevelCount;
+            var (validity, nullCount) = ValidityBitmap(presence, length);
+            var values = new ArrowBuffer(_plainValues.AsMemory(0, (int)_plainLength));
+            IArrowType type = ArrowType switch
+            {
+                Int32Type or Date32Type or Time32Type => Int32Type.Default,
+                Int64Type or Date64Type or Time64Type or TimestampType or DurationType => Int64Type.Default,
+                _ => ArrowType,
+            };
+
+            ArrowBuffer[] buffers;
+            if (SlotWidth > 0)
+                buffers = [validity, values];
+            else if (_plainReferences is null)
+                buffers = [validity, new ArrowBuffer(_plainOffsets is null
+                    ? new byte[sizeof(int)]
+                    : _plainOffsets.AsMemory(0, (length + 1) * sizeof(int))), values];
+            else
+                buffers = [validity, .. ResolveReferences(length)];
+            return Data.ArrowArrayFactory.BuildArray(new ArrayData(type, length, nullCount, 0, buffers));
+        }
+
+        /// <summary>The offsets and values of a BYTE_ARRAY column some of whose levels are held by reference.</summary>
+        private ArrowBuffer[] ResolveReferences(int length)
+        {
+            var references = _plainReferences!;
+            long total = _plainLength;
+            foreach (var reference in references)
+                total += reference.Length;
+            if (total > DictionaryEncoder.BytesHashTable.MaxArrayLength)
+                throw new InvalidOperationException(
+                    "A column's values in one row group exceed the largest array .NET can allocate; flush row groups sooner.");
+
+            var heldOffsets = MemoryMarshal.Cast<byte, int>(_plainOffsets.AsSpan()).Slice(0, length + 1);
+            var offsetBytes = new byte[(length + 1) * sizeof(int)];
+            var offsets = MemoryMarshal.Cast<byte, int>(offsetBytes.AsSpan());
+            var data = new byte[total];
+            int written = 0, next = 0;
+            for (int level = 0; level < length; level++)
+            {
+                ReadOnlySpan<byte> value;
+                if (next < references.Count && references[next].Level == level)
+                {
+                    var (_, start, count) = references[next++];
+                    value = _plainValues.AsSpan(start, count);
+                }
+                else
+                {
+                    value = _plainValues.AsSpan(heldOffsets[level], heldOffsets[level + 1] - heldOffsets[level]);
+                }
+
+                value.CopyTo(data.AsSpan(written));
+                written += value.Length;
+                offsets[level + 1] = written;
+            }
+
+            return [new ArrowBuffer(offsetBytes), new ArrowBuffer(data)];
+        }
+
+        /// <summary>
+        /// Takes the first-page test once the values fed reach <see cref="DictionaryEncoder.FirstPageBytes"/> written
+        /// plain, and on a decline moves the column to plain values. The test reads only those first values, so it
+        /// answers here as it would at flush; a chunk that ends short of them is still tested at flush.
+        /// </summary>
+        private void TakeFirstPageTest()
+        {
+            long plainBytes = PhysicalType switch
+            {
+                PhysicalType.ByteArray => _byteArrayPlainBytes,
+                PhysicalType.Int32 or PhysicalType.Float => 4L * NonNullCount,
+                PhysicalType.Int64 or PhysicalType.Double => 8L * NonNullCount,
+                _ => (long)TypeLength * NonNullCount,
+            };
+            if (plainBytes < DictionaryEncoder.FirstPageBytes)
+                return;
+
+            _firstPageTested = true;
+
+            // The test reads the page only for BYTE_ARRAY entry lengths and the indices only up to the first page's
+            // values, so both are lent as they stand.
+            byte[] page = _bytesTable is not null ? _bytesTable.ToPage() : _fixedPage;
+            var dictionary = new DictionaryEncoder.DictionaryResult
+            {
+                DictionaryPageData = page,
+                DictionaryCount = DictionaryCount,
+                Indices = Indices!.Buffer,
+            };
+            if (DictionaryEncoder.FirstPagePays(dictionary, NonNullCount, PhysicalType, TypeLength, DictionaryEncoder.FirstPageBytes))
+                return;
+
+            // Declined, as ParquetFileWriter declines it: whether or not the dictionary also filled first, it would
+            // have declined. The values so far are rebuilt once, and the dictionary dropped.
+            int pageLength;
+            if (TryBorrowPage(out byte[] borrowed))
+            {
+                page = borrowed;
+                pageLength = DictionaryPageLength;
+            }
+            else
+            {
+                page = BuildDictionaryPage();
+                pageLength = page.Length;
+            }
+
+            using var rebuilt = ReconstructArrowArray(
+                this,
+                new DictionaryEncoder.DictionaryResult
+                {
+                    DictionaryPageData = page,
+                    DictionaryCount = DictionaryCount,
+                    Indices = Indices.ToArray(NonNullCount),
+                },
+                pageLength,
+                PresenceLevels(this, DefLevels?.ToArray(LevelCount)),
+                LevelCount);
+
+            ResetDictionary();
+            // Released, not kept for reuse: a declined column will not look anything up again this row group.
+            _fixedDict = null;
+            _longDict = null;
+            _floatDict = null;
+            _doubleDict = null;
+            _fixedPage = [];
+            Indices.Reset();
+            _declined = true;
+            AppendPlain(rebuilt.Data, LevelCount);
+        }
+
+        private void ResetDictionary()
+        {
+            _fixedDict?.Clear();
+            _longDict?.Clear();
+            _floatDict?.Clear();
+            _doubleDict?.Clear();
+            _bytesTable = null;
+            _dictPageSize = 0;
+            _dictionaryFull = false;
+            if (_recentEntries is not null)
+                System.Array.Clear(_recentEntries, 0, _recentEntries.Length);
+            DictionaryCount = 0;
         }
 
         private void DictionaryEncodeArray(IArrowArray array, int rowCount, int srcOffset)
@@ -1266,15 +1617,19 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             ReadOnlySpan<int> arrowOffsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
             ReadOnlySpan<byte> arrowData = data.Buffers[2].Span;
 
+            long plainBytes = 0;
             for (int i = 0; i < rowCount; i++)
             {
                 if (!IsValue(LevelCount + i)) continue;
                 int start = arrowOffsets[srcOffset + i];
                 int len = arrowOffsets[srcOffset + i + 1] - start;
                 ReadOnlySpan<byte> valueBytes = arrowData.Slice(start, len);
+                plainBytes += 4 + len;
 
                 Indices!.Add(AddBytes(valueBytes));
             }
+
+            _byteArrayPlainBytes += plainBytes;
 
             // `data` is the only thing rooting the buffers the two spans above point into, and the loop
             // allocates on every new distinct value. See doc/arrow-span-lifetime.md.
@@ -1426,23 +1781,25 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         public void Reset()
         {
-            _fixedDict?.Clear();
-            _longDict?.Clear();
-            _floatDict?.Clear();
-            _doubleDict?.Clear();
-            _bytesTable = null;
-            _dictPageSize = 0;
-            _dictionaryFull = false;
+            ResetDictionary();
             // A page that held raw values is as large as the column was; keep one the size of a dictionary for
-            // reuse, and release a larger one rather than root it for the writer's lifetime.
+            // reuse, and release a larger one rather than root it for the writer's lifetime. Plain values are as
+            // large as the column, so they are released too.
             if (_fixedPage.Length > DictionaryLimit)
                 _fixedPage = [];
-            if (_recentEntries is not null)
-                System.Array.Clear(_recentEntries, 0, _recentEntries.Length);
-            DictionaryCount = 0;
+            _declined = false;
+            _plainValues = [];
+            _plainOffsets = null;
+            _plainLength = 0;
+            _plainLevels = 0;
+            _plainReferences = null;
+            if (_recentLargeStarts is not null)
+                System.Array.Clear(_recentLargeStarts, 0, _recentLargeStarts.Length);
+            _byteArrayPlainBytes = 0;
+            _firstPageTested = false;
+            _booleanBits.AsSpan(0, Math.Min(_booleanBits.Length, (LevelCount + 7) / 8)).Clear();
             Indices?.Reset();
             DefLevels?.Reset();
-            BooleanValues?.Reset();
             RepLevels?.Reset();
             LevelCount = 0;
             NonNullCount = 0;
@@ -1479,6 +1836,29 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 System.Array.Resize(ref _data, _data.Length * 2);
             _data[_count++] = value;
         }
+
+        /// <summary><paramref name="count"/> new elements at the end, for the caller to fill.</summary>
+        public Span<int> AppendSpan(int count)
+        {
+            long needed = (long)_count + count;
+            if (needed > _data.Length)
+            {
+                if (needed > DictionaryEncoder.BytesHashTable.MaxArrayLength / sizeof(int))
+                    throw new InvalidOperationException(
+                        "A column's levels in one row group exceed the largest array .NET can allocate; flush row groups sooner.");
+                System.Array.Resize(ref _data, (int)Math.Min(
+                    DictionaryEncoder.BytesHashTable.MaxArrayLength / sizeof(int), Math.Max(needed, (long)_data.Length * 2)));
+            }
+
+            var span = _data.AsSpan(_count, count);
+            _count += count;
+            return span;
+        }
+
+        public ReadOnlySpan<int> Slice(int start, int count) => _data.AsSpan(start, count);
+
+        /// <summary>The backing array, whose first elements are the list; longer than it.</summary>
+        public int[] Buffer => _data;
 
         public int Get(int index) => _data[index];
 
