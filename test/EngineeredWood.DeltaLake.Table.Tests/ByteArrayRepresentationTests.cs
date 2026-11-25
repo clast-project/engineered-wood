@@ -213,6 +213,10 @@ public class ByteArrayRepresentationTests
 
         Assert.Equal(0, builtAllocator.Live);
         Assert.Equal(readerBefore, readerAllocator.Live);
+
+        // Unreferenced past the release, the reader's array could be collected and its buffer released by the
+        // finalizer before Live is read, as happened once on net472 in CI.
+        GC.KeepAlive(raw);
     }
 
     /// <summary>

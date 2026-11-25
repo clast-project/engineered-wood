@@ -90,7 +90,7 @@ public class BufferedDictionaryLimitTests : IDisposable
         await AssertSameRowsAsync(batch, buffered);
     }
 
-    public static TheoryData<string> Types() => new() { "int8", "int32", "int64", "float", "double", "string", "decimal", "list" };
+    public static TheoryData<string> Types() => new() { "int8", "int32", "int64", "float", "double", "string", "decimal", "decimal9", "decimal18", "list" };
 
     [Theory]
     [MemberData(nameof(Types))]
@@ -133,6 +133,13 @@ public class BufferedDictionaryLimitTests : IDisposable
                 var m = new Decimal128Array.Builder(new Decimal128Type(30, 2));
                 for (int i = 0; i < rows; i++) m.Append((i % 300 - 150) * 1.25m);
                 array = m.Build();
+                break;
+            case "decimal9":
+            case "decimal18":
+                // Narrowed to INT32 / INT64 (Decimal32Type / Decimal64Type), so held plain in 4- and 8-byte slots.
+                var n = new Decimal128Array.Builder(new Decimal128Type(type == "decimal9" ? 9 : 18, 2));
+                for (int i = 0; i < rows; i++) n.Append((i % 300 - 150) * 1.25m);
+                array = n.Build();
                 break;
             default:
                 array = ListBatch(rows / 4, rows / 8, nullable: true).Column(0);
@@ -208,27 +215,221 @@ public class BufferedDictionaryLimitTests : IDisposable
     }
 
     [Fact]
-    public async Task ResetReleasesARawPage()
+    public async Task RepetitiveValues_AlikeWhereSampled_TakeAnEntryEach()
     {
-        // A page that held a row group's raw values is as large as the column was; once the row group is flushed
-        // it must not stay rooted for the writer's lifetime. Read through reflection: the state is private.
+        // Four 4 KiB strings that differ only at byte 24 hash apart: a slot chosen from a few sampled words would
+        // put them all in one slot, each evicting the last, and every row would take a copy.
+        var big = Enumerable.Range(0, 4).Select(k => new string('x', 24) + (char)('a' + k) + new string('x', 4071)).ToArray();
+        var builder = new StringArray.Builder();
+        for (int i = 0; i < 20_000; i++)
+            builder.Append(big[i % 4]);
+        var batch = Batch(builder.Build(), nullable: false);
+
+        await AssertAppendsAllocateLittleAsync(batch); // the values would be 82 MB
+        var (direct, buffered) = await WriteBothAsync(batch, DataPageVersion.V1, Limit, dictionary: false);
+        await AssertSameChunksAsync(direct, buffered);
+        await AssertSameRowsAsync(batch, buffered);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RepetitiveWideFixedSizeValues_TakeAnEntryEach(bool dictionary)
+    {
+        // A FIXED_LEN_BYTE_ARRAY this wide keeps its deduplicated entries rather than going plain: four distinct
+        // 4 KiB values over 20,000 rows are four entries, not 82 MB.
+        const int width = 4096, rows = 20_000;
+        var values = new byte[rows * width];
+        for (int i = 0; i < rows; i++)
+            values.AsSpan(i * width, width).Fill((byte)('a' + i % 4));
+        var array = new Apache.Arrow.Arrays.FixedSizeBinaryArray(new ArrayData(
+            new FixedSizeBinaryType(width), rows, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(values)]));
+        var batch = Batch(array, nullable: false);
+
+        if (!dictionary)
+            await AssertAppendsAllocateLittleAsync(batch);
+        var (direct, buffered) = await WriteBothAsync(batch, DataPageVersion.V1, Limit, dictionary);
+        await AssertSameChunksAsync(direct, buffered);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task BytesUnderNulls_AreNotHeld(bool dictionary)
+    {
+        // Arrow lets a null BYTE_ARRAY slot span bytes. They are not a value: the column must come out as it does
+        // when its nulls span none, with pages cut by the average size of its values alone.
+        const int rows = 200_000;
+        var validity = new byte[(rows + 7) / 8];
+        var offsets = new int[rows + 1];
+        var dirty = new List<byte>();
+        var clean = new StringArray.Builder();
+        for (int i = 0; i < rows; i++)
+        {
+            bool isNull = i % 2 == 1;
+            var text = isNull ? new string('n', 200) : "v" + i;
+            dirty.AddRange(System.Text.Encoding.UTF8.GetBytes(text));
+            offsets[i + 1] = dirty.Count;
+            if (isNull)
+            {
+                clean.AppendNull();
+            }
+            else
+            {
+                validity[i >> 3] |= (byte)(1 << (i & 7));
+                clean.Append(text);
+            }
+        }
+
+        var offsetBytes = new byte[offsets.Length * sizeof(int)];
+        Buffer.BlockCopy(offsets, 0, offsetBytes, 0, offsetBytes.Length);
+        var withPayloads = new StringArray(new ArrayData(StringType.Default, rows, rows / 2, 0,
+            [new ArrowBuffer(validity), new ArrowBuffer(offsetBytes), new ArrowBuffer(dirty.ToArray())]));
+
+        var expected = await WriteBufferedAsync(Batch(clean.Build(), nullable: true), dictionary);
+        var actual = await WriteBufferedAsync(Batch(withPayloads, nullable: true), dictionary);
+        var e = (await ReadMetadataAsync(expected)).RowGroups.Single().Columns.Single().MetaData!;
+        var a = (await ReadMetadataAsync(actual)).RowGroups.Single().Columns.Single().MetaData!;
+        Assert.Equal(ChunkBytes(expected, e), ChunkBytes(actual, a));
+    }
+
+    private async Task<string> WriteBufferedAsync(RecordBatch batch, bool dictionary)
+    {
+        var options = ParquetWriteOptions.Default with { DictionaryEnabled = dictionary, RowGroupMaxRows = 1_000_000 };
+        string path = Path.Combine(_tempDir, $"buffered-{Guid.NewGuid():N}.parquet");
+        await using (var writer = new BufferedParquetWriter(new LocalSequentialFile(path), ownsFile: true, options))
+        {
+            for (int start = 0; start < batch.Length; start += 37_000)
+                await writer.AppendAsync(batch.Slice(start, Math.Min(37_000, batch.Length - start)));
+            await writer.CloseAsync();
+        }
+
+        return path;
+    }
+
+    // Appends batch with dictionaries off, in slices, and asserts they allocate a fraction of its values' size.
+    private async Task AssertAppendsAllocateLittleAsync(RecordBatch batch)
+    {
+        var options = ParquetWriteOptions.Default with { DictionaryEnabled = false, RowGroupMaxRows = 1_000_000 };
+        await using var writer = new BufferedParquetWriter(
+            new LocalSequentialFile(Path.Combine(_tempDir, $"alloc-{Guid.NewGuid():N}.parquet")), ownsFile: true, options);
+#if NET8_0_OR_GREATER
+        long before = GC.GetAllocatedBytesForCurrentThread();
+#endif
+        for (int start = 0; start < batch.Length; start += 2_000)
+            await writer.AppendAsync(batch.Slice(start, Math.Min(2_000, batch.Length - start)));
+#if NET8_0_OR_GREATER
+        Assert.InRange(GC.GetAllocatedBytesForCurrentThread() - before, 0, 16L << 20);
+#endif
+        await writer.CloseAsync();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RepeatedLargeValues_AmongNullsAndSmallOnes_WriteAsTheFileWriterDoes(bool dictionary)
+    {
+        // A plain column holds a repeated large value by reference, beside small values copied whole and nulls; the
+        // flush resolves the references in level order. With the dictionary on, distinct values decline it first.
+        var big = Enumerable.Range(0, 4).Select(k => new string((char)('a' + k), 100 + k)).ToArray();
+        var builder = new StringArray.Builder();
+        for (int i = 0; i < 300_000; i++)
+        {
+            if (i % 3 == 0) builder.AppendNull();
+            else if (i % 2 == 0 && i > 60_000) builder.Append(big[i % 4]);
+            else builder.Append("unique-value-" + i);
+        }
+
+        var batch = Batch(builder.Build(), nullable: true);
+        var (direct, buffered) = await WriteBothAsync(batch, DataPageVersion.V2, 1 << 20, dictionary);
+        await AssertSameChunksAsync(direct, buffered);
+        await AssertSameRowsAsync(batch, buffered);
+    }
+
+    [Fact]
+    public async Task ResetReleasesPlainValues()
+    {
+        // Values held plain are as large as the column was; once the row group is flushed they must not stay rooted
+        // for the writer's lifetime. Read through reflection: the state is private.
         var options = ParquetWriteOptions.Default with { DictionaryEnabled = false, RowGroupMaxRows = 1_000_000 };
         await using var writer = new BufferedParquetWriter(
             new LocalSequentialFile(Path.Combine(_tempDir, "reset.parquet")), ownsFile: true, options);
         await writer.AppendAsync(Int64Batch(300_000, 0, nullable: false)); // all distinct: 2.4 MB raw
-        Assert.True(FixedPageLength(writer) > options.DictionaryPageSizeLimit);
+        Assert.True(StateArrayLength(writer, "_plainValues") > options.DictionaryPageSizeLimit);
 
         await writer.FlushRowGroupAsync();
-        Assert.Equal(0, FixedPageLength(writer));
+        Assert.Equal(0, StateArrayLength(writer, "_plainValues"));
         await writer.CloseAsync();
     }
 
-    private static int FixedPageLength(BufferedParquetWriter writer)
+    [Fact]
+    public async Task DeclinedOnTheFirstPage_HeldPlainWithoutADictionary()
+    {
+        // Distinct values decline the dictionary once a first page of them has arrived; from then the column is
+        // held as its values, and its dictionary is dropped rather than kept growing until the flush.
+        var options = ParquetWriteOptions.Default with { RowGroupMaxRows = 1_000_000 };
+        await using (var writer = new BufferedParquetWriter(
+            new LocalSequentialFile(Path.Combine(_tempDir, "declined.parquet")), ownsFile: true, options))
+        {
+            var distinct = Int64Batch(200_000, 0, nullable: true);
+            await writer.AppendAsync(distinct.Slice(0, 100_000)); // 685 KiB of values: still undecided
+            Assert.Equal(0, StateArrayLength(writer, "_plainValues"));
+            await writer.AppendAsync(distinct.Slice(100_000, 100_000)); // past the first page: declined
+            Assert.True(StateArrayLength(writer, "_plainValues") >= 200_000 * sizeof(long));
+            Assert.Equal(0, StateArrayLength(writer, "_fixedPage"));
+            await writer.CloseAsync();
+        }
+
+        foreach (var nullable in new[] { false, true })
+        {
+            var ints = Int64Batch(400_000, 0, nullable);
+            var (direct, buffered) = await WriteBothAsync(ints, DataPageVersion.V2, options.DictionaryPageSizeLimit, dictionary: true);
+            await AssertSameChunksAsync(direct, buffered);
+            await AssertSameRowsAsync(ints, buffered);
+
+            var strings = StringBatch(400_000, 0, nullable);
+            (direct, buffered) = await WriteBothAsync(strings, DataPageVersion.V1, options.DictionaryPageSizeLimit, dictionary: true);
+            await AssertSameChunksAsync(direct, buffered);
+            await AssertSameRowsAsync(strings, buffered);
+        }
+    }
+
+    [Fact]
+    public async Task FilledBeforeTheFirstPage_HeldPlainAtOnce()
+    {
+        // A dictionary that passes its limit before a first page of values has arrived is declined, whatever the
+        // test would say, so the column is held as values from the append that filled it, not a first page later.
+        var options = ParquetWriteOptions.Default with { DictionaryPageSizeLimit = 64 * 1024, RowGroupMaxRows = 1_000_000 };
+        var distinct = Int64Batch(200_000, 0, nullable: true);
+        await using (var writer = new BufferedParquetWriter(
+            new LocalSequentialFile(Path.Combine(_tempDir, "filled.parquet")), ownsFile: true, options))
+        {
+            await writer.AppendAsync(distinct.Slice(0, 20_000)); // 137 KiB of values: full, a first page is 1 MiB
+            Assert.True(StateArrayLength(writer, "_plainValues") >= 20_000 * sizeof(long));
+            Assert.Equal(0, StateArrayLength(writer, "_fixedPage"));
+            await writer.CloseAsync();
+        }
+
+        foreach (var nullable in new[] { false, true })
+        {
+            var ints = Int64Batch(400_000, 0, nullable);
+            var (direct, buffered) = await WriteBothAsync(ints, DataPageVersion.V2, options.DictionaryPageSizeLimit, dictionary: true);
+            await AssertSameChunksAsync(direct, buffered);
+            await AssertSameRowsAsync(ints, buffered);
+
+            var strings = StringBatch(400_000, 0, nullable);
+            (direct, buffered) = await WriteBothAsync(strings, DataPageVersion.V1, options.DictionaryPageSizeLimit, dictionary: true);
+            await AssertSameChunksAsync(direct, buffered);
+            await AssertSameRowsAsync(strings, buffered);
+        }
+    }
+
+    private static int StateArrayLength(BufferedParquetWriter writer, string field)
     {
         var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
         var states = (System.Array)typeof(BufferedParquetWriter).GetField("_columnStates", flags)!.GetValue(writer)!;
         var state = states.GetValue(0)!;
-        return ((byte[])state.GetType().GetField("_fixedPage", flags)!.GetValue(state)!).Length;
+        return ((System.Array)state.GetType().GetField(field, flags)!.GetValue(state)!).Length;
     }
 
     private static RecordBatch Int64Batch(int rows, int lowRows, bool nullable)
@@ -369,11 +570,17 @@ public class BufferedDictionaryLimitTests : IDisposable
         Int32Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
         FloatArray a => BitConverter.ToInt32(BitConverter.GetBytes(a.GetValue(i)!.Value), 0).ToString(System.Globalization.CultureInfo.InvariantCulture),
         DoubleArray a => BitConverter.DoubleToInt64Bits(a.GetValue(i)!.Value).ToString(System.Globalization.CultureInfo.InvariantCulture),
-        Decimal128Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        Decimal128Array a => RenderDecimal(a.GetValue(i)!.Value),
+        Decimal32Array a => RenderDecimal(a.GetValue(i)!.Value),
+        Decimal64Array a => RenderDecimal(a.GetValue(i)!.Value),
         ListArray a => string.Join(",", Enumerable.Range(a.ValueOffsets[i], a.GetValueLength(i))
             .Select(k => ((Int64Array)a.Values).GetValue(k))),
         _ => throw new InvalidOperationException(array.GetType().Name),
     };
+
+    // By value: the decimal arrays differ in whether a value keeps its scale's trailing zeros.
+    private static string RenderDecimal(decimal value) =>
+        (value / 1.0000000000000000000000000000m).ToString(System.Globalization.CultureInfo.InvariantCulture);
 
     private static async Task<FileMetaData> ReadMetadataAsync(string path)
     {
