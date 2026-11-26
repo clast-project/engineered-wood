@@ -1,0 +1,2 @@
+# Vendored test vectors, kept byte for byte.
+*.bin binary
