@@ -51,6 +51,10 @@ public sealed class ExpireSnapshots
         TableMetadata metadata, ITableFileSystem? fs = null,
         CancellationToken ct = default)
     {
+        // Expiry rewrites the table's metadata and deletes its files, so it is a write: refuse an encrypted
+        // table up front, whatever would be expired and whether or not a file system is given.
+        metadata.ThrowIfNotWritable();
+
         var allSnapshots = metadata.Snapshots.ToList();
 
         // Determine snapshots that must be retained

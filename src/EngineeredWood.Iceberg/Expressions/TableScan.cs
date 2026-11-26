@@ -57,7 +57,9 @@ public sealed class TableScan
             ? TimeTravel.AtSnapshot(_metadata, _snapshotId.Value)
             : _metadata;
 
-        if (effectiveMetadata.CurrentSnapshotId is null)
+        var current = effectiveMetadata.Snapshots.FirstOrDefault(s => s.SnapshotId == effectiveMetadata.CurrentSnapshotId);
+        effectiveMetadata.ThrowIfDataInaccessible(current);
+        if (current is null)
             return new ScanResult([], [], 0, 0);
 
         var snapshot = effectiveMetadata.Snapshots.First(
@@ -112,6 +114,11 @@ public sealed class TableScan
     /// </summary>
     public ScanResult PlanFiles(IReadOnlyList<DataFile> candidateFiles)
     {
+        // The files come from the caller, but planning them is still reading the table.
+        var effective = _snapshotId is not null ? TimeTravel.AtSnapshot(_metadata, _snapshotId.Value) : _metadata;
+        effective.ThrowIfDataInaccessible(
+            effective.Snapshots.FirstOrDefault(s => s.SnapshotId == effective.CurrentSnapshotId));
+
         var schema = _metadata.Schemas.First(
             s => s.SchemaId == _metadata.CurrentSchemaId);
         var (boundFilter, accessor) = BindFilter(_filter, schema);

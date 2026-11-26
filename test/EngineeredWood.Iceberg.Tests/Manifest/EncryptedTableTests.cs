@@ -136,4 +136,38 @@ public class EncryptedTableTests : IDisposable
         var result = await new TableScan(md, _fs).PlanFilesAsync();
         Assert.Single(result.DataFiles);
     }
+
+    [Fact]
+    public async Task EmptyEncryptedTable_RefusesScansAndListings()
+    {
+        var md = WithTableKey(TableMetadata.Create(
+            new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]),
+            location: Path.Combine(_warehouse, "empty-scan"), formatVersion: 3));
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await new TableScan(md, _fs).PlanFilesAsync());
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await _ops.ListDataFilesAsync(md));
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await _ops.ListDeleteFilesAsync(md));
+    }
+
+    [Theory]
+    [MemberData(nameof(Encryptions))]
+    public async Task PlanningCallerSuppliedFiles_IsRefused(string how)
+    {
+        var md = Encrypt(await TableWithOneSnapshotAsync(), how);
+        Assert.Throws<UnsupportedTableFeatureException>(() => new TableScan(md, _fs).PlanFiles([File1]));
+    }
+
+    [Theory]
+    [MemberData(nameof(Encryptions))]
+    public async Task ExpireSnapshots_IsRefused_EvenWhenNothingExpiresOrNoFileSystem(string how)
+    {
+        var md = Encrypt(await TableWithOneSnapshotAsync(), how);
+        // Nothing to expire (the only snapshot is current), and no file system to touch.
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await new ExpireSnapshots().ExpireOlderThan(0).ApplyAsync(md));
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await new ExpireSnapshots().ExpireOlderThan(long.MaxValue).ApplyAsync(md, fs: null));
+    }
 }

@@ -180,14 +180,15 @@ public sealed record TableMetadata : IJsonOnDeserialized
         EncryptionKeys is { Count: > 0 } || Snapshots.Any(s => s.KeyId is not null);
 
     /// <summary>
-    /// Throws <see cref="UnsupportedTableFeatureException"/> when <paramref name="snapshot"/>'s data cannot be
-    /// read safely by this library: the table, or the snapshot, is encrypted. Reading an encrypted manifest
+    /// Throws <see cref="UnsupportedTableFeatureException"/> when <paramref name="snapshot"/>'s data (or, with
+    /// none, the table's) cannot be read safely by this library: the table, or the snapshot, is encrypted. Reading an encrypted manifest
     /// list as plaintext would misread it.
     /// </summary>
-    internal void ThrowIfDataInaccessible(Snapshot snapshot)
+    internal void ThrowIfDataInaccessible(Snapshot? snapshot)
     {
+        // Table keys refuse every read, including one of an empty table: there is no plaintext view of it.
         ThrowIfTableKeys("read");
-        if (snapshot.KeyId is { } keyId)
+        if (snapshot?.KeyId is { } keyId)
             throw new UnsupportedTableFeatureException(
                 $"Snapshot {snapshot.SnapshotId} of table {TableUuid} is encrypted (key-id '{keyId}'); " +
                 "table encryption is not supported, so its data cannot be read.");
