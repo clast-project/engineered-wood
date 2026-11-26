@@ -10,7 +10,7 @@ namespace EngineeredWood.Iceberg;
 /// The immutable metadata for an Iceberg table at a specific version, including schemas,
 /// partition specs, sort orders, snapshots, and table properties.
 /// </summary>
-public sealed record TableMetadata : IJsonOnDeserialized
+public sealed record TableMetadata : IJsonOnDeserialized, IJsonOnSerializing
 {
     /// <summary>The newest table format version this library reads and writes.</summary>
     public const int MaxSupportedFormatVersion = 3;
@@ -231,13 +231,19 @@ public sealed record TableMetadata : IJsonOnDeserialized
                 $"Table {TableUuid}'s current-snapshot-id {id} names no snapshot in its metadata.");
     }
 
-    void IJsonOnDeserialized.OnDeserialized()
+    void IJsonOnDeserialized.OnDeserialized() => ThrowIfUnsupportedVersion("read");
+
+    // Writing is checked too: metadata built with `with { FormatVersion = 4 }` would otherwise be written as a
+    // table this library (and any v3 reader) then refuses, while the files it describes follow v3 rules.
+    void IJsonOnSerializing.OnSerializing() => ThrowIfUnsupportedVersion("written");
+
+    private void ThrowIfUnsupportedVersion(string verb)
     {
         // "Implementations must throw an exception if a table's version is higher than the supported
         // version." Opening a newer table anyway would misread it, and a commit would corrupt it.
         if (FormatVersion is < 1 or > MaxSupportedFormatVersion)
             throw new UnsupportedTableFeatureException(
-                $"Table format-version {FormatVersion} is not supported; this library supports " +
-                $"format versions 1 to {MaxSupportedFormatVersion}.");
+                $"Table format-version {FormatVersion} is not supported, so it cannot be {verb}; this library " +
+                $"supports format versions 1 to {MaxSupportedFormatVersion}.");
     }
 }

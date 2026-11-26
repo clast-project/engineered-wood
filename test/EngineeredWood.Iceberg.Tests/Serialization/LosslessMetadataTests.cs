@@ -373,6 +373,16 @@ public class LosslessMetadataTests
         Assert.Contains($"format-version {version}", ex.Message);
     }
 
+    [Theory]
+    [InlineData(4)]
+    [InlineData(0)]
+    public void UnsupportedFormatVersion_IsNotWrittenEither(int version)
+    {
+        var md = IcebergJsonSerializer.Deserialize<TableMetadata>(V3Json) with { FormatVersion = version };
+        var ex = Assert.Throws<UnsupportedTableFeatureException>(() => IcebergJsonSerializer.Serialize(md));
+        Assert.Contains($"format-version {version}", ex.Message);
+    }
+
     /// <summary>
     /// A JSON value with object properties sorted by name, so two documents compare equal when they hold
     /// the same data in a different property order.
