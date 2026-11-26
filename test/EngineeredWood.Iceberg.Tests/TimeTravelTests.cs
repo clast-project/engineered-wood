@@ -181,6 +181,27 @@ public class TimeTravelTests : IDisposable
     }
 
     [Fact]
+    public async Task CherryPick_KeepsTheSourcesRowLineage()
+    {
+        long snap1 = 0, snap3 = 0;
+        var metadata = await CreateTableWithSnapshotsAsync(
+            onSnap1: id => snap1 = id,
+            onSnap3: id => snap3 = id);
+        // As a v3 writer records it: snap3 assigned row ids 200..249.
+        metadata = metadata with
+        {
+            Snapshots = metadata.Snapshots
+                .Select(s => s.SnapshotId == snap3 ? s with { FirstRowId = 200, AddedRows = 50 } : s)
+                .ToList(),
+        };
+
+        var cherryPicked = TimeTravel.CherryPick(TimeTravel.Rollback(metadata, snap1), snap3);
+
+        var latest = cherryPicked.Snapshots.Single(s => s.SnapshotId == cherryPicked.CurrentSnapshotId);
+        Assert.Equal((200L, 50L), (latest.FirstRowId!.Value, latest.AddedRows!.Value));
+    }
+
+    [Fact]
     public async Task CherryPick_CreatesNewSnapshotFromExisting()
     {
         long snap1 = 0, snap3 = 0;

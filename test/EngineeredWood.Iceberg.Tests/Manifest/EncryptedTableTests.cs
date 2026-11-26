@@ -187,6 +187,8 @@ public class EncryptedTableTests : IDisposable
         var current = picked.Snapshots.Single(s => s.SnapshotId == picked.CurrentSnapshotId);
         Assert.Equal(source.ManifestList, current.ManifestList);
         Assert.Equal("k1", current.KeyId);
+        // v3 lineage comes across with the manifest list it describes.
+        Assert.Equal((source.FirstRowId, source.AddedRows), (current.FirstRowId, current.AddedRows));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
             async () => await new TableScan(picked, _fs).PlanFilesAsync());
     }
