@@ -41,22 +41,22 @@ internal sealed class RecordBatchAssembler
     }
 
     /// <summary>
-    /// Decodes up to <paramref name="maxRows"/> records from the data span.
+    /// Decodes the next <paramref name="rowCount"/> records of a block from the data span.
     /// Returns the RecordBatch and the number of bytes consumed.
     /// </summary>
-    public (RecordBatch batch, int bytesConsumed) Decode(ReadOnlySpan<byte> data, int maxRows)
+    /// <remarks>
+    /// The count comes from the block header, not from the bytes left: a record can be encoded as zero bytes
+    /// (only nulls, or a record with no fields), and stopping when the data ran out read those as no rows.
+    /// </remarks>
+    public (RecordBatch batch, int bytesConsumed) Decode(ReadOnlySpan<byte> data, int rowCount)
     {
         var reader = new AvroBinaryReader(data);
         var effectiveSchema = _resolution?.ArrowSchema ?? _arrowSchema;
         ResetBuilders();
-        ReserveBuilders(maxRows);
+        ReserveBuilders(rowCount);
 
-        int rowCount = 0;
-        for (int i = 0; i < maxRows && !reader.IsEmpty; i++)
-        {
+        for (int i = 0; i < rowCount; i++)
             DecodeRecordDispatch(ref reader, _builders);
-            rowCount++;
-        }
 
         var arrays = BuildArrays(_builders, effectiveSchema);
         var batch = new RecordBatch(effectiveSchema, arrays, rowCount);
@@ -531,7 +531,9 @@ internal sealed class NullableBuilder : IColumnBuilder
 
     public void Append(ref AvroBinaryReader reader)
     {
-        int branchIndex = reader.ReadUnionIndex();
+        // Two branches: any index but the null one used to count as the value, so a stray index read the
+        // bytes after it as a value, silently and misaligned from there on.
+        int branchIndex = reader.ReadUnionIndex(2);
         if (branchIndex == _nullIndex)
         {
             _inner.AppendNull();
@@ -1787,7 +1789,7 @@ internal sealed class DenseUnionBuilder : IColumnBuilder
 
     public void Append(ref AvroBinaryReader reader)
     {
-        int branchIndex = reader.ReadUnionIndex();
+        int branchIndex = reader.ReadUnionIndex(_branchBuilders.Length);
         _typeIds.Add(checked((byte)branchIndex));
         _offsets.Add(_branchCounts[branchIndex]);
         _branchCounts[branchIndex]++;

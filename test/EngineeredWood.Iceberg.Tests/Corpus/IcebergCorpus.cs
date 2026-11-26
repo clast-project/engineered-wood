@@ -111,7 +111,7 @@ internal sealed class IcebergCorpus
         var files = new List<ManifestFileBounds>();
         foreach (string manifest in ReadColumn(snapshot.ManifestList, "manifest_path"))
         {
-            foreach (var batch in Read(manifest, BoundsReaderSchema))
+            foreach (var batch in Read(manifest))
             {
                 var status = (Int32Array)batch.Column("status");
                 var dataFile = (StructArray)batch.Column("data_file");
@@ -143,37 +143,12 @@ internal sealed class IcebergCorpus
         }
     }
 
-    private List<RecordBatch> Read(string avroLocation, AvroSchema? readerSchema = null)
+    private List<RecordBatch> Read(string avroLocation)
     {
         using var stream = File.OpenRead(LocalPath(avroLocation));
-        var builder = new AvroReaderBuilder();
-        if (readerSchema is not null)
-            builder = builder.WithReaderSchema(readerSchema);
-        using var reader = builder.Build(stream);
+        using var reader = new AvroReaderBuilder().Build(stream);
         return reader.ToList();
     }
-
-    /// <summary>
-    /// The manifest-entry fields the bound checks need, resolved by name against the writer's schema. Reading
-    /// the whole entry into Arrow fails for two reasons that are EngineeredWood.Avro's, not the corpus's: an
-    /// unpartitioned table's empty <c>partition</c> record (Arrow refuses a struct of no fields), and a
-    /// union in the uuid/fixed partition tuple (an OverflowException).
-    /// </summary>
-    private static readonly AvroSchema BoundsReaderSchema = new("""
-        {"type": "record", "name": "manifest_entry", "fields": [
-          {"name": "status", "type": "int"},
-          {"name": "data_file", "type": {"type": "record", "name": "r2", "fields": [
-            {"name": "content", "type": "int", "default": 0},
-            {"name": "file_path", "type": "string"},
-            {"name": "lower_bounds", "type": ["null", {"type": "array", "items":
-              {"type": "record", "name": "k126_v127", "fields": [{"name": "key", "type": "int"}, {"name": "value", "type": "bytes"}]}}],
-             "default": null},
-            {"name": "upper_bounds", "type": ["null", {"type": "array", "items":
-              {"type": "record", "name": "k129_v130", "fields": [{"name": "key", "type": "int"}, {"name": "value", "type": "bytes"}]}}],
-             "default": null}
-          ]}}
-        ]}
-        """);
 
     private static Dictionary<int, byte[]> BoundMap(IArrowArray array, int row)
     {

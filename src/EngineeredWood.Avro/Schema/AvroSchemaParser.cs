@@ -161,7 +161,9 @@ internal static class AvroSchemaParser
             Properties = ExtraProperties(obj, RecordAttributes),
         };
 
-        // Replace placeholder with real record
+        // Replace placeholder with real record; references already parsed keep the placeholder, which now knows
+        // what it stands for.
+        placeholder.Definition = record;
         namedTypes[fullName] = record;
         namedTypes[name] = record;
 

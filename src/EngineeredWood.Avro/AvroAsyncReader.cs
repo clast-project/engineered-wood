@@ -23,6 +23,10 @@ public sealed class AvroAsyncReader : IAsyncEnumerable<RecordBatch>, IAsyncDispo
     private int _pendingRemaining;
 
     /// <summary>The Arrow schema for all batches produced by this reader.</summary>
+    /// <remarks>
+    /// A field whose type is a record with no fields is left out: Apache.Arrow has no struct of no fields, and
+    /// such a record is encoded as zero bytes, so nothing else is lost. <see cref="WriterSchema"/> still has it.
+    /// </remarks>
     public Apache.Arrow.Schema Schema { get; }
 
     /// <summary>The Avro writer schema from the OCF header.</summary>
@@ -40,20 +44,23 @@ public sealed class AvroAsyncReader : IAsyncEnumerable<RecordBatch>, IAsyncDispo
         _ocf = ocf;
         _batchSize = batchSize;
 
+        WriterSchema = new AvroSchema(AvroSchemaWriter.ToJson(ocf.WriterSchema));
         var writerRecord = ocf.WriterSchema;
-        WriterSchema = new AvroSchema(AvroSchemaWriter.ToJson(writerRecord));
 
         if (readerSchema != null)
         {
             if (readerSchema.Parsed is not AvroRecordSchema readerRecord)
                 throw new InvalidOperationException("Reader schema must be a record type.");
 
-            var resolution = SchemaResolver.Resolve(writerRecord, readerRecord);
+            // Only the reader's empty records are left out. A writer field of an empty record type is then skipped
+            // (it takes zero bytes), or, when the reader's record adds fields, those fields take their defaults.
+            var resolution = SchemaResolver.Resolve(writerRecord, EmptyRecords.Strip(readerRecord));
             Schema = resolution.ArrowSchema;
             _assembler = new RecordBatchAssembler(writerRecord, resolution);
         }
         else
         {
+            writerRecord = EmptyRecords.Strip(writerRecord);
             Schema = ArrowSchemaConverter.ToArrow(writerRecord, extensionRegistry);
             _assembler = new RecordBatchAssembler(writerRecord, Schema);
         }
