@@ -1,0 +1,773 @@
+{
+ "all_delete_files": [
+  {
+   "column_sizes": {
+    "1": 57
+   },
+   "content": 2,
+   "equality_ids": [
+    1
+   ],
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/data/part=0/eq-delete-id-0-5f6bb95c-e0f7-4180-be16-41b23b95d059.parquet",
+   "file_size_in_bytes": 461,
+   "lower_bounds": {
+    "1": "AgAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0
+   },
+   "partition": {
+    "part": 0
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 57,
+     "lower_bound": 2,
+     "null_value_count": 0,
+     "upper_bound": 7,
+     "value_count": 4
+    },
+    "part": {},
+    "s": {}
+   },
+   "record_count": 4,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "BwAAAA=="
+   },
+   "value_counts": {
+    "1": 4
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 53
+   },
+   "content": 2,
+   "equality_ids": [
+    1
+   ],
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/data/part=1/eq-delete-id-1-3026e170-0543-464d-a0c9-c74f2f3d1faf.parquet",
+   "file_size_in_bytes": 457,
+   "lower_bounds": {
+    "1": "AQAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0
+   },
+   "partition": {
+    "part": 1
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 53,
+     "lower_bound": 1,
+     "null_value_count": 0,
+     "upper_bound": 8,
+     "value_count": 3
+    },
+    "part": {},
+    "s": {}
+   },
+   "record_count": 3,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "CAAAAA=="
+   },
+   "value_counts": {
+    "1": 3
+   }
+  },
+  {
+   "column_sizes": {
+    "2": 59
+   },
+   "content": 2,
+   "equality_ids": [
+    2
+   ],
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/data/part=1/eq-delete-s-1-48296dd3-a537-43e8-af01-37158d046dc3.parquet",
+   "file_size_in_bytes": 466,
+   "lower_bounds": {
+    "2": "cm93MTE="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "2": 0
+   },
+   "partition": {
+    "part": 1
+   },
+   "readable_metrics": {
+    "id": {},
+    "part": {},
+    "s": {
+     "column_size": 59,
+     "lower_bound": "row11",
+     "null_value_count": 0,
+     "upper_bound": "row13",
+     "value_count": 2
+    }
+   },
+   "record_count": 2,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "2": "cm93MTM="
+   },
+   "value_counts": {
+    "2": 2
+   }
+  }
+ ],
+ "files": [
+  {
+   "column_sizes": {
+    "1": 75,
+    "2": 76,
+    "3": 78
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/data/part=0/00000-107-4ad8b124-18c6-48e6-a979-39814c3eda08-0-00001.parquet",
+   "file_size_in_bytes": 960,
+   "lower_bounds": {
+    "1": "AAAAAA==",
+    "2": "cm93MA==",
+    "3": "AAAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0,
+    "2": 0,
+    "3": 0
+   },
+   "partition": {
+    "part": 0
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 75,
+     "lower_bound": 0,
+     "null_value_count": 0,
+     "upper_bound": 18,
+     "value_count": 10
+    },
+    "part": {
+     "column_size": 78,
+     "lower_bound": 0,
+     "null_value_count": 0,
+     "upper_bound": 0,
+     "value_count": 10
+    },
+    "s": {
+     "column_size": 76,
+     "lower_bound": "row0",
+     "null_value_count": 0,
+     "upper_bound": "row8",
+     "value_count": 10
+    }
+   },
+   "record_count": 10,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "EgAAAA==",
+    "2": "cm93OA==",
+    "3": "AAAAAA=="
+   },
+   "value_counts": {
+    "1": 10,
+    "2": 10,
+    "3": 10
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 39,
+    "2": 49,
+    "3": 39
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/data/part=0/00000-109-584076bc-b96a-46c2-9baf-122120279437-0-00001.parquet",
+   "file_size_in_bytes": 886,
+   "lower_bounds": {
+    "1": "BAAAAA==",
+    "2": "cmVpbnNlcnRlZA==",
+    "3": "AAAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0,
+    "2": 0,
+    "3": 0
+   },
+   "partition": {
+    "part": 0
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 39,
+     "lower_bound": 4,
+     "null_value_count": 0,
+     "upper_bound": 4,
+     "value_count": 1
+    },
+    "part": {
+     "column_size": 39,
+     "lower_bound": 0,
+     "null_value_count": 0,
+     "upper_bound": 0,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 49,
+     "lower_bound": "reinserted",
+     "null_value_count": 0,
+     "upper_bound": "reinserted",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "BAAAAA==",
+    "2": "cmVpbnNlcnRlZA==",
+    "3": "AAAAAA=="
+   },
+   "value_counts": {
+    "1": 1,
+    "2": 1,
+    "3": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 75,
+    "2": 76,
+    "3": 78
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/data/part=1/00000-107-4ad8b124-18c6-48e6-a979-39814c3eda08-0-00002.parquet",
+   "file_size_in_bytes": 960,
+   "lower_bounds": {
+    "1": "AQAAAA==",
+    "2": "cm93MQ==",
+    "3": "AQAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0,
+    "2": 0,
+    "3": 0
+   },
+   "partition": {
+    "part": 1
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 75,
+     "lower_bound": 1,
+     "null_value_count": 0,
+     "upper_bound": 19,
+     "value_count": 10
+    },
+    "part": {
+     "column_size": 78,
+     "lower_bound": 1,
+     "null_value_count": 0,
+     "upper_bound": 1,
+     "value_count": 10
+    },
+    "s": {
+     "column_size": 76,
+     "lower_bound": "row1",
+     "null_value_count": 0,
+     "upper_bound": "row9",
+     "value_count": 10
+    }
+   },
+   "record_count": 10,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "EwAAAA==",
+    "2": "cm93OQ==",
+    "3": "AQAAAA=="
+   },
+   "value_counts": {
+    "1": 10,
+    "2": 10,
+    "3": 10
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 57
+   },
+   "content": 2,
+   "equality_ids": [
+    1
+   ],
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/data/part=0/eq-delete-id-0-5f6bb95c-e0f7-4180-be16-41b23b95d059.parquet",
+   "file_size_in_bytes": 461,
+   "lower_bounds": {
+    "1": "AgAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0
+   },
+   "partition": {
+    "part": 0
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 57,
+     "lower_bound": 2,
+     "null_value_count": 0,
+     "upper_bound": 7,
+     "value_count": 4
+    },
+    "part": {},
+    "s": {}
+   },
+   "record_count": 4,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "BwAAAA=="
+   },
+   "value_counts": {
+    "1": 4
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 53
+   },
+   "content": 2,
+   "equality_ids": [
+    1
+   ],
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/data/part=1/eq-delete-id-1-3026e170-0543-464d-a0c9-c74f2f3d1faf.parquet",
+   "file_size_in_bytes": 457,
+   "lower_bounds": {
+    "1": "AQAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0
+   },
+   "partition": {
+    "part": 1
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 53,
+     "lower_bound": 1,
+     "null_value_count": 0,
+     "upper_bound": 8,
+     "value_count": 3
+    },
+    "part": {},
+    "s": {}
+   },
+   "record_count": 3,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "CAAAAA=="
+   },
+   "value_counts": {
+    "1": 3
+   }
+  },
+  {
+   "column_sizes": {
+    "2": 59
+   },
+   "content": 2,
+   "equality_ids": [
+    2
+   ],
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/data/part=1/eq-delete-s-1-48296dd3-a537-43e8-af01-37158d046dc3.parquet",
+   "file_size_in_bytes": 466,
+   "lower_bounds": {
+    "2": "cm93MTE="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "2": 0
+   },
+   "partition": {
+    "part": 1
+   },
+   "readable_metrics": {
+    "id": {},
+    "part": {},
+    "s": {
+     "column_size": 59,
+     "lower_bound": "row11",
+     "null_value_count": 0,
+     "upper_bound": "row13",
+     "value_count": 2
+    }
+   },
+   "record_count": 2,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "2": "cm93MTM="
+   },
+   "value_counts": {
+    "2": 2
+   }
+  }
+ ],
+ "format_version": 2,
+ "manifests": [
+  {
+   "added_data_files_count": 0,
+   "added_delete_files_count": 1,
+   "added_snapshot_id": 8535963789812067414,
+   "content": 1,
+   "deleted_data_files_count": 0,
+   "deleted_delete_files_count": 0,
+   "existing_data_files_count": 0,
+   "existing_delete_files_count": 0,
+   "length": 7280,
+   "partition_spec_id": 0,
+   "partition_summaries": [
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "1",
+     "upper_bound": "1"
+    }
+   ],
+   "path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/metadata/36b70b41-f646-4dfc-a358-d07774e5edd7-m0.avro"
+  },
+  {
+   "added_data_files_count": 2,
+   "added_delete_files_count": 0,
+   "added_snapshot_id": 4082811984913885280,
+   "content": 0,
+   "deleted_data_files_count": 0,
+   "deleted_delete_files_count": 0,
+   "existing_data_files_count": 0,
+   "existing_delete_files_count": 0,
+   "length": 7337,
+   "partition_spec_id": 0,
+   "partition_summaries": [
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "1"
+    }
+   ],
+   "path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/metadata/93ef3360-1824-4912-8d33-aebd104b28d5-m0.avro"
+  },
+  {
+   "added_data_files_count": 0,
+   "added_delete_files_count": 2,
+   "added_snapshot_id": 2479936350668885309,
+   "content": 1,
+   "deleted_data_files_count": 0,
+   "deleted_delete_files_count": 0,
+   "existing_data_files_count": 0,
+   "existing_delete_files_count": 0,
+   "length": 7335,
+   "partition_spec_id": 0,
+   "partition_summaries": [
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "1"
+    }
+   ],
+   "path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/metadata/b904adff-cd62-43f8-89f9-e2223581ba88-m0.avro"
+  },
+  {
+   "added_data_files_count": 1,
+   "added_delete_files_count": 0,
+   "added_snapshot_id": 5399806070451644821,
+   "content": 0,
+   "deleted_data_files_count": 0,
+   "deleted_delete_files_count": 0,
+   "existing_data_files_count": 0,
+   "existing_delete_files_count": 0,
+   "length": 7305,
+   "partition_spec_id": 0,
+   "partition_summaries": [
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "0"
+    }
+   ],
+   "path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/metadata/bc4a47b4-63b6-4f3f-ac68-1092f71ed52b-m0.avro"
+  }
+ ],
+ "metadata_location": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/metadata/v5.metadata.json",
+ "refs": [
+  {
+   "name": "main",
+   "snapshot_id": 8535963789812067414,
+   "type": "BRANCH"
+  }
+ ],
+ "rows": [
+  {
+   "id": 0,
+   "part": 0,
+   "s": "row0"
+  },
+  {
+   "id": 4,
+   "part": 0,
+   "s": "reinserted"
+  },
+  {
+   "id": 5,
+   "part": 1,
+   "s": "row5"
+  },
+  {
+   "id": 7,
+   "part": 1,
+   "s": "row7"
+  },
+  {
+   "id": 8,
+   "part": 0,
+   "s": "row8"
+  },
+  {
+   "id": 9,
+   "part": 1,
+   "s": "row9"
+  },
+  {
+   "id": 10,
+   "part": 0,
+   "s": "row10"
+  },
+  {
+   "id": 12,
+   "part": 0,
+   "s": "row12"
+  },
+  {
+   "id": 14,
+   "part": 0,
+   "s": "row14"
+  },
+  {
+   "id": 15,
+   "part": 1,
+   "s": "row15"
+  },
+  {
+   "id": 16,
+   "part": 0,
+   "s": "row16"
+  },
+  {
+   "id": 17,
+   "part": 1,
+   "s": "row17"
+  },
+  {
+   "id": 18,
+   "part": 0,
+   "s": "row18"
+  },
+  {
+   "id": 19,
+   "part": 1,
+   "s": "row19"
+  }
+ ],
+ "schema": {
+  "fields": [
+   {
+    "id": 1,
+    "name": "id",
+    "required": false,
+    "type": "int"
+   },
+   {
+    "id": 2,
+    "name": "s",
+    "required": false,
+    "type": "string"
+   },
+   {
+    "id": 3,
+    "name": "part",
+    "required": false,
+    "type": "int"
+   }
+  ],
+  "schema-id": 0,
+  "type": "struct"
+ },
+ "snapshots": [
+  {
+   "committed_at": "2026-11-26T17:27:24.887000Z",
+   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/metadata/snap-4082811984913885280-1-93ef3360-1824-4912-8d33-aebd104b28d5.avro",
+   "operation": "append",
+   "snapshot_id": 4082811984913885280,
+   "summary": {
+    "added-data-files": "2",
+    "added-files-size": "1920",
+    "added-records": "20",
+    "app-id": "local-1795714029894",
+    "app-name": "ew-iceberg-corpus",
+    "changed-partition-count": "2",
+    "engine-name": "spark",
+    "engine-version": "4.1.2",
+    "iceberg-version": "Apache Iceberg 1.12.0 (commit 212aa894e919ff9fdf89160da4aadcbe6858ac01)",
+    "manifests-created": "1",
+    "manifests-kept": "0",
+    "manifests-replaced": "0",
+    "spark.app.id": "local-1795714029894",
+    "total-data-files": "2",
+    "total-delete-files": "0",
+    "total-equality-deletes": "0",
+    "total-files-size": "1920",
+    "total-position-deletes": "0",
+    "total-records": "20"
+   }
+  },
+  {
+   "committed_at": "2026-11-26T17:27:25.052000Z",
+   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/metadata/snap-2479936350668885309-1-b904adff-cd62-43f8-89f9-e2223581ba88.avro",
+   "operation": "delete",
+   "parent_id": 4082811984913885280,
+   "snapshot_id": 2479936350668885309,
+   "summary": {
+    "added-delete-files": "2",
+    "added-equality-delete-files": "2",
+    "added-equality-deletes": "7",
+    "added-files-size": "918",
+    "app-id": "local-1795714029894",
+    "app-name": "ew-iceberg-corpus",
+    "changed-partition-count": "2",
+    "engine-name": "spark",
+    "engine-version": "4.1.2",
+    "iceberg-version": "Apache Iceberg 1.12.0 (commit 212aa894e919ff9fdf89160da4aadcbe6858ac01)",
+    "manifests-created": "1",
+    "manifests-kept": "1",
+    "manifests-replaced": "0",
+    "total-data-files": "2",
+    "total-delete-files": "2",
+    "total-equality-deletes": "7",
+    "total-files-size": "2838",
+    "total-position-deletes": "0",
+    "total-records": "20"
+   }
+  },
+  {
+   "committed_at": "2026-11-26T17:27:25.219000Z",
+   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/metadata/snap-5399806070451644821-1-bc4a47b4-63b6-4f3f-ac68-1092f71ed52b.avro",
+   "operation": "append",
+   "parent_id": 2479936350668885309,
+   "snapshot_id": 5399806070451644821,
+   "summary": {
+    "added-data-files": "1",
+    "added-files-size": "886",
+    "added-records": "1",
+    "app-id": "local-1795714029894",
+    "app-name": "ew-iceberg-corpus",
+    "changed-partition-count": "1",
+    "engine-name": "spark",
+    "engine-version": "4.1.2",
+    "iceberg-version": "Apache Iceberg 1.12.0 (commit 212aa894e919ff9fdf89160da4aadcbe6858ac01)",
+    "manifests-created": "1",
+    "manifests-kept": "2",
+    "manifests-replaced": "0",
+    "spark.app.id": "local-1795714029894",
+    "total-data-files": "3",
+    "total-delete-files": "2",
+    "total-equality-deletes": "7",
+    "total-files-size": "3724",
+    "total-position-deletes": "0",
+    "total-records": "21"
+   }
+  },
+  {
+   "committed_at": "2026-11-26T17:27:25.369000Z",
+   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/wh/db/v2_eqdel/metadata/snap-8535963789812067414-1-36b70b41-f646-4dfc-a358-d07774e5edd7.avro",
+   "operation": "delete",
+   "parent_id": 5399806070451644821,
+   "snapshot_id": 8535963789812067414,
+   "summary": {
+    "added-delete-files": "1",
+    "added-equality-delete-files": "1",
+    "added-equality-deletes": "2",
+    "added-files-size": "466",
+    "app-id": "local-1795714029894",
+    "app-name": "ew-iceberg-corpus",
+    "changed-partition-count": "1",
+    "engine-name": "spark",
+    "engine-version": "4.1.2",
+    "iceberg-version": "Apache Iceberg 1.12.0 (commit 212aa894e919ff9fdf89160da4aadcbe6858ac01)",
+    "manifests-created": "1",
+    "manifests-kept": "3",
+    "manifests-replaced": "0",
+    "total-data-files": "3",
+    "total-delete-files": "3",
+    "total-equality-deletes": "9",
+    "total-files-size": "4190",
+    "total-position-deletes": "0",
+    "total-records": "21"
+   }
+  }
+ ],
+ "table": "v2_eqdel"
+}

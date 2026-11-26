@@ -69,7 +69,7 @@ def main():
     out = os.path.abspath(args.out)
     if os.path.exists(out):
         shutil.rmtree(out)
-    shutil.copytree(WAREHOUSE, os.path.join(out, "warehouse"),
+    shutil.copytree(WAREHOUSE, os.path.join(out, "wh"),
                     ignore=shutil.ignore_patterns("catalog.db*", "*.crc"))
     os.makedirs(os.path.join(out, "expected"))
     for name, data in expected.items():

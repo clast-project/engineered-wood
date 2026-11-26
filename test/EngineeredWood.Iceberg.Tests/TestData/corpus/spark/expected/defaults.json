@@ -7,7 +7,7 @@
    },
    "content": 0,
    "file_format": "PARQUET",
-   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/defaults/data/00000-143-0095f511-9a49-4405-b638-0f23f2518b47-0-00001.parquet",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/defaults/data/00000-143-f14015aa-ff92-4905-862f-ce16213a854f-0-00001.parquet",
    "file_size_in_bytes": 439,
    "first_row_id": 0,
    "lower_bounds": {
@@ -49,7 +49,7 @@
    },
    "content": 0,
    "file_format": "PARQUET",
-   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/defaults/data/00000-144-c8cd4fb1-114e-433a-a8a2-b1c2e4812f2a-0-00001.parquet",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/defaults/data/00000-144-406d7203-ebfa-4696-805b-69b44cd82f37-0-00001.parquet",
    "file_size_in_bytes": 4061,
    "first_row_id": 5,
    "lower_bounds": {
@@ -129,7 +129,7 @@
   }
  ],
  "files_error": {
-  "error": "Py4JJavaError: An error occurred while calling o1524.collectToPython.",
+  "error": "Py4JJavaError: An error occurred while calling o1627.collectToPython.",
   "what": "files"
  },
  "format_version": 3,
@@ -169,7 +169,7 @@
   {
    "added_data_files_count": 1,
    "added_delete_files_count": 0,
-   "added_snapshot_id": 366004643740394074,
+   "added_snapshot_id": 8158746293375311390,
    "content": 0,
    "deleted_data_files_count": 0,
    "deleted_delete_files_count": 0,
@@ -178,28 +178,28 @@
    "length": 9912,
    "partition_spec_id": 0,
    "partition_summaries": [],
-   "path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/defaults/metadata/118dc38c-8fb1-4ae8-8d15-f98114c81bbb-m0.avro"
+   "path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/defaults/metadata/e437bb01-f13a-42e3-b4c3-611bfcb0a4e7-m0.avro"
   },
   {
    "added_data_files_count": 1,
    "added_delete_files_count": 0,
-   "added_snapshot_id": 840012606074963728,
+   "added_snapshot_id": 3014353663196627006,
    "content": 0,
    "deleted_data_files_count": 0,
    "deleted_delete_files_count": 0,
    "existing_data_files_count": 0,
    "existing_delete_files_count": 0,
-   "length": 7790,
+   "length": 7785,
    "partition_spec_id": 0,
    "partition_summaries": [],
-   "path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/defaults/metadata/926703be-f729-4625-b877-e815ed10920a-m0.avro"
+   "path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/defaults/metadata/ed160e5c-7382-4209-a459-4460b6d59cb9-m0.avro"
   }
  ],
- "metadata_location": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/defaults/metadata/v5.metadata.json",
+ "metadata_location": "file:/tmp/ew-iceberg-corpus/spark/wh/db/defaults/metadata/v5.metadata.json",
  "refs": [
   {
    "name": "main",
-   "snapshot_id": 366004643740394074,
+   "snapshot_id": 8158746293375311390,
    "type": "BRANCH"
   }
  ],
@@ -432,15 +432,15 @@
  },
  "snapshots": [
   {
-   "committed_at": "2026-11-26T17:12:18.135000Z",
-   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/defaults/metadata/snap-840012606074963728-1-926703be-f729-4625-b877-e815ed10920a.avro",
+   "committed_at": "2026-11-26T17:27:27.671000Z",
+   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/wh/db/defaults/metadata/snap-3014353663196627006-1-ed160e5c-7382-4209-a459-4460b6d59cb9.avro",
    "operation": "append",
-   "snapshot_id": 840012606074963728,
+   "snapshot_id": 3014353663196627006,
    "summary": {
     "added-data-files": "1",
     "added-files-size": "439",
     "added-records": "5",
-    "app-id": "local-1795713121078",
+    "app-id": "local-1795714029894",
     "app-name": "ew-iceberg-corpus",
     "changed-partition-count": "1",
     "engine-name": "spark",
@@ -449,7 +449,7 @@
     "manifests-created": "1",
     "manifests-kept": "0",
     "manifests-replaced": "0",
-    "spark.app.id": "local-1795713121078",
+    "spark.app.id": "local-1795714029894",
     "total-data-files": "1",
     "total-delete-files": "0",
     "total-equality-deletes": "0",
@@ -459,16 +459,16 @@
    }
   },
   {
-   "committed_at": "2026-11-26T17:12:18.345000Z",
-   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/defaults/metadata/snap-366004643740394074-1-118dc38c-8fb1-4ae8-8d15-f98114c81bbb.avro",
+   "committed_at": "2026-11-26T17:27:27.889000Z",
+   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/wh/db/defaults/metadata/snap-8158746293375311390-1-e437bb01-f13a-42e3-b4c3-611bfcb0a4e7.avro",
    "operation": "append",
-   "parent_id": 840012606074963728,
-   "snapshot_id": 366004643740394074,
+   "parent_id": 3014353663196627006,
+   "snapshot_id": 8158746293375311390,
    "summary": {
     "added-data-files": "1",
     "added-files-size": "4061",
     "added-records": "1",
-    "app-id": "local-1795713121078",
+    "app-id": "local-1795714029894",
     "app-name": "ew-iceberg-corpus",
     "changed-partition-count": "1",
     "engine-name": "spark",
@@ -477,7 +477,7 @@
     "manifests-created": "1",
     "manifests-kept": "1",
     "manifests-replaced": "0",
-    "spark.app.id": "local-1795713121078",
+    "spark.app.id": "local-1795714029894",
     "total-data-files": "2",
     "total-delete-files": "0",
     "total-equality-deletes": "0",

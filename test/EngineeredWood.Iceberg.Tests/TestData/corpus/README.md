@@ -11,8 +11,9 @@ are checked against these files (`Corpus/*Tests.cs`).
 ## Layout
 
 - `corpus.json`: writer versions, the table list, and `warehouse_uri`, the neutral location everything was
-  written under. Every path inside the tables is absolute under it, so tests map that prefix onto `warehouse/`.
-- `warehouse/`: the tables, exactly as written. `.gitattributes` keeps them byte for byte.
+  written under. Every path inside the tables is absolute under it, so tests map that prefix onto `wh/`.
+- `wh/`: the tables, exactly as written. Names are short (warehouse `wh`, namespace `db`, partition
+  fields like `i_b` and `dt_m`) so the deepest path stays well inside Windows' 260-character limit. `.gitattributes` keeps them byte for byte.
 - `expected/<table>.json`: what the writer reads back.
   - For Spark: rows per ref, the lineage columns, and the `files`, `all_delete_files`, `manifests`,
     `snapshots` and `refs` metadata tables. `files` includes the raw bounds and `readable_metrics`.
@@ -32,7 +33,7 @@ Regenerating replaces the corpus, and every snapshot id, UUID and file name chan
 Spark's own gaps are recorded in `expected/` as they are; the corpus does not work around them.
 
 - **uuid bounds:** Iceberg 1.12's `files.readable_metrics` cannot render a uuid column (a
-  `ClassCastException` in `MetricsUtil$ReadableColMetricsStruct`). For `transforms_java_types` and
+  `ClassCastException` in `MetricsUtil$ReadableColMetricsStruct`). For `t_javatypes` and
   `defaults`, `files` is captured without `readable_metrics`, and the error is kept as `files_error`.
 - **Shredded-variant lineage:** Spark 4.1 + Iceberg 1.12 cannot project a shredded-variant table's lineage
   columns without the variant column (`Unsupported variant: shredded typed_value primitive`). The lineage

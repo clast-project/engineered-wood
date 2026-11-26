@@ -29,7 +29,7 @@ internal sealed class IcebergCorpus
     private IcebergCorpus(string engine)
     {
         Engine = engine;
-        _root = Path.Combine(AppContext.BaseDirectory, "TestData", "corpus", engine);
+        _root = Path.Combine(SourceCorpusDirectory(), engine);
         Info = JsonDocument.Parse(File.ReadAllText(Path.Combine(_root, "corpus.json"))).RootElement;
         _warehouseUri = Info.GetProperty("warehouse_uri").GetString()!.TrimEnd('/');
         Tables = Info.GetProperty("tables").EnumerateArray().Select(t => t.GetString()!).ToArray();
@@ -38,7 +38,23 @@ internal sealed class IcebergCorpus
     public string Engine { get; }
 
     /// <summary>The committed copy of the warehouse the tables were written under.</summary>
-    public string WarehouseDirectory => Path.Combine(_root, "warehouse");
+    public string WarehouseDirectory => Path.Combine(_root, "wh");
+
+    /// <summary>
+    /// The corpus in the source tree, found by walking up from the test output. It is not copied to the output:
+    /// its deepest paths, under bin/&lt;configuration&gt;/&lt;tfm&gt;/, would pass Windows' 260-character limit.
+    /// </summary>
+    private static string SourceCorpusDirectory()
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            string candidate = Path.Combine(dir.FullName, "TestData", "corpus");
+            if (Directory.Exists(candidate) && File.Exists(Path.Combine(dir.FullName, "EngineeredWood.Iceberg.Tests.csproj")))
+                return candidate;
+        }
+
+        throw new DirectoryNotFoundException("test/EngineeredWood.Iceberg.Tests/TestData/corpus not found above " + AppContext.BaseDirectory);
+    }
 
     public JsonElement Info { get; }
 
@@ -70,7 +86,7 @@ internal sealed class IcebergCorpus
         string loc = Normalize(location), prefix = Normalize(_warehouseUri);
         Assert.StartsWith(prefix + "/", loc, StringComparison.Ordinal);
         string relative = Uri.UnescapeDataString(loc.Substring(prefix.Length + 1));
-        return Path.Combine(_root, "warehouse", relative.Replace('/', Path.DirectorySeparatorChar));
+        return Path.Combine(WarehouseDirectory, relative.Replace('/', Path.DirectorySeparatorChar));
     }
 
     /// <summary>The table's current metadata file, as its writer last committed it.</summary>

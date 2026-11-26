@@ -1,0 +1,361 @@
+{
+ "all_delete_files": [],
+ "files": [
+  {
+   "column_sizes": {
+    "1": 43,
+    "2": 48,
+    "3": 45,
+    "4": 41
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/t_javatypes/data/u_b=0/fx_b=1/fx=fwAAAQ%3D%3D/s_void=null/00000-49-586ed378-4c96-4687-82d3-eda66cbc1682-0-00003.parquet",
+   "file_size_in_bytes": 1150,
+   "first_row_id": 3,
+   "lower_bounds": {
+    "1": "AwAAAAAAAAA=",
+    "2": "/////////////////////w==",
+    "3": "fwAAAQ=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0,
+    "2": 0,
+    "3": 0,
+    "4": 1
+   },
+   "partition": {
+    "fx": "fwAAAQ==",
+    "fx_b": 1,
+    "u_b": 0
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 1,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "AwAAAAAAAAA=",
+    "2": "/////////////////////w==",
+    "3": "fwAAAQ=="
+   },
+   "value_counts": {
+    "1": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 43,
+    "2": 48,
+    "3": 45,
+    "4": 46
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/t_javatypes/data/u_b=2/fx_b=1/fx=%2F%2F%2F%2F%2Fw%3D%3D/s_void=null/00000-49-586ed378-4c96-4687-82d3-eda66cbc1682-0-00002.parquet",
+   "file_size_in_bytes": 1169,
+   "first_row_id": 2,
+   "lower_bounds": {
+    "1": "AgAAAAAAAAA=",
+    "2": "AAAAAAAAAAAAAAAAAAAAAA==",
+    "3": "/////w==",
+    "4": "Yg=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0
+   },
+   "partition": {
+    "fx": "/////w==",
+    "fx_b": 1,
+    "u_b": 2
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 1,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "AgAAAAAAAAA=",
+    "2": "AAAAAAAAAAAAAAAAAAAAAA==",
+    "3": "/////w==",
+    "4": "Yg=="
+   },
+   "value_counts": {
+    "1": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 51,
+    "2": 73,
+    "3": 49,
+    "4": 50
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/t_javatypes/data/u_b=2/fx_b=1/fx=AAECAw%3D%3D/s_void=null/00000-49-586ed378-4c96-4687-82d3-eda66cbc1682-0-00001.parquet",
+   "file_size_in_bytes": 1170,
+   "first_row_id": 0,
+   "lower_bounds": {
+    "1": "AQAAAAAAAAA=",
+    "2": "Ej5FZ+ibEtOkVkJmFBdAAA==",
+    "3": "AAECAw==",
+    "4": "YQ=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0
+   },
+   "partition": {
+    "fx": "AAECAw==",
+    "fx_b": 1,
+    "u_b": 2
+   },
+   "record_count": 2,
+   "sort_order_id": 0,
+   "spec_id": 1,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "BAAAAAAAAAA=",
+    "2": "95w+CWd8S72keT80nLeF5w==",
+    "3": "AAECAw==",
+    "4": "ZA=="
+   },
+   "value_counts": {
+    "1": 2,
+    "2": 2,
+    "3": 2,
+    "4": 2
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 43,
+    "2": 41,
+    "3": 41,
+    "4": 46
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/t_javatypes/data/u_b=null/fx_b=null/fx=null/s_void=null/00000-49-586ed378-4c96-4687-82d3-eda66cbc1682-0-00004.parquet",
+   "file_size_in_bytes": 1022,
+   "first_row_id": 4,
+   "lower_bounds": {
+    "1": "BQAAAAAAAAA=",
+    "4": "ZQ=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0,
+    "2": 1,
+    "3": 1,
+    "4": 0
+   },
+   "partition": {},
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 1,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "BQAAAAAAAAA=",
+    "4": "ZQ=="
+   },
+   "value_counts": {
+    "1": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1
+   }
+  }
+ ],
+ "files_error": {
+  "error": "Py4JJavaError: An error occurred while calling o734.collectToPython.",
+  "what": "files"
+ },
+ "format_version": 3,
+ "lineage": [
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 0,
+   "id": 1
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 2,
+   "id": 2
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 3,
+   "id": 3
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 1,
+   "id": 4
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 4,
+   "id": 5
+  }
+ ],
+ "manifests": [
+  {
+   "added_data_files_count": 4,
+   "added_delete_files_count": 0,
+   "added_snapshot_id": 3712489851562869719,
+   "content": 0,
+   "deleted_data_files_count": 0,
+   "deleted_delete_files_count": 0,
+   "existing_data_files_count": 0,
+   "existing_delete_files_count": 0,
+   "length": 9040,
+   "partition_spec_id": 1,
+   "partition_summaries": [
+    {
+     "contains_nan": false,
+     "contains_null": true,
+     "lower_bound": "0",
+     "upper_bound": "2"
+    },
+    {
+     "contains_nan": false,
+     "contains_null": true,
+     "lower_bound": "1",
+     "upper_bound": "1"
+    },
+    {
+     "contains_nan": false,
+     "contains_null": true,
+     "lower_bound": "AAECAw==",
+     "upper_bound": "/////w=="
+    },
+    {
+     "contains_nan": false,
+     "contains_null": true,
+     "lower_bound": "null",
+     "upper_bound": "null"
+    }
+   ],
+   "path": "file:/tmp/ew-iceberg-corpus/spark/wh/db/t_javatypes/metadata/85a53812-4a1d-4cd5-b808-c3bc1281e342-m0.avro"
+  }
+ ],
+ "metadata_location": "file:/tmp/ew-iceberg-corpus/spark/wh/db/t_javatypes/metadata/v3.metadata.json",
+ "refs": [
+  {
+   "name": "main",
+   "snapshot_id": 3712489851562869719,
+   "type": "BRANCH"
+  }
+ ],
+ "rows": [
+  {
+   "fx": "AAECAw==",
+   "id": 1,
+   "s": "a",
+   "u": "f79c3e09-677c-4bbd-a479-3f349cb785e7"
+  },
+  {
+   "fx": "/////w==",
+   "id": 2,
+   "s": "b",
+   "u": "00000000-0000-0000-0000-000000000000"
+  },
+  {
+   "fx": "fwAAAQ==",
+   "id": 3,
+   "u": "ffffffff-ffff-ffff-ffff-ffffffffffff"
+  },
+  {
+   "fx": "AAECAw==",
+   "id": 4,
+   "s": "d",
+   "u": "123e4567-e89b-12d3-a456-426614174000"
+  },
+  {
+   "id": 5,
+   "s": "e"
+  }
+ ],
+ "schema": {
+  "fields": [
+   {
+    "id": 1,
+    "name": "id",
+    "required": true,
+    "type": "long"
+   },
+   {
+    "id": 2,
+    "name": "u",
+    "required": false,
+    "type": "uuid"
+   },
+   {
+    "id": 3,
+    "name": "fx",
+    "required": false,
+    "type": "fixed[4]"
+   },
+   {
+    "id": 4,
+    "name": "s",
+    "required": false,
+    "type": "string"
+   }
+  ],
+  "schema-id": 0,
+  "type": "struct"
+ },
+ "snapshots": [
+  {
+   "committed_at": "2026-11-26T17:27:20.215000Z",
+   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/wh/db/t_javatypes/metadata/snap-3712489851562869719-1-85a53812-4a1d-4cd5-b808-c3bc1281e342.avro",
+   "operation": "append",
+   "snapshot_id": 3712489851562869719,
+   "summary": {
+    "added-data-files": "4",
+    "added-files-size": "4511",
+    "added-records": "5",
+    "app-id": "local-1795714029894",
+    "app-name": "ew-iceberg-corpus",
+    "changed-partition-count": "4",
+    "engine-name": "spark",
+    "engine-version": "4.1.2",
+    "iceberg-version": "Apache Iceberg 1.12.0 (commit 212aa894e919ff9fdf89160da4aadcbe6858ac01)",
+    "manifests-created": "1",
+    "manifests-kept": "0",
+    "manifests-replaced": "0",
+    "spark.app.id": "local-1795714029894",
+    "total-data-files": "4",
+    "total-delete-files": "0",
+    "total-equality-deletes": "0",
+    "total-files-size": "4511",
+    "total-position-deletes": "0",
+    "total-records": "5"
+   }
+  }
+ ],
+ "table": "t_javatypes"
+}

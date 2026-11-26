@@ -143,7 +143,7 @@ public class SparkCorpusTests
             }
         }
 
-        if (table.StartsWith("transforms_", StringComparison.Ordinal) && table != "transforms_java_types")
+        if (table.StartsWith("t_", StringComparison.Ordinal) && table != "t_javatypes")
             Assert.True(compared > 100, $"only {compared} bounds compared");
     }
 
@@ -154,7 +154,7 @@ public class SparkCorpusTests
     {
         var md = Corpus.Metadata(table);
         var current = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
-        if (table == "transforms_java_types")
+        if (table == "t_javatypes")
         {
             // KNOWN DEFECT in EngineeredWood.Avro, not in the corpus: decoding this manifest (a partition tuple
             // of bucket(uuid), bucket(fixed[4]), identity(fixed[4]) and void(string)) misaligns, and a later union
@@ -208,7 +208,7 @@ public class SparkCorpusTests
     public void CorpusCoversThePlan()
     {
         var transforms = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var t in Corpus.Tables.Where(t => t.StartsWith("transforms_", StringComparison.Ordinal)))
+        foreach (var t in Corpus.Tables.Where(t => t.StartsWith("t_", StringComparison.Ordinal)))
         {
             using var doc = JsonDocument.Parse(Corpus.MetadataText(t));
             foreach (var spec in doc.RootElement.GetProperty("partition-specs").EnumerateArray())
@@ -224,23 +224,23 @@ public class SparkCorpusTests
             g.Count() >= 3 && g.Select(f => f.GetProperty("referenced_data_file").GetString()).Distinct().Count() == g.Count());
 
         // v2 position deletes, and equality deletes scoped by partition.
-        Assert.Contains(Files("v2_position_deletes"), f => f.GetProperty("content").GetInt32() == 1
+        Assert.Contains(Files("v2_posdel"), f => f.GetProperty("content").GetInt32() == 1
             && !f.TryGetProperty("referenced_data_file", out _) || f.GetProperty("file_format").GetString() == "PARQUET");
-        Assert.Contains(Files("v2_equality_deletes"), f => f.GetProperty("content").GetInt32() == 2
+        Assert.Contains(Files("v2_eqdel"), f => f.GetProperty("content").GetInt32() == 2
             && f.GetProperty("equality_ids").GetArrayLength() == 1);
 
         // The upgraded table: v2 history, a v3 present, DVs after the upgrade.
-        Assert.Equal(3, Corpus.Metadata("v2_to_v3_upgrade").FormatVersion);
-        Assert.Contains(Files("v2_to_v3_upgrade"), f => f.TryGetProperty("referenced_data_file", out _));
+        Assert.Equal(3, Corpus.Metadata("v2_to_v3").FormatVersion);
+        Assert.Contains(Files("v2_to_v3"), f => f.TryGetProperty("referenced_data_file", out _));
 
         // Variant, shredded and not.
-        Assert.All(new[] { "variant_unshredded", "variant_shredded" }, t =>
+        Assert.All(new[] { "variant", "variant_shred" }, t =>
             Assert.Contains(Corpus.Metadata(t).Schemas.Last().Fields, f => f.Type is VariantType));
-        Assert.Equal("true", Corpus.Metadata("variant_shredded").Properties["write.parquet.shred-variants"]);
+        Assert.Equal("true", Corpus.Metadata("variant_shred").Properties["write.parquet.shred-variants"]);
 
         // Branches and tags, and a compaction that carried lineage.
         Assert.Superset(new HashSet<string> { "main", "b1", "t1" }, new HashSet<string>(Corpus.Metadata("branches").Refs.Keys));
-        Assert.Contains(Corpus.Expected("compacted_lineage").GetProperty("snapshots").EnumerateArray(),
+        Assert.Contains(Corpus.Expected("compacted").GetProperty("snapshots").EnumerateArray(),
             s => s.GetProperty("operation").GetString() == "replace");
 
         // No nanosecond timestamps: Spark cannot read them.

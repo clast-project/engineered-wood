@@ -29,9 +29,9 @@ import shutil
 import sys
 import traceback
 
-WAREHOUSE_DIR = "/tmp/ew-iceberg-corpus/spark/warehouse"
+WAREHOUSE_DIR = "/tmp/ew-iceberg-corpus/spark/wh"
 WAREHOUSE_URI = "file:" + WAREHOUSE_DIR
-NS = "corpus"
+NS = "db"
 TS_FORMAT = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX"
 NTZ_FORMAT = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
 
@@ -114,49 +114,70 @@ def typed_rows(start, count):
     return ", ".join(rows)
 
 
+def short_partition_names(name):
+    """Renames the current spec's partition fields to short forms (i_bucket -> i_b), keeping data paths short."""
+    table = java_table(name)
+    suffixes = {"_bucket": "_b", "_trunc": "_t", "_year": "_y", "_month": "_m", "_day": "_d", "_hour": "_h"}
+    update, changed = table.updateSpec(), False
+    for field in table.spec().fields():
+        old = field.name()
+        for long_suffix, short_suffix in suffixes.items():
+            if old.endswith(long_suffix):
+                update = update.renameField(old, old[: -len(long_suffix)] + short_suffix)
+                changed = True
+    if changed:
+        update.commit()
+
+
 # ── Tables ──
 
 
-def transforms_bucket():
-    sql(f"""CREATE TABLE {fq('transforms_bucket')} ({TYPED_COLUMNS}) USING iceberg
+def t_bucket():
+    sql(f"""CREATE TABLE {fq('t_bucket')} ({TYPED_COLUMNS}) USING iceberg
             PARTITIONED BY (bucket(3, i), bucket(3, l), bucket(3, d), bucket(3, s), bucket(3, bin),
                             bucket(3, dt), bucket(3, ts), bucket(3, tstz))
             TBLPROPERTIES ({tblprops(3)})""")
-    sql(f"INSERT INTO {fq('transforms_bucket')} VALUES {typed_rows(1, 12)}")
+    short_partition_names("t_bucket")
+    sql(f"INSERT INTO {fq('t_bucket')} VALUES {typed_rows(1, 12)}")
 
 
-def transforms_truncate():
-    sql(f"""CREATE TABLE {fq('transforms_truncate')} ({TYPED_COLUMNS}) USING iceberg
+def t_truncate():
+    sql(f"""CREATE TABLE {fq('t_truncate')} ({TYPED_COLUMNS}) USING iceberg
             PARTITIONED BY (truncate(50, i), truncate(1000000000, l), truncate(100000, d),
                             truncate(3, s), truncate(2, bin))
             TBLPROPERTIES ({tblprops(3)})""")
-    sql(f"INSERT INTO {fq('transforms_truncate')} VALUES {typed_rows(1, 12)}")
+    short_partition_names("t_truncate")
+    sql(f"INSERT INTO {fq('t_truncate')} VALUES {typed_rows(1, 12)}")
 
 
-def transforms_temporal():
+def t_temporal():
     """year, month, day and hour on date, timestamp and timestamptz. Two temporal transforms of one source
     in one spec are redundant (Iceberg refuses them), so each spec takes one per source and the table
     evolves through four specs, a batch of rows written under each."""
-    t = fq("transforms_temporal")
+    t = fq("t_temporal")
     sql(f"""CREATE TABLE {t} ({TYPED_COLUMNS}) USING iceberg
             PARTITIONED BY (years(dt), months(ts), days(tstz))
             TBLPROPERTIES ({tblprops(3)})""")
+    short_partition_names("t_temporal")
     sql(f"INSERT INTO {t} VALUES {typed_rows(1, 6)}")
     sql(f"ALTER TABLE {t} REPLACE PARTITION FIELD years(dt) WITH months(dt)")
     sql(f"ALTER TABLE {t} REPLACE PARTITION FIELD months(ts) WITH days(ts)")
     sql(f"ALTER TABLE {t} REPLACE PARTITION FIELD days(tstz) WITH hours(tstz)")
+    short_partition_names("t_temporal")
     sql(f"INSERT INTO {t} VALUES {typed_rows(7, 6)}")
     sql(f"ALTER TABLE {t} REPLACE PARTITION FIELD months(dt) WITH days(dt)")
     sql(f"ALTER TABLE {t} REPLACE PARTITION FIELD days(ts) WITH hours(ts)")
     sql(f"ALTER TABLE {t} REPLACE PARTITION FIELD hours(tstz) WITH years(tstz)")
+    short_partition_names("t_temporal")
     sql(f"INSERT INTO {t} VALUES {typed_rows(13, 6)}")
     sql(f"ALTER TABLE {t} DROP PARTITION FIELD days(dt)")
     sql(f"ALTER TABLE {t} REPLACE PARTITION FIELD hours(ts) WITH years(ts)")
     sql(f"ALTER TABLE {t} REPLACE PARTITION FIELD years(tstz) WITH months(tstz)")
+    short_partition_names("t_temporal")
     sql(f"INSERT INTO {t} VALUES {typed_rows(19, 6)}")
 
 
-def transforms_java_types():
+def t_javatypes():
     """uuid, fixed and the void transform: Spark SQL has no DDL for them, so the Java API makes the table."""
     T = jvm.org.apache.iceberg.types.Types
     fields = jvm.java.util.ArrayList()
@@ -169,8 +190,9 @@ def transforms_java_types():
             .bucket("u", 3).bucket("fx", 3).identity("fx").alwaysNull("s", "s_void").build())
     props = jvm.java.util.HashMap()
     props.put("format-version", "3")
-    catalog().createTable(identifier("transforms_java_types"), schema, spec, props)
-    sql(f"""INSERT INTO {fq('transforms_java_types')} VALUES
+    catalog().createTable(identifier("t_javatypes"), schema, spec, props)
+    short_partition_names("t_javatypes")
+    sql(f"""INSERT INTO {fq('t_javatypes')} VALUES
             (1, 'f79c3e09-677c-4bbd-a479-3f349cb785e7', X'00010203', 'a'),
             (2, '00000000-0000-0000-0000-000000000000', X'ffffffff', 'b'),
             (3, 'ffffffff-ffff-ffff-ffff-ffffffffffff', X'7f000001', NULL),
@@ -190,8 +212,8 @@ def dv_multi():
     sql(f"UPDATE {t} SET s = 'updated' WHERE id IN (1, 101, 201)")
 
 
-def v2_position_deletes():
-    t = fq("v2_position_deletes")
+def v2_posdel():
+    t = fq("v2_posdel")
     sql(f"CREATE TABLE {t} (id BIGINT, s STRING, part INT) USING iceberg PARTITIONED BY (part) "
         f"TBLPROPERTIES ({tblprops(2, MOR)})")
     sql(f"INSERT INTO {t} SELECT id, concat('row', id), CAST(id % 2 AS INT) FROM range(0, 40)")
@@ -200,16 +222,16 @@ def v2_position_deletes():
     sql(f"UPDATE {t} SET s = 'updated' WHERE id % 9 = 0")
 
 
-def v2_equality_deletes():
+def v2_eqdel():
     """Equality deletes. Spark never writes them, so they go through the Java API. Partitioned by `part`:
     an equality delete applies only within its partition, and only to data of a lower sequence number,
     so the row re-inserted afterwards survives."""
-    t = fq("v2_equality_deletes")
+    t = fq("v2_eqdel")
     # id is an INT: py4j hands every boxed Long back to Java as an Integer, which a long column refuses.
     sql(f"CREATE TABLE {t} (id INT, s STRING, part INT) USING iceberg PARTITIONED BY (part) "
         f"TBLPROPERTIES ({tblprops(2)})")
     sql(f"INSERT INTO {t} SELECT CAST(id AS INT), concat('row', id), CAST(id % 2 AS INT) FROM range(0, 20)")
-    table = java_table("v2_equality_deletes")
+    table = java_table("v2_eqdel")
     write_equality_deletes(table, "id", {0: [2, 4, 6, 7], 1: [1, 3, 8]})  # 7 in part 0 and 8 in part 1 match nothing
     sql(f"INSERT INTO {t} VALUES (4, 'reinserted', 0)")
     table.refresh()
@@ -246,10 +268,10 @@ def write_equality_deletes(table, column, by_partition):
     delta.commit()
 
 
-def v2_to_v3_upgrade():
+def v2_to_v3():
     """A v2 table with position deletes, upgraded to v3. The first DV on a file must absorb its v2
     position deletes, and the first v3 commit assigns row ids to every carried-over file."""
-    t = fq("v2_to_v3_upgrade")
+    t = fq("v2_to_v3")
     sql(f"CREATE TABLE {t} (id BIGINT, s STRING) USING iceberg TBLPROPERTIES ({tblprops(2, MOR)})")
     sql(f"INSERT INTO {t} SELECT id, concat('row', id) FROM range(0, 30)")
     sql(f"INSERT INTO {t} SELECT id, concat('row', id) FROM range(30, 60)")
@@ -302,8 +324,8 @@ def bytes_array(values):
     return bytes(values)
 
 
-def variant_unshredded():
-    t = fq("variant_unshredded")
+def variant():
+    t = fq("variant")
     sql(f"CREATE TABLE {t} (id BIGINT, v VARIANT) USING iceberg TBLPROPERTIES ({tblprops(3)})")
     sql(f"""INSERT INTO {t} VALUES
             (1, parse_json('{{"a": 1, "b": "x", "c": [1, 2, 3]}}')),
@@ -314,8 +336,8 @@ def variant_unshredded():
             (6, parse_json('null'))""")
 
 
-def variant_shredded():
-    t = fq("variant_shredded")
+def variant_shred():
+    t = fq("variant_shred")
     sql(f"CREATE TABLE {t} (id BIGINT, v VARIANT) USING iceberg "
         f"TBLPROPERTIES ({tblprops(3, {'write.parquet.shred-variants': 'true'})})")
     rows = ", ".join(
@@ -335,22 +357,22 @@ def branches():
     sql(f"DELETE FROM {t}.branch_b1 WHERE id = 1")
 
 
-def compacted_lineage():
+def compacted():
     """Rows written in several commits, one updated, then compacted: rewritten files must carry the
     original _row_id and _last_updated_sequence_number physically."""
-    t = fq("compacted_lineage")
+    t = fq("compacted")
     sql(f"CREATE TABLE {t} (id BIGINT, s STRING) USING iceberg TBLPROPERTIES ({tblprops(3, COW)})")
     for start in (0, 10, 20):
         sql(f"INSERT INTO {t} SELECT id, concat('row', id) FROM range({start}, {start + 10})")
     sql(f"UPDATE {t} SET s = 'updated' WHERE id IN (3, 13)")
-    sql(f"CALL c.system.rewrite_data_files(table => '{NS}.compacted_lineage', options => map('rewrite-all', 'true'))")
+    sql(f"CALL c.system.rewrite_data_files(table => '{NS}.compacted', options => map('rewrite-all', 'true'))")
     sql(f"INSERT INTO {t} SELECT id, concat('row', id) FROM range(30, 33)")
 
 
 TABLES = [
-    transforms_bucket, transforms_truncate, transforms_temporal, transforms_java_types,
-    dv_multi, v2_position_deletes, v2_equality_deletes, v2_to_v3_upgrade, defaults,
-    variant_unshredded, variant_shredded, branches, compacted_lineage,
+    t_bucket, t_truncate, t_temporal, t_javatypes,
+    dv_multi, v2_posdel, v2_eqdel, v2_to_v3, defaults,
+    variant, variant_shred, branches, compacted,
 ]
 
 
@@ -459,7 +481,7 @@ def main():
     out = os.path.abspath(args.out)
     if os.path.exists(out):
         shutil.rmtree(out)
-    shutil.copytree(local_warehouse, os.path.join(out, "warehouse"),
+    shutil.copytree(local_warehouse, os.path.join(out, "wh"),
                     ignore=shutil.ignore_patterns("*.crc"))
     os.makedirs(os.path.join(out, "expected"))
     for name, data in results.items():
