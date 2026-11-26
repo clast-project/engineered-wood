@@ -396,14 +396,14 @@ jobs:
         if: always() && steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ matrix.tfm }}
+          name: test-results-${{ matrix.tfm }}-${{ github.run_attempt }}
           path: '**/*.trx'
 
       - name: Upload runtime samples (MEASUREMENT ONLY)
         if: always() && steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
         uses: actions/upload-artifact@v4
         with:
-          name: perf-samples-${{ matrix.tfm }}
+          name: perf-samples-${{ matrix.tfm }}-${{ github.run_attempt }}
           path: perf-samples/
 
       - name: Upload packages
