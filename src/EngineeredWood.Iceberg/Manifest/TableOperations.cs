@@ -69,6 +69,7 @@ public sealed class TableOperations
         current.ThrowIfNotWritable();
         if (filesToAdd.Count > 0)
             ThrowIfSpecNotWritable(current);
+        ThrowIfEncryptedFiles(filesToAdd);
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var snapshotId = GenerateSnapshotId();
@@ -268,6 +269,7 @@ public sealed class TableOperations
         // files under a partition spec this library cannot apply.
         current.ThrowIfNotWritable();
         ThrowIfSpecNotWritable(current);
+        ThrowIfEncryptedFiles(files);
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var snapshotId = GenerateSnapshotId();
@@ -469,6 +471,18 @@ public sealed class TableOperations
                 $"Cannot add files to table {table.TableUuid}: its default partition spec {table.DefaultSpecId} has " +
                 $"field '{unknown.Name}' with transform '{TransformName(unknown.Transform)}', which this " +
                 "library does not know.");
+    }
+
+    /// <summary>
+    /// A file with key metadata is encrypted. Listing it in a plaintext manifest would publish an encrypted
+    /// file the table cannot describe, and the next scan would refuse the table, so refuse it now.
+    /// </summary>
+    private static void ThrowIfEncryptedFiles(IReadOnlyList<DataFile> files)
+    {
+        if (files.FirstOrDefault(f => f.KeyMetadata is not null) is { } encrypted)
+            throw new UnsupportedTableFeatureException(
+                $"Cannot add '{encrypted.FilePath}': it is encrypted (it has key metadata), and table encryption " +
+                "is not supported.");
     }
 
     private static string TransformName(Transform transform) =>

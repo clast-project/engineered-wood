@@ -358,6 +358,55 @@ public class ManifestCodecTests : IDisposable
         Assert.Equal(1, bucket);
     }
 
+    private static readonly List<PartitionValueType> TwoFieldSpec =
+    [
+        new(1000, "id_bucket", IcebergType.Int),
+        new(1001, "ts-day", IcebergType.Date),
+    ];
+
+    private static byte[] PartitionOnly(string partitionFields, Dictionary<string, object?> values) =>
+        WriteOcf(V1ManifestSchema.Replace("\"name\": \"r102\", \"fields\": []", "\"name\": \"r102\", \"fields\": [" + partitionFields + "]"),
+            s => Entry(s, new()
+            {
+                ["status"] = 1, ["snapshot_id"] = 1L,
+                ["data_file"] = (Func<AvroRecordSchema, AvroRecordValue>)(df => Rec(df, new()
+                {
+                    ["file_path"] = "a.parquet", ["file_format"] = "PARQUET",
+                    ["partition"] = (Func<AvroRecordSchema, AvroRecordValue>)(p => Rec(p, values)),
+                    ["record_count"] = 1L, ["file_size_in_bytes"] = 1L, ["block_size_in_bytes"] = 1L,
+                })),
+            }));
+
+    [Theory]
+    // With ids, in an order other than the spec's.
+    [InlineData("""{"name": "ts_x2Dday", "type": ["null", "int"], "field-id": 1001}, {"name": "id_bucket", "type": ["null", "int"], "field-id": 1000}""", "ts_x2Dday")]
+    // Without ids, reordered: matched by name, including the escaped Avro form of "ts-day".
+    [InlineData("""{"name": "ts_x2Dday", "type": ["null", "int"]}, {"name": "id_bucket", "type": ["null", "int"]}""", "ts_x2Dday")]
+    public void PartitionValues_ComeOutInSpecOrder(string fields, string dayName)
+    {
+        var bytes = PartitionOnly(fields, new() { [dayName] = 19_000, ["id_bucket"] = 3 });
+        var tuple = Assert.Single(ManifestCodec.DecodeManifest(bytes, "m.avro", TwoFieldSpec).Entries).DataFile.Partition!;
+        Assert.Equal(
+            [(1000, "id_bucket", (object?)3), (1001, "ts-day", (object?)19_000)],
+            tuple.Values.Select(v => (v.FieldId, v.Name, v.Value)));
+    }
+
+    [Fact]
+    public void IdLessPartitionFields_MatchingSomeNamesButNotAll_AreRefused()
+    {
+        var bytes = PartitionOnly(
+            """{"name": "id_bucket", "type": ["null", "int"]}, {"name": "mystery", "type": ["null", "int"]}""",
+            new() { ["id_bucket"] = 3, ["mystery"] = 1 });
+        Assert.Throws<InvalidDataException>(() => ManifestCodec.DecodeManifest(bytes, "m.avro", TwoFieldSpec));
+
+        // Names matching none of the spec's: the oldest v1 writers' positional layout.
+        var positional = PartitionOnly(
+            """{"name": "p0", "type": ["null", "int"]}, {"name": "p1", "type": ["null", "int"]}""",
+            new() { ["p0"] = 3, ["p1"] = 19_000 });
+        var tuple = Assert.Single(ManifestCodec.DecodeManifest(positional, "m.avro", TwoFieldSpec).Entries).DataFile.Partition!;
+        Assert.Equal([3, 19_000], tuple.Values.Select(v => (int)v.Value!));
+    }
+
     [Fact]
     public void UnmodelledFieldWithAValue_IsReported()
     {

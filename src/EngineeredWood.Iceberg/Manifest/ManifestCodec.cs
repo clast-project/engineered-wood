@@ -139,39 +139,82 @@ internal static class ManifestCodec
         };
     }
 
-    /// <summary>Reads a manifest's partition record into a typed <see cref="PartitionData"/>.</summary>
+    /// <summary>
+    /// Reads a manifest's partition record into a typed <see cref="PartitionData"/>. Each Avro field is placed
+    /// by its <c>field-id</c>; a writer that wrote none (v1) is matched to the spec by name (the Iceberg name
+    /// or its Avro-escaped form), and only when no name matches at all, by position. With a spec, the values
+    /// come out in spec order, whatever order the writer used.
+    /// </summary>
     private sealed class PartitionReader
     {
-        private readonly PartitionValueType[] _fields;
+        private readonly PartitionValueType[] _fields;   // output order
+        private readonly int[] _avroIndex;               // the Avro field each output value is read from
 
         public PartitionReader(AvroRecordSchema schema, IReadOnlyList<PartitionValueType>? spec, string path)
         {
-            _fields = new PartitionValueType[schema.Fields.Count];
-            for (int i = 0; i < schema.Fields.Count; i++)
+            var avro = schema.Fields;
+            if (spec is null)
             {
-                var f = schema.Fields[i];
-                // v2 requires the partition record's field ids to be the spec's; a v1 writer may have left
-                // them out, and then the fields are the spec's, in order.
-                int? id = f.FieldId ?? (spec is not null && i < spec.Count ? spec[i].FieldId : null);
-                if (id is null)
-                    throw Invalid(path, $"has partition field '{f.Name}' with no field-id and no partition spec to place it");
-
-                // The Avro name may be escaped (an Iceberg name need not be a valid Avro name), so the spec,
-                // when at hand, gives the name as well as the type.
-                PartitionValueType? fromSpec = null;
-                if (spec is not null)
+                _fields = new PartitionValueType[avro.Count];
+                _avroIndex = new int[avro.Count];
+                for (int i = 0; i < avro.Count; i++)
                 {
-                    foreach (var s in spec)
-                    {
-                        if (s.FieldId == id)
-                            fromSpec = s;
-                    }
-                    if (fromSpec is null)
-                        throw Invalid(path, $"has partition field {id}, which its partition spec does not have");
+                    var f = avro[i];
+                    if (f.FieldId is not { } id)
+                        throw Invalid(path, $"has partition field '{f.Name}' with no field-id and no partition spec to place it");
+                    _fields[i] = new PartitionValueType(id, f.Name, IcebergAvroTypes.InferType(f.Schema));
+                    _avroIndex[i] = i;
                 }
-
-                _fields[i] = fromSpec ?? new PartitionValueType(id.Value, f.Name, IcebergAvroTypes.InferType(f.Schema));
+                return;
             }
+
+            // Which spec field each Avro field is.
+            var specIndexOf = new int[avro.Count];
+            bool anyNamed = false;
+            for (int i = 0; i < avro.Count; i++)
+            {
+                var f = avro[i];
+                int k = f.FieldId is { } id
+                    ? IndexOf(spec, s => s.FieldId == id)
+                    : IndexOf(spec, s => s.Name == f.Name || ManifestAvroSchemas.AvroCompatibleName(s.Name) == f.Name);
+                if (f.FieldId is null && k >= 0)
+                    anyNamed = true;
+                specIndexOf[i] = k;
+            }
+            for (int i = 0; i < avro.Count; i++)
+            {
+                if (specIndexOf[i] >= 0)
+                    continue;
+                var f = avro[i];
+                // An id-less record whose names match none of the spec's is taken to be in spec order, as
+                // the oldest v1 writers wrote it; one that matches some names but not this one is ambiguous.
+                if (f.FieldId is null && !anyNamed && avro.Count == spec.Count)
+                    specIndexOf[i] = i;
+                else
+                    throw Invalid(path, f.FieldId is { } id
+                        ? $"has partition field {id}, which its partition spec does not have"
+                        : $"has partition field '{f.Name}' with no field-id, which matches no field of its partition spec");
+            }
+
+            _fields = spec.ToArray();
+            _avroIndex = new int[spec.Count];
+            for (int k = 0; k < spec.Count; k++)
+            {
+                int i = System.Array.IndexOf(specIndexOf, k);
+                if (i < 0 || System.Array.LastIndexOf(specIndexOf, k) != i)
+                    throw Invalid(path, $"does not hold partition field {spec[k].FieldId} ({spec[k].Name}) exactly once");
+                _avroIndex[k] = i;
+            }
+        }
+
+        private static int IndexOf(IReadOnlyList<PartitionValueType> spec, Func<PartitionValueType, bool> match)
+        {
+            for (int k = 0; k < spec.Count; k++)
+            {
+                if (match(spec[k]))
+                    return k;
+            }
+            return -1;
         }
 
         public PartitionData? Read(AvroRecordValue? record)
@@ -179,10 +222,11 @@ internal static class ManifestCodec
             if (record is null || _fields.Length == 0)
                 return null;
             var values = new PartitionValue[_fields.Length];
-            for (int i = 0; i < _fields.Length; i++)
+            for (int k = 0; k < _fields.Length; k++)
             {
-                var f = _fields[i];
-                values[i] = new PartitionValue(f.FieldId, f.Name, f.Type, IcebergAvroTypes.ToPhysical(record.Values[i], f.Type));
+                var f = _fields[k];
+                values[k] = new PartitionValue(f.FieldId, f.Name, f.Type,
+                    IcebergAvroTypes.ToPhysical(record.Values[_avroIndex[k]], f.Type));
             }
             return new PartitionData(values);
         }

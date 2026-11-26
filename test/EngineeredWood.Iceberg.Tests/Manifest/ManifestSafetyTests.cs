@@ -151,6 +151,66 @@ public class ManifestSafetyTests : IDisposable
     }
 
     [Fact]
+    public void RewriteOfAnUnknownTransformSpec_GetsAHeaderSchemaWithItsSources()
+    {
+        // TryResolve cannot type the spec, but the header only needs its source fields.
+        var s0 = new Schema(0, [new NestedField(1, "id", IcebergType.Long, true), new NestedField(2, "cat", IcebergType.String, false)]);
+        var s1 = new Schema(1, [new NestedField(1, "id", IcebergType.Long, true)]);
+        var spec = new PartitionSpec(1, [new PartitionField(1, 1000, "z", new UnknownTransform("zorder"), [1, 2])]);
+        var md = TableMetadata.Create(s0, location: "s3://b/t") with
+        {
+            Schemas = [s0, s1],
+            CurrentSchemaId = 1,
+            PartitionSpecs = [PartitionSpec.Unpartitioned, spec],
+        };
+        Assert.Equal(0, ManifestWriteOptions.For(md, 1, ManifestContent.Data).Schema!.SchemaId);
+    }
+
+    [Fact]
+    public async Task AddingAnEncryptedFile_IsRefused_AndWritesNothing()
+    {
+        var md = TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]), location: Path.Combine(_dir, "k"));
+        var encrypted = File("data/a.parquet") with { KeyMetadata = [1, 2] };
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(async () => await _ops.AppendFilesAsync(md, [encrypted]));
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(async () => await _ops.AppendDeleteFilesAsync(md,
+            [encrypted with { Content = FileContent.PositionDeletes }]));
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(async () => await _ops.OverwriteFilesAsync(md, [], [encrypted]));
+        Assert.Empty(FilesUnder(md.Location));
+    }
+
+    [Fact]
+    public async Task EncryptedEntryInAJsonManifestList_IsRefused()
+    {
+        var md = await _ops.AppendFilesAsync(
+            TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]), location: Path.Combine(_dir, "j")),
+            [File("data/a.parquet")]);
+        var snapshot = md.Snapshots.Single();
+        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList));
+        var jsonList = Path.Combine(md.Location, "metadata", "snap-json.json");
+        await ManifestIO.WriteManifestListAsync(_fs, jsonList, [mle with { KeyMetadata = [1] }]);
+        md = md with { Snapshots = [snapshot with { ManifestList = jsonList }] };
+
+        var before = FilesUnder(md.Location);
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await _ops.AppendFilesAsync(md, [File("data/b.parquet")]));
+        Assert.Equal(before, FilesUnder(md.Location));
+    }
+
+    [Fact]
+    public async Task ExpiringATableWithAnEncryptedManifest_IsRefused()
+    {
+        var md = TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]), location: Path.Combine(_dir, "x"));
+        md = await _ops.AppendFilesAsync(md, [File("data/a.parquet")]);
+        md = await _ops.AppendFilesAsync(md, [File("data/b.parquet")]);
+        var current = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
+        var list = await ManifestIO.ReadManifestListAsync(_fs, current.ManifestList);
+        await ManifestIO.WriteManifestListAsync(_fs, current.ManifestList, [list[0] with { KeyMetadata = [1] }, .. list.Skip(1)]);
+
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(async () =>
+            await new ExpireSnapshots().ExpireSnapshotId(md.Snapshots[0].SnapshotId).ApplyAsync(md, _fs));
+    }
+
+    [Fact]
     public async Task AppendCarryingAnEncryptedManifest_IsRefused_AndWritesNothing()
     {
         var md = await _ops.AppendFilesAsync(

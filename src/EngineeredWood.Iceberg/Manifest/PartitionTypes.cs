@@ -74,7 +74,7 @@ internal static class PartitionTypes
     private static string TransformName(Transform t) =>
         t is UnknownTransform u ? u.Name : t.GetType().Name;
 
-    private static NestedField? FindField(IReadOnlyList<NestedField> fields, int id)
+    internal static NestedField? FindField(IReadOnlyList<NestedField> fields, int id)
     {
         foreach (var f in fields)
         {

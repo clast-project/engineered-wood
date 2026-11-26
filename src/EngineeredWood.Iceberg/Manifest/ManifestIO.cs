@@ -166,20 +166,33 @@ public static class ManifestIO
                 snapshot.ManifestList);
 
         var data = await fs.ReadAllBytesAsync(snapshot.ManifestList, ct).ConfigureAwait(false);
-        if (!IsAvro(snapshot.ManifestList))
-            return JsonSerializer.Deserialize(data, JsonOptions.TypeInfo<List<ManifestListEntry>>())
+        List<ManifestListEntry> entries;
+        if (IsAvro(snapshot.ManifestList))
+        {
+            var decoded = ManifestCodec.DecodeManifestList(data, snapshot.ManifestList);
+            if (decoded.UnmodelledFields.Count > 0)
+                throw new NotSupportedException(
+                    $"Cannot rewrite manifest list '{snapshot.ManifestList}': it holds fields this library does not " +
+                    $"model ({string.Join(", ", decoded.UnmodelledFields)}), and the next snapshot's list would drop them.");
+            entries = decoded.Entries;
+        }
+        else
+        {
+            entries = JsonSerializer.Deserialize(data, JsonOptions.TypeInfo<List<ManifestListEntry>>())
                 ?? throw new InvalidOperationException($"Failed to read manifest list: {snapshot.ManifestList}");
+        }
 
-        var decoded = ManifestCodec.DecodeManifestList(data, snapshot.ManifestList);
-        if (decoded.UnmodelledFields.Count > 0)
-            throw new NotSupportedException(
-                $"Cannot rewrite manifest list '{snapshot.ManifestList}': it holds fields this library does not " +
-                $"model ({string.Join(", ", decoded.UnmodelledFields)}), and the next snapshot's list would drop them.");
-        if (decoded.Entries.FirstOrDefault(e => e.KeyMetadata is not null) is { } encrypted)
+        ThrowIfEncryptedManifest(entries, snapshot, "the table cannot be written");
+        return entries;
+    }
+
+    /// <summary>Refuses a manifest-list entry with key metadata: its manifest is encrypted.</summary>
+    internal static void ThrowIfEncryptedManifest(IEnumerable<ManifestListEntry> entries, Snapshot snapshot, string consequence)
+    {
+        if (entries.FirstOrDefault(e => e.KeyMetadata is not null) is { } encrypted)
             throw new UnsupportedTableFeatureException(
                 $"Manifest '{encrypted.ManifestPath}' of snapshot {snapshot.SnapshotId} is encrypted (it has key " +
-                "metadata); table encryption is not supported, so the table cannot be written.");
-        return decoded.Entries;
+                $"metadata); table encryption is not supported, so {consequence}.");
     }
 
     /// <summary>
@@ -283,7 +296,11 @@ public sealed record ManifestWriteOptions
         var candidates = table.Schemas.Where(s => s.SchemaId == table.CurrentSchemaId)
             .Concat(table.Schemas.Where(s => s.SchemaId != table.CurrentSchemaId).Reverse())
             .ToList();
-        var header = candidates.FirstOrDefault(s => PartitionTypes.TryResolve(spec, [s], out _, out _)) ?? candidates[0];
+        // Binding needs only the source fields, so this also works for a spec whose transforms this library
+        // cannot evaluate.
+        var sourceIds = spec.Fields.SelectMany(f => f.SourceIds ?? [f.SourceId]).Distinct().ToList();
+        var header = candidates.FirstOrDefault(s => sourceIds.All(id => PartitionTypes.FindField(s.Fields, id) is not null))
+            ?? candidates[0];
         return new ManifestWriteOptions
         {
             FormatVersion = table.FormatVersion,
