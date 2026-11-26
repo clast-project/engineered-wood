@@ -39,6 +39,8 @@ public class LiteralValueEqualityContractTests
         LiteralValue.Of(Guid.Empty), LiteralValue.Of(new Guid("00000000-0000-0000-0000-000000000001")),
         LiteralValue.Of(new DateTimeOffset(2024, 1, 1, 0, 0, 0, TimeSpan.Zero)),
         LiteralValue.Of(new DateTimeOffset(2024, 1, 1, 0, 0, 0, TimeSpan.FromHours(1))),
+        LiteralValue.TimestampNanosOf(1_704_067_200_000_000_000L), LiteralValue.TimestampNanosOf(1_704_067_200_000_000_001L),
+        LiteralValue.TimestampNanosOf(0),
 #if NET6_0_OR_GREATER
         LiteralValue.Of((Half)1.0f), LiteralValue.Of((Half)1.5f),
         LiteralValue.Of(new DateOnly(2024, 1, 1)), LiteralValue.Of(new DateOnly(2024, 1, 2)),
