@@ -163,6 +163,7 @@ missing tool a failure that names the missing prerequisite:
 | `EW_REQUIRE_DUCKDB_INTEROP` | DuckDB (Delta) | `build`, nightly |
 | `EW_REQUIRE_SPARK_INTEROP` | PySpark | nightly only (`build` has no JDK) |
 | `EW_REQUIRE_PARQUET_READERS_INTEROP` | Parquet readers (DuckDB, DataFusion) | `build` |
+| `EW_REQUIRE_ICEBERG_GO_INTEROP` | iceberg-go | `build` |
 | `EW_REQUIRE_PARQUET_ALP_ORACLE` | ALP vs. arrow-rs | `parquet-alp-interop` |
 | `EW_REQUIRE_CLOUD_EMULATORS` | Azurite, MinIO, storage-testbench | `cloud-io` |
 | `EW_REQUIRE_VORTEX_VALIDATOR`, `EW_REQUIRE_VORTEX_UPSTREAM_COMPAT` | Vortex | `vortex-interop` |
@@ -215,6 +216,23 @@ against PyArrow, DuckDB and Polars. You run it by hand; no test depends on it. S
 pip install parquity
 dotnet build test/EngineeredWood.Parquet.Bridge -c Release
 ```
+
+### Iceberg interop
+
+`EngineeredWood.Iceberg.Tests` drives [iceberg-go](https://github.com/apache/iceberg-go) through a Go
+CLI in `Interop/iceberg-go`, as both writer and reader. The first test that needs it runs `go build`
+in the test output, so you need Go on PATH (the version in its `go.mod`) and, the first time, network
+access for the module download. Without them the tests skip. To use a binary you built yourself:
+
+```
+cd test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go
+go build -o iceberg-go-driver.exe .
+$env:EW_ICEBERG_GO_DRIVER = "…\iceberg-go-driver.exe"
+```
+
+`go.mod` pins iceberg-go **0.8.0 or later**: 0.7.0 brings deleted rows back after a v2→v3 upgrade.
+The driver keeps its tables in a sqlite SQL catalog, because iceberg-go's Hadoop catalog does not
+work on Windows.
 
 ### Cloud backends
 
@@ -298,7 +316,7 @@ reads files outside its own project at run time (for example, `EngineeredWood.Pa
 
 | Workflow / job | Runs on | What it tests |
 |---|---|---|
-| `ci.yml` / `build` (required) | windows-latest | Affected projects, all TFMs, with delta-rs, DuckDB, DataFusion, pyarrow and fastavro installed. No JDK, so Spark cases skip. |
+| `ci.yml` / `build` (required) | windows-latest | Affected projects, all TFMs, with delta-rs, DuckDB, DataFusion, pyarrow, fastavro and Go (for iceberg-go) installed. No JDK, so Spark cases skip. |
 | `ci.yml` / `cloud-io` (required) | ubuntu-latest | Cloud backends against the emulators, net10.0. |
 | `ci.yml` / `vortex-interop` | ubuntu-latest | Vortex against upstream (Rust 1.96.0). |
 | `ci.yml` / `parquet-alp-interop` | ubuntu-latest | ALP against arrow-rs (Rust 1.96.0). |

@@ -17,7 +17,9 @@ namespace EngineeredWood.Tests.Interop;
 /// <para>Every driver obeys the same contract: <c>python &lt;script&gt; &lt;command&gt;
 /// &lt;args-file&gt; &lt;result-file&gt;</c>, writing exactly one JSON object to the result file, with
 /// failures reported as <c>{"ok": false, "error": ...}</c> and exit code 0 so the C# side can assert
-/// on the message rather than on a process crash.</para>
+/// on the message rather than on a process crash. A driver that is a native executable rather than a
+/// Python script (the iceberg-go driver, see <see cref="ForExecutable"/>) obeys the same contract
+/// without the interpreter: <c>&lt;exe&gt; &lt;command&gt; &lt;args-file&gt; &lt;result-file&gt;</c>.</para>
 ///
 /// <para>The result goes to a FILE rather than stdout because stdout is not ours to own: Spark's JVM
 /// writes <c>SUCCESS: The process with PID ... has been terminated.</c> straight to the inherited
@@ -74,6 +76,39 @@ internal sealed class InteropDriver
             return blocked is not null ? (null, null, blocked) : RunProbe(probeExpression);
         });
     }
+
+    private InteropDriver(
+        string displayName,
+        Func<(string? Exe, string? Version, string? Error)> resolve,
+        string requireEnvVar,
+        int timeoutMs)
+    {
+        ScriptName = displayName;
+        RequireEnvVar = requireEnvVar;
+        TimeoutMs = timeoutMs;
+        IsExecutable = true;
+        _probe = new Lazy<(string?, string?, string?)>(resolve);
+    }
+
+    /// <summary>
+    /// A driver that is a native executable obeying the same contract as the Python drivers, minus the
+    /// interpreter. One process per command: a compiled driver starts in milliseconds, so there is no
+    /// startup cost for a persistent server to amortize.
+    /// </summary>
+    /// <param name="displayName">Name used in skip and failure messages.</param>
+    /// <param name="resolve">Locates (or builds) the executable and reports its version, or an error
+    /// saying why the tier is unavailable. Runs once, on first use.</param>
+    /// <param name="requireEnvVar">As for the Python drivers.</param>
+    /// <param name="timeoutMs">Per-command timeout.</param>
+    public static InteropDriver ForExecutable(
+        string displayName,
+        Func<(string? Exe, string? Version, string? Error)> resolve,
+        string requireEnvVar,
+        int timeoutMs) =>
+        new(displayName, resolve, requireEnvVar, timeoutMs);
+
+    /// <summary>True for a <see cref="ForExecutable"/> driver: the probe's executable IS the driver.</summary>
+    private bool IsExecutable { get; }
 
     private string ScriptName { get; }
 
@@ -158,9 +193,9 @@ internal sealed class InteropDriver
     /// <summary>As <see cref="Invoke"/> but does not assert success — for tests expecting a rejection.</summary>
     public JsonElement InvokeRaw(string command, object? args = null)
     {
-        string driver = Path.Combine(AppContext.BaseDirectory, "Interop", ScriptName);
+        string driver = IsExecutable ? _probe.Value.Exe! : Path.Combine(AppContext.BaseDirectory, "Interop", ScriptName);
         if (!File.Exists(driver))
-            throw new FileNotFoundException($"Interop driver script not found at {driver}.");
+            throw new FileNotFoundException($"Interop driver not found at {driver}.");
 
         string id = Guid.NewGuid().ToString("N");
         string argsFile = Path.Combine(Path.GetTempPath(), $"ew_interop_args_{id}.json");
@@ -174,7 +209,9 @@ internal sealed class InteropDriver
 
             var psi = new ProcessStartInfo(_probe.Value.Exe!)
             {
-                Arguments = $"\"{driver}\" {command} \"{argsFile}\" \"{resultFile}\"",
+                Arguments = IsExecutable
+                    ? $"{command} \"{argsFile}\" \"{resultFile}\""
+                    : $"\"{driver}\" {command} \"{argsFile}\" \"{resultFile}\"",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
