@@ -335,11 +335,22 @@ public class LosslessMetadataTests
     [InlineData("truncate[ 4 ]")]
     [InlineData("bucket[99999999999]")]
     [InlineData("bucketed[4]")]
+    [InlineData("bucket[0]")]
+    [InlineData("truncate[0]")]
+    [InlineData("bucket[000]")]
     public void TransformsThatOnlyLookKnown_AreUnknown(string name)
     {
         var transform = IcebergJsonSerializer.Deserialize<Transform>(JsonSerializer.Serialize(name));
         Assert.Equal(new UnknownTransform(name), transform);
         Assert.Equal(JsonSerializer.Serialize(name), IcebergJsonSerializer.Serialize(transform));
+    }
+
+    [Fact]
+    public void NonPositiveWidths_AreRefusedByTheFactories()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => Transform.Bucket(0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => Transform.Truncate(-1));
+        Assert.Equal(new BucketTransform(16), IcebergJsonSerializer.Deserialize<Transform>("\"bucket[16]\""));
     }
 
     [Fact]

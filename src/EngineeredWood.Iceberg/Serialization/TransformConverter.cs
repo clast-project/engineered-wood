@@ -27,10 +27,13 @@ internal sealed class TransformConverter : JsonConverter<Transform>
         if (value is null)
             throw new JsonException("Transform cannot be null");
 
-        // Only an exact "bucket[N]" / "truncate[W]" is the known transform, as in Java's parser. Anything
-        // else with the same prefix ("bucket[16,2]") is a transform this library does not know.
+        // Only an exact "bucket[N]" / "truncate[W]" with a positive width is the known transform, as in Java,
+        // which refuses a width of 0. Anything else with the same prefix ("bucket[16,2]", "bucket[0]") is kept
+        // as a transform this library does not know: it still reads and round-trips, and no file can be
+        // committed under it.
         var m = WidthPattern.Match(value);
-        if (m.Success && int.TryParse(m.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var width))
+        if (m.Success && int.TryParse(m.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var width)
+            && width > 0)
         {
             switch (m.Groups[1].Value)
             {
