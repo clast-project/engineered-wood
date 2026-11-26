@@ -156,11 +156,14 @@ public class SparkCorpusTests
         var current = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
         if (table == "t_javatypes")
         {
-            // KNOWN DEFECT in EngineeredWood.Avro, not in the corpus: decoding this manifest (a partition tuple
-            // of bucket(uuid), bucket(fixed[4]), identity(fixed[4]) and void(string)) misaligns, and a later union
-            // index comes out of range; read without a projection it throws an OverflowException instead. When
-            // this starts passing, delete the guard so the comparison below runs for this table too.
-            Assert.ThrowsAny<Exception>(() => Corpus.ReadFileBounds(current));
+            // KNOWN DEFECT in Iceberg Java (apache/iceberg#17501, 1.8.0 through main), not in EngineeredWood.Avro:
+            // its manifest writer encodes a plain Avro fixed (the identity(fixed[4]) partition value) as
+            // length-prefixed bytes, and its reader decodes it the same way, so only Java reads its own file.
+            // A conforming reader (fastavro too) takes the length as the fixed's first byte: the first entry's
+            // 08 00 01 02 03 reads as fixed 08000102, then 03 as the next union's index, -2. Reading these manifests needs the Iceberg manifest codec to decode
+            // fixed the Java way; when it does, delete the guard so the comparison below runs for this table too.
+            var e = Assert.Throws<InvalidDataException>(() => Corpus.ReadFileBounds(current));
+            Assert.Contains("union branch index -2 ", e.Message);
             return;
         }
 
