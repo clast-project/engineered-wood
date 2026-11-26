@@ -325,7 +325,7 @@ public class PartitionSpecUpdateTests : IDisposable
         var evolved = new PartitionSpecUpdate(table.Metadata)
             .AddField("timestamp", Transform.Day)
             .Apply();
-        await catalog.UpdateTableAsync(id, evolved);
+        await catalog.CommitTableAsync(table, evolved);
 
         // Reload and verify
         var reloaded = await catalog.LoadTableAsync(id);

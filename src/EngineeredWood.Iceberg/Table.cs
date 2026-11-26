@@ -15,13 +15,24 @@ public sealed class Table
     /// <summary>The current metadata snapshot for this table.</summary>
     public TableMetadata Metadata { get; }
 
+    /// <summary>
+    /// <para>Where the catalog stored <see cref="Metadata"/>: the metadata file's path for a file-system
+    /// catalog, or the catalog's own version token. <see langword="null"/> for a table that was not loaded
+    /// from a catalog.</para>
+    /// <para>A commit is based on this version: <see cref="ICatalog.CommitTableAsync"/> fails with
+    /// <see cref="CommitFailedException"/> when the table has moved on since.</para>
+    /// </summary>
+    public string? MetadataLocation { get; }
+
     /// <summary>Initializes a new <see cref="Table"/> with the given identifier and metadata.</summary>
     /// <param name="identifier">The table identifier.</param>
     /// <param name="metadata">The table metadata.</param>
-    public Table(TableIdentifier identifier, TableMetadata metadata)
+    /// <param name="metadataLocation">Where the catalog stored <paramref name="metadata"/>, if it came from one.</param>
+    public Table(TableIdentifier identifier, TableMetadata metadata, string? metadataLocation = null)
     {
         Identifier = identifier;
         Metadata = metadata;
+        MetadataLocation = metadataLocation;
     }
 
     /// <summary>The active schema, resolved from <see cref="TableMetadata.CurrentSchemaId"/>.</summary>

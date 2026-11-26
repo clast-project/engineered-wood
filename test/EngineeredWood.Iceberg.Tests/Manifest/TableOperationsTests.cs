@@ -185,7 +185,7 @@ public class TableOperationsTests : IDisposable
         };
 
         var updated = await _ops.AppendFilesAsync(table.Metadata, [file]);
-        await catalog.UpdateTableAsync(id, updated);
+        await catalog.CommitTableAsync(table, updated);
 
         // Reload and verify
         var reloaded = await catalog.LoadTableAsync(id);

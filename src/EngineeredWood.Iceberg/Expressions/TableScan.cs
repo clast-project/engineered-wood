@@ -63,14 +63,11 @@ public sealed class TableScan
         var snapshot = effectiveMetadata.Snapshots.First(
             s => s.SnapshotId == effectiveMetadata.CurrentSnapshotId);
 
-        if (!await _fs.ExistsAsync(snapshot.ManifestList, ct).ConfigureAwait(false))
-            return new ScanResult([], [], 0, 0);
-
         var schema = effectiveMetadata.Schemas.First(
             s => s.SchemaId == effectiveMetadata.CurrentSchemaId);
         var (boundFilter, accessor) = BindFilter(_filter, schema);
 
-        var manifestList = await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList, ct)
+        var manifestList = await ManifestIO.ReadSnapshotManifestListAsync(_fs, snapshot, ct)
             .ConfigureAwait(false);
 
         var dataFiles = new List<DataFile>();
@@ -80,10 +77,7 @@ public sealed class TableScan
 
         foreach (var mle in manifestList)
         {
-            if (!await _fs.ExistsAsync(mle.ManifestPath, ct).ConfigureAwait(false))
-                continue;
-
-            var entries = await ManifestIO.ReadManifestAsync(_fs, mle.ManifestPath, ct)
+            var entries = await ManifestIO.ReadSnapshotManifestAsync(_fs, snapshot, mle, ct)
                 .ConfigureAwait(false);
 
             foreach (var entry in entries)

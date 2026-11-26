@@ -102,15 +102,14 @@ public sealed class ExpireSnapshots
 
         if (fs is not null)
         {
+            // A kept snapshot's manifest list must be readable: without it there is no knowing which
+            // manifests it still needs, and deleting on that basis could remove them.
             foreach (var snap in keptSnapshots)
             {
-                if (await fs.ExistsAsync(snap.ManifestList, ct).ConfigureAwait(false))
-                {
-                    var entries = await ManifestIO.ReadManifestListAsync(fs, snap.ManifestList, ct)
-                        .ConfigureAwait(false);
-                    foreach (var e in entries)
-                        keptManifestPaths.Add(e.ManifestPath);
-                }
+                var entries = await ManifestIO.ReadSnapshotManifestListAsync(fs, snap, ct)
+                    .ConfigureAwait(false);
+                foreach (var e in entries)
+                    keptManifestPaths.Add(e.ManifestPath);
             }
         }
 

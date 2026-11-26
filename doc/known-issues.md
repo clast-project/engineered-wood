@@ -712,6 +712,52 @@ reorder, nested add, or `FIRST`/`AFTER`. No format-version upgrade.
 **Table encryption.** `key_metadata` is always written null; no KMS
 plumbing.
 
+### Commits
+
+`ICatalog.CommitTableAsync(baseTable, newMetadata)` commits optimistically:
+it fails with `CommitFailedException` when the table moved on after
+`baseTable` was loaded. `CatalogCommitExtensions.CommitWithRetryAsync`
+reloads and re-applies the change, with Iceberg Java's `commit.retry.*`
+limits. `FileSystemCatalog` commits by creating `v<N+1>.metadata.json` with
+an atomic create-if-absent. `version-hint.text` is only a hint: loads walk
+past a stale one and fall back to listing when it is missing or
+unreadable. Gaps:
+
+- Conflict validation is limited to an overwrite refusing to delete a file
+  the table no longer holds (`CommitValidationException`). An overwrite or
+  delete therefore commits over a concurrent append that added rows its
+  filter would have matched. There is no isolation-level choice.
+- Manifests and manifest lists written by an abandoned attempt are left
+  behind; there is no orphan-file removal.
+- A commit is checked against the base's metadata version and table UUID.
+  A drop and re-create that lands between that check and the
+  create-if-absent is not detected.
+- Drop and rename can't be made conditional on concurrent commits in the
+  Hadoop layout; only a tombstone version, which other Hadoop-catalog
+  readers would see as a broken table, could do that. So `FileSystemCatalog`
+  narrows the window:
+  - A drop deletes versions until a listing finds none, and gives up with
+    `CommitFailedException` after 5 rounds.
+  - A rename re-checks the source's version before and after removing it.
+    If a commit landed, the rename undoes its copy and fails, and the source
+    keeps its name.
+
+  A commit that publishes after the last check still re-creates a dropped
+  table at its version, or leaves a renamed table under both names. Iceberg
+  Java's Hadoop catalog doesn't guard drop either and has no rename. Use a
+  catalog with server-side commits (REST, planned in #955) when drops or
+  renames race with writers.
+- Only uncompressed `v<N>.metadata.json` is recognised, not
+  `v<N>.gz.metadata.json`, and not the `<NNNNN>-<uuid>.metadata.json` names
+  of catalogs that don't use the Hadoop layout.
+- `DropTableAsync` without `purge` deletes the table's metadata directory and
+  keeps its data files.
+- `RenameTableAsync` moves no files. It writes the destination's `v1` and
+  removes the source's version files and hint. The renamed table's manifests
+  and data stay under the old path and are still referenced from there. A
+  table later created under the old name and dropped with `purge` deletes
+  them.
+
 ### Correctness / interop issues
 
 **The manifest codec is truncated.** `ManifestIO` omits `partition`

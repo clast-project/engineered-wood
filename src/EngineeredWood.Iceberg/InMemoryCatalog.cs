@@ -12,7 +12,16 @@ public sealed class InMemoryCatalog : ICatalog
     private readonly string _warehouseLocation;
     private readonly object _lock = new();
     private readonly Dictionary<Namespace, Dictionary<string, string>> _namespaces = new();
-    private readonly Dictionary<TableIdentifier, TableMetadata> _tables = new();
+    // Each stored version carries a catalog-unique token, so a commit can tell whether the table is still at
+    // the version it was based on (and a dropped and re-created table never reuses one).
+    private readonly Dictionary<TableIdentifier, (TableMetadata Metadata, string Location)> _tables = new();
+    private long _nextVersion;
+
+    // Unique to this instance, so a table loaded from another InMemoryCatalog never matches a token here.
+    private readonly string _instanceId = Guid.NewGuid().ToString("N");
+
+    private string NextLocation(TableIdentifier identifier) =>
+        $"{_warehouseLocation}/{identifier.Namespace}/{identifier.Name}/metadata/{_instanceId}-{++_nextVersion}";
 
     /// <summary>Initializes a new <see cref="InMemoryCatalog"/> with the given warehouse location URI.</summary>
     /// <param name="warehouseLocation">The base URI used to construct table locations.</param>
@@ -166,9 +175,10 @@ public sealed class InMemoryCatalog : ICatalog
             var metadata = TableMetadata.Create(
                 schema, spec, sortOrder, tableLocation, properties);
 
-            _tables[identifier] = metadata;
+            var stored = (Metadata: metadata, Location: NextLocation(identifier));
+            _tables[identifier] = stored;
 
-            return Task.FromResult(new Table(identifier, metadata));
+            return Task.FromResult(new Table(identifier, stored.Metadata, stored.Location));
         }
     }
 
@@ -177,10 +187,10 @@ public sealed class InMemoryCatalog : ICatalog
     {
         lock (_lock)
         {
-            if (!_tables.TryGetValue(identifier, out var metadata))
+            if (!_tables.TryGetValue(identifier, out var stored))
                 throw new NoSuchTableException(identifier);
 
-            return Task.FromResult(new Table(identifier, metadata));
+            return Task.FromResult(new Table(identifier, stored.Metadata, stored.Location));
         }
     }
 
@@ -201,7 +211,7 @@ public sealed class InMemoryCatalog : ICatalog
     {
         lock (_lock)
         {
-            if (!_tables.TryGetValue(from, out var metadata))
+            if (!_tables.TryGetValue(from, out var stored))
                 throw new NoSuchTableException(from);
 
             if (!_namespaces.ContainsKey(to.Namespace))
@@ -210,8 +220,11 @@ public sealed class InMemoryCatalog : ICatalog
             if (_tables.ContainsKey(to))
                 throw new TableAlreadyExistsException(to);
 
+            // The renamed table reports, and builds new files under, its new location, as FileSystemCatalog's does.
             _tables.Remove(from);
-            _tables[to] = metadata;
+            _tables[to] = (
+                stored.Metadata with { Location = $"{_warehouseLocation}/{to.Namespace}/{to.Name}" },
+                NextLocation(to));
         }
 
         return Task.CompletedTask;
@@ -226,16 +239,40 @@ public sealed class InMemoryCatalog : ICatalog
         }
     }
 
-    public Task<Table> UpdateTableAsync(
-        TableIdentifier identifier, TableMetadata newMetadata, CancellationToken ct = default)
+    public Task<Table> CommitTableAsync(
+        Table baseTable, TableMetadata newMetadata, CancellationToken ct = default)
     {
+        var identifier = baseTable.Identifier;
+        if (newMetadata.TableUuid != baseTable.Metadata.TableUuid)
+            throw new ArgumentException(
+                $"The new metadata belongs to table {newMetadata.TableUuid}, not {baseTable.Metadata.TableUuid}.",
+                nameof(newMetadata));
+
+        // A base this catalog never issued (constructed by hand, or loaded from another catalog) is a misuse,
+        // not a lost race, as in FileSystemCatalog.
+        if (baseTable.MetadataLocation is not { } location ||
+            location.IndexOf($"/metadata/{_instanceId}-", StringComparison.Ordinal) < 0)
+            throw new ArgumentException(
+                $"The base table's metadata location '{baseTable.MetadataLocation}' was not issued by this catalog; " +
+                "load the table from this catalog before committing to it.",
+                nameof(baseTable));
+
         lock (_lock)
         {
-            if (!_tables.ContainsKey(identifier))
+            if (!_tables.TryGetValue(identifier, out var current))
                 throw new NoSuchTableException(identifier);
 
-            _tables[identifier] = newMetadata;
-            return Task.FromResult(new Table(identifier, newMetadata));
+            if (current.Metadata.TableUuid != baseTable.Metadata.TableUuid)
+                throw new CommitFailedException(identifier,
+                    $"the commit is based on table {baseTable.Metadata.TableUuid}, but {identifier} is table {current.Metadata.TableUuid}.");
+
+            if (baseTable.MetadataLocation != current.Location)
+                throw new CommitFailedException(identifier,
+                    $"the commit is based on version '{baseTable.MetadataLocation}', but the table is at '{current.Location}'.");
+
+            var stored = (Metadata: newMetadata, Location: NextLocation(identifier));
+            _tables[identifier] = stored;
+            return Task.FromResult(new Table(identifier, stored.Metadata, stored.Location));
         }
     }
 }

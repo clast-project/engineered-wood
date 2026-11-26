@@ -90,6 +90,37 @@ public static class ManifestIO
             return await ReadManifestListJsonAsync(fs, path, ct).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Reads a snapshot's manifest list, throwing <see cref="FileNotFoundException"/> when it is missing. A
+    /// snapshot whose manifest list is gone cannot be read: treating it as empty would silently drop every
+    /// file the snapshot holds, from a scan or from the next commit's carried-forward state.
+    /// </summary>
+    internal static async ValueTask<List<ManifestListEntry>> ReadSnapshotManifestListAsync(
+        ITableFileSystem fs, Snapshot snapshot, CancellationToken ct)
+    {
+        if (!await fs.ExistsAsync(snapshot.ManifestList, ct).ConfigureAwait(false))
+            throw new FileNotFoundException(
+                $"Snapshot {snapshot.SnapshotId}'s manifest list '{snapshot.ManifestList}' does not exist; " +
+                "the table's metadata references a missing file.",
+                snapshot.ManifestList);
+        return await ReadManifestListAsync(fs, snapshot.ManifestList, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reads a manifest a snapshot's manifest list names, throwing <see cref="FileNotFoundException"/> when
+    /// it is missing, for the same reason as <see cref="ReadSnapshotManifestListAsync"/>.
+    /// </summary>
+    internal static async ValueTask<List<ManifestEntry>> ReadSnapshotManifestAsync(
+        ITableFileSystem fs, Snapshot snapshot, ManifestListEntry manifest, CancellationToken ct)
+    {
+        if (!await fs.ExistsAsync(manifest.ManifestPath, ct).ConfigureAwait(false))
+            throw new FileNotFoundException(
+                $"Manifest '{manifest.ManifestPath}' of snapshot {snapshot.SnapshotId} does not exist; " +
+                "the table's metadata references a missing file.",
+                manifest.ManifestPath);
+        return await ReadManifestAsync(fs, manifest.ManifestPath, ct).ConfigureAwait(false);
+    }
+
     // --- JSON format ---
 
     private static async ValueTask<long> WriteManifestJsonAsync(
