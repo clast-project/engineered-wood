@@ -35,6 +35,9 @@ Spark's own gaps are recorded in `expected/` as they are; the corpus does not wo
 - **uuid bounds:** Iceberg 1.12's `files.readable_metrics` cannot render a uuid column (a
   `ClassCastException` in `MetricsUtil$ReadableColMetricsStruct`). For `t_javatypes` and
   `defaults`, `files` is captured without `readable_metrics`, and the error is kept as `files_error`.
+- **Fixed partition values:** Iceberg Java (1.8.0 through main) writes a plain `fixed[N]` in a manifest as
+  length-prefixed `bytes` and reads it back the same way (apache/iceberg#17501), so `t_javatypes`' manifest,
+  with its identity(fixed[4]) partition, does not match its own Avro schema. fastavro refuses it as well.
 - **Shredded-variant lineage:** Spark 4.1 + Iceberg 1.12 cannot project a shredded-variant table's lineage
   columns without the variant column (`Unsupported variant: shredded typed_value primitive`). The lineage
   is captured with the variant column included.

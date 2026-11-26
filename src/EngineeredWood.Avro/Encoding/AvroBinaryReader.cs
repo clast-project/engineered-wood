@@ -89,9 +89,28 @@ internal ref struct AvroBinaryReader
         return result;
     }
 
-    /// <summary>Reads a union branch index (0-based).</summary>
+    /// <summary>Reads a union branch index (0-based) without checking it against the union.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int ReadUnionIndex() => checked((int)Varint.ReadSigned(_data, ref _pos));
+
+    /// <summary>
+    /// Reads a union branch index (0-based) and checks that it names one of the union's
+    /// <paramref name="branchCount"/> branches. An index outside the union means the data does not match
+    /// its schema, or decoding has already lost its place; taking it as some branch anyway reads the bytes
+    /// that follow as the wrong type, which can go on without an error for many more values.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int ReadUnionIndex(int branchCount)
+    {
+        long index = Varint.ReadSigned(_data, ref _pos);
+        if ((ulong)index >= (ulong)branchCount)
+            ThrowUnionIndexOutOfRange(index, branchCount);
+        return (int)index;
+    }
+
+    private static void ThrowUnionIndexOutOfRange(long index, int branchCount) =>
+        throw new InvalidDataException(
+            $"Avro union branch index {index} is out of range for a union of {branchCount} branches.");
 
     /// <summary>
     /// Skips over a value of the given schema type without materializing it.
@@ -135,8 +154,7 @@ internal ref struct AvroBinaryReader
                 SkipMap(m.Values);
                 break;
             case AvroUnionSchema u:
-                int idx = ReadUnionIndex();
-                Skip(u.Branches[idx]);
+                Skip(u.Branches[ReadUnionIndex(u.Branches.Count)]);
                 break;
             default:
                 throw new InvalidOperationException($"Cannot skip unknown schema type: {schema.Type}");

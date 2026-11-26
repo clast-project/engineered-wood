@@ -531,7 +531,9 @@ internal sealed class NullableBuilder : IColumnBuilder
 
     public void Append(ref AvroBinaryReader reader)
     {
-        int branchIndex = reader.ReadUnionIndex();
+        // Two branches: any index but the null one used to count as the value, so a stray index read the
+        // bytes after it as a value, silently and misaligned from there on.
+        int branchIndex = reader.ReadUnionIndex(2);
         if (branchIndex == _nullIndex)
         {
             _inner.AppendNull();
@@ -1787,7 +1789,7 @@ internal sealed class DenseUnionBuilder : IColumnBuilder
 
     public void Append(ref AvroBinaryReader reader)
     {
-        int branchIndex = reader.ReadUnionIndex();
+        int branchIndex = reader.ReadUnionIndex(_branchBuilders.Length);
         _typeIds.Add(checked((byte)branchIndex));
         _offsets.Add(_branchCounts[branchIndex]);
         _branchCounts[branchIndex]++;
