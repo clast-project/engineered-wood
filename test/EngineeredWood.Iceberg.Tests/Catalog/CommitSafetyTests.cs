@@ -601,8 +601,13 @@ public class CommitSafetyTests : IDisposable
         var calls = 0;
         var clock = System.Diagnostics.Stopwatch.StartNew();
 
-        // The first backoff (10 s) is longer than the whole budget (100 ms), so the wait is cut to the
+        // The first backoff (2 min) is longer than the whole budget (100 ms), so the wait is cut to the
         // budget and no second attempt follows.
+        //
+        // The bound below separates "the wait was cut" from "the backoff was waited out" (at least 108 s
+        // with jitter). It must also absorb a loaded CI runner: measured on #964, this test took 5.9 s on
+        // net472 with the run queue at ~35 on 4 vCPUs, which failed the 5 s bound that sat against a 10 s
+        // backoff. A 30 s bound against a 2 min backoff keeps both margins wide.
         await Assert.ThrowsAsync<CommitFailedException>(() => catalog.CommitWithRetryAsync(
             id,
             async (metadata, ct) =>
@@ -612,10 +617,10 @@ public class CommitSafetyTests : IDisposable
                 await interloper.CommitTableAsync(current, WithProperty(current.Metadata, "n", calls.ToString()), ct);
                 return WithProperty(metadata, "mine", "yes");
             },
-            new CommitRetryOptions(100, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(100))));
+            new CommitRetryOptions(100, TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(2), TimeSpan.FromMilliseconds(100))));
 
         Assert.Equal(1, calls);
-        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(5), $"took {clock.Elapsed}");
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(30), $"took {clock.Elapsed}");
     }
 
     // --- Review round 2: drop and rename racing a commit ---

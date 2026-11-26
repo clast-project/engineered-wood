@@ -43,11 +43,21 @@ internal static class IcebergGo
 
     private const int BuildTimeoutMs = 15 * 60_000;
 
+    /// <summary>The allowance for one driver command, the <c>version</c> probe included. Generous because the
+    /// CI runner is heavily oversubscribed: on #964 its run queue sat around 18 (peak 73) on 4 vCPUs, and a
+    /// <c>version</c> call, which only prints a line, failed to finish within the 30 s it was then given.</summary>
+    private const int CommandTimeoutMs = 180_000;
+
+    /// <summary>How many times the <c>version</c> probe may time out before the tier counts as unavailable.
+    /// The probe's result is cached for the whole test process, so a single stall would otherwise fail
+    /// every iceberg-go test in it: on #964, 22 net472 tests under <c>EW_REQUIRE_ICEBERG_GO_INTEROP=1</c>.</summary>
+    private const int VersionAttempts = 2;
+
     private static readonly InteropDriver Driver = InteropDriver.ForExecutable(
         displayName: "iceberg-go driver",
         resolve: Resolve,
         requireEnvVar: "EW_REQUIRE_ICEBERG_GO_INTEROP",
-        timeoutMs: 180_000);
+        timeoutMs: CommandTimeoutMs);
 
     public static bool Available => Driver.Available;
 
@@ -96,7 +106,7 @@ internal static class IcebergGo
 
             exe = Path.Combine(source, "bin",
                 RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "iceberg-go-driver.exe" : "iceberg-go-driver");
-            var (built, buildOut, buildErr) = Run("go", $"build -mod=readonly -o \"{exe}\" .", source, BuildTimeoutMs);
+            var (built, buildOut, buildErr, _) = Run("go", $"build -mod=readonly -o \"{exe}\" .", source, BuildTimeoutMs);
             if (built != 0)
                 return (null, null, $"`go build` of the iceberg-go driver failed (exit {built}): {Tail(buildOut + buildErr)}");
         }
@@ -105,7 +115,15 @@ internal static class IcebergGo
             return (null, null, $"{DriverOverrideEnvVar} names {exe}, which does not exist");
         }
 
-        var (exit, stdout, stderr) = Run(exe, "version", null, 30_000);
+        // Only a TIMEOUT is retried: a driver that exits with an error, or prints something unparseable,
+        // does so deterministically, and retrying it would only delay the verdict.
+        var probe = Run(exe, "version", null, CommandTimeoutMs);
+        for (int attempt = 2; attempt <= VersionAttempts && probe.TimedOut; attempt++)
+            probe = Run(exe, "version", null, CommandTimeoutMs);
+
+        var (exit, stdout, stderr, timedOut) = probe;
+        if (timedOut)
+            return (null, null, $"`{exe} version` timed out {VersionAttempts} times ({CommandTimeoutMs / 1000}s each)");
         if (exit != 0)
             return (null, null, $"`{exe} version` failed (exit {exit}): {Tail(stdout + stderr)}");
         JsonElement root;
@@ -131,7 +149,7 @@ internal static class IcebergGo
 
     /// <summary>Runs a process to completion, returning its exit code and output; exit -1 when it cannot
     /// start (e.g. no <c>go</c> on PATH) or times out.</summary>
-    private static (int Exit, string Stdout, string Stderr) Run(string exe, string arguments, string? workingDirectory, int timeoutMs)
+    private static (int Exit, string Stdout, string Stderr, bool TimedOut) Run(string exe, string arguments, string? workingDirectory, int timeoutMs)
     {
         var psi = new ProcessStartInfo(exe, arguments)
         {
@@ -152,7 +170,7 @@ internal static class IcebergGo
         }
         catch (Exception e)
         {
-            return (-1, "", $"cannot start {exe}: {e.Message}");
+            return (-1, "", $"cannot start {exe}: {e.Message}", false);
         }
 
         using (proc)
@@ -164,11 +182,11 @@ internal static class IcebergGo
             if (!proc.WaitForExit(timeoutMs))
             {
                 try { proc.Kill(); } catch { }
-                return (-1, "", $"{exe} {arguments} timed out after {timeoutMs / 1000}s");
+                return (-1, "", $"{exe} {arguments} timed out after {timeoutMs / 1000}s", true);
             }
 
             proc.WaitForExit();
-            return (proc.ExitCode, stdout.Result, stderr.Result);
+            return (proc.ExitCode, stdout.Result, stderr.Result, false);
         }
     }
 
