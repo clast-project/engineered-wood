@@ -163,10 +163,15 @@ public sealed class ExpireSnapshots
             .Where(e => keptIds.Contains(e.SnapshotId))
             .ToList();
 
+        // Statistics computed for an expired snapshot describe a snapshot that no longer exists, so their
+        // entries go with it, as Java's RemoveSnapshots drops them. Their files are not deleted yet: the
+        // Puffin- and statistics-aware cleanup is Phase 4 (doc/iceberg-v3-plan.md, #957).
         var updatedMetadata = metadata with
         {
             Snapshots = keptSnapshots,
             SnapshotLog = keptSnapshotLog,
+            Statistics = metadata.Statistics?.Where(s => keptIds.Contains(s.SnapshotId)).ToList(),
+            PartitionStatistics = metadata.PartitionStatistics?.Where(s => keptIds.Contains(s.SnapshotId)).ToList(),
             LastUpdatedMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         };
 
