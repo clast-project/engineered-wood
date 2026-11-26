@@ -202,7 +202,9 @@ leaves Spark reading identical rows and identical other metadata. Two concurrent
 10. **Deletes.**
     - Use the shared position-delete bitmap (see §6). Iceberg adds only the Puffin container, and reading by
       offset and length means Databricks-style DVs inside Delta `.bin` files work unchanged.
-    - A Puffin reader (footer, LZ4/zstd-compressed footers) for statistics. DVs are read by offset and length.
+    - A Puffin reader for statistics. The footer payload is uncompressed or LZ4 (a single frame); `zstd` is valid
+      only as a *blob* codec, alongside `lz4`, so a zstd-compressed footer is refused rather than accepted. DVs
+      are read by offset and length.
     - v2 position-delete files and equality deletes (anti-join on field ids) feed `IExcludedRows` and a row mask.
 11. **Metadata columns.** `_file`, `_pos`, `_spec_id`, `_partition`, `_row_id` and `_last_updated_sequence_number`,
     with inheritance (`first_row_id + _pos`, data sequence number; null before the upgrade).
@@ -271,8 +273,16 @@ Spark's. A differential fuzz test runs random DML sequences, alternating engines
 ### Delta UniForm (#490): after Phase 2, before Phase 3 finishes
 
 Once the Iceberg metadata and manifest writers exist, UniForm means generating an Iceberg snapshot from each
-Delta commit. The Delta side already enforces IcebergCompatV1-V3. DVs need **no rewrite**: an Iceberg DV entry
-can point straight at the Delta `.bin` with `content_offset = 1` (§1), which is exactly what Databricks writes.
+Delta commit. The Delta side already enforces IcebergCompatV1-V3. **File-backed** DVs need no rewrite: an Iceberg
+DV entry can point straight at the Delta `.bin` (§1), which is what Databricks writes.
+- `content_offset` is the descriptor's resolved `offset`, the position of the length prefix. It is 1 only for the
+  first DV in a file.
+- `content_size_in_bytes` is the descriptor's `sizeInBytes + 8`. Delta counts only magic and bitmap; Iceberg
+  counts the 4-byte length and the 4-byte CRC as well.
+
+**Inline** DVs (Z85 in the log; EW inlines any DV of up to 1024 bytes by default) have no file and no length/CRC
+framing. UniForm must either write them out as framed blobs in a Puffin file, or make IcebergCompatV3 tables write
+file-backed DVs only (inline threshold 0). Check which one delta-spark does before choosing.
 Row tracking maps to row lineage (the reserved field ids are already used). Partition values are already
 materialized in the data files (#756). UniForm is also the first real second consumer of the shared table code
 (§6), so it is a good forcing function for deciding what moves where.
@@ -335,8 +345,8 @@ own when work on it starts.
 
 | | Position space | Encoding | Container |
 |---|---|---|---|
-| Delta | 64-bit row index in a file | `MT1d` magic + Roaring64 portable, BE length + CRC | `.bin` with version byte, or inline Z85 |
-| Iceberg v3 | 64-bit `_pos` in a file | **identical blob** | Puffin, or a Delta `.bin` (UniForm) |
+| Delta | 64-bit row index in a file | `MT1d` magic + Roaring64 portable; BE length + CRC only when file-backed | `.bin` with version byte, or inline Z85 (no length/CRC) |
+| Iceberg v3 | 64-bit `_pos` in a file | **identical blob** to a file-backed Delta DV | Puffin, or a file-backed Delta `.bin` (UniForm) |
 | Iceberg v2 | 64-bit `pos` | Parquet/Avro position-delete *rows* | data-format file |
 | Lance | 32-bit row offset in a fragment | CRoaring 32-bit bitmap, or an Arrow `Int32` array | `_deletions/*.bin` / `*.arrow` |
 

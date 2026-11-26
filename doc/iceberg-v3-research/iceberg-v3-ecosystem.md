@@ -195,9 +195,11 @@ unsupported ([AWS guidance](https://docs.aws.amazon.com/prescriptive-guidance/la
 8. **Variant shredding in Iceberg Parquet:** Java uses the Parquet 1.16 VARIANT logical annotation
    (#13941). Shredded schema chosen by sampling (data-dependent). Partial-shredding data loss fixed only
    in 1.11 (#15087); "type uniformity" changed in 1.12 (#17424); decimal high-precision and UTF-8
-   bound-ordering fixes in 1.12. Iceberg forbids min/max on the variant column itself but allows them on
-   shredded children (iceberg-go #988); identity transform/bound literal predicates on variant are
-   rejected (iceberg-go #1206). Same Parquet VARIANT encoding EW already implements for Delta.
+   bound-ordering fixes in 1.12. Don't confuse two kinds of stats. A whole-value min/max of the variant column
+   is meaningless; iceberg-go #988 is about that policy. The spec's manifest bounds for a variant field are
+   something else: a serialized Variant of **per-path** bounds keyed by normalized JSON paths (spec digest
+   §2.10), which the spec permits and writers should keep. Identity-transform and bound-literal predicates
+   on variant are rejected (iceberg-go #1206). (Corrected after review.) Same Parquet VARIANT encoding EW already implements for Delta.
 9. **Defaults:** nested initial-default under a null ancestor struct (Java #17320), filtering on a
    defaulted column must not drop rows (Java #16692, iceberg-rust #3298/#3301), decimal defaults
    serialized wrongly (iceberg-go #2695), nanos default overflow (Java 1.10.1).

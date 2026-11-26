@@ -140,8 +140,10 @@ Expressions `Predicate` (`ParquetReadOptions.Filter :287`, `ParquetScan.Prune`),
   3. The Iceberg codec bypasses the resolver: `Iceberg/Manifest/ManifestIO.cs:223-239` decodes positionally
      and **refuses any writer schema that is not EW's own** (#586), so Java, Spark and pyiceberg manifests,
      partitioned manifests and V1 manifests are all refused. The data file is written with an empty partition
-     record and without bounds, nan counts, key_metadata, equality_ids or v3 fields beyond `FirstRowId`,
-     `ReferencedDataFile` and `ContentOffset` (`ManifestIO.cs:239-260`). The manifest list is always written
+     record and without bounds, nan counts, key_metadata, equality_ids, or any of `FirstRowId`,
+     `ReferencedDataFile`, `ContentOffset` and `ContentSizeInBytes`. Those four exist on the `DataFile` model
+     only; `EncodeDataFile` / `DecodeDataFile` (`ManifestIO.cs:246-318`) drop them, so a rewritten manifest
+     loses row lineage and the DV-to-data-file association. (Corrected after review.) The manifest list is always written
      uncompressed (`AvroCodec.Null`).
   4. The array-with-`logicalType: map` encoding (Iceberg's int-keyed maps) parses as an array of records,
      which is fine for decoding but has no Map semantics.
@@ -197,8 +199,8 @@ Expressions `Predicate` (`ParquetReadOptions.Filter :287`, `ParquetScan.Prune`),
 
 - **Puffin: none.** No source or test file mentions it. The DV pieces above (roaring, CRC-32 via
   `System.IO.Hashing`, and the BE framing) cover the `deletion-vector-v1` blob. Still missing: the
-  Puffin file container (magic `PFA1`, JSON footer with blob metadata, optional LZ4/zstd footer
-  compression, flags), `apache-datasketches-theta-v1` (NDV), and the manifest `content_offset` and
+  Puffin file container (magic `PFA1`, JSON footer with blob metadata, footer compression flag, which allows
+  LZ4 only; `lz4` and `zstd` are blob codecs), `apache-datasketches-theta-v1` (NDV), and the manifest `content_offset` and
   `content_size_in_bytes` plumbing.
 - **murmur3_x86_32: none.** The only murmur is `src/EngineeredWood.Orc/BloomFilter/Murmur3.cs:28` (internal), which
   implements **x64 variants only** (`Hash64Cpp`, `Hash64Java` = murmur3_x64_128 h1). The Iceberg bucket
