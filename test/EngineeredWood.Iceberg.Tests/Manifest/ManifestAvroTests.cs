@@ -118,8 +118,10 @@ public class ManifestAvroTests : IDisposable
                 MinSequenceNumber = 2,
                 AddedSnapshotId = 200,
                 AddedDataFilesCount = 0,
+                ExistingDataFilesCount = 0,
                 DeletedDataFilesCount = 1,
                 AddedRowsCount = 0,
+                ExistingRowsCount = 0,
                 DeletedRowsCount = 100,
             }
         };

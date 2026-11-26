@@ -112,6 +112,7 @@ public sealed class ExpireSnapshots
             {
                 var entries = await ManifestIO.ReadSnapshotManifestListAsync(fs, metadata, snap, ct)
                     .ConfigureAwait(false);
+                ManifestIO.ThrowIfEncryptedManifest(entries, snap, "its snapshots cannot be expired");
                 foreach (var e in entries)
                     keptManifestPaths.Add(e.ManifestPath);
             }
@@ -131,6 +132,7 @@ public sealed class ExpireSnapshots
                     metadata.ThrowIfDataInaccessible(snap);
                     var entries = await ManifestIO.ReadManifestListAsync(fs, snap.ManifestList, ct)
                         .ConfigureAwait(false);
+                    ManifestIO.ThrowIfEncryptedManifest(entries, snap, "its snapshots cannot be expired");
                     foreach (var e in entries)
                     {
                         if (!keptManifestPaths.Contains(e.ManifestPath))

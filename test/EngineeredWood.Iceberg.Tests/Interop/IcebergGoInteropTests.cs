@@ -13,10 +13,6 @@ namespace EngineeredWood.Iceberg.Tests.Interop;
 /// back as expected (the oracle is healthy), then that EW reads the same table's metadata and manifests
 /// the way iceberg-go does.</para>
 ///
-/// <para>EW cannot read another engine's manifests yet: the codec refuses any Avro writer schema but its
-/// own (#775) until the rewrite in #586. The manifest comparisons are written anyway and run inside
-/// <see cref="PendingIssue586"/>, which passes while EW refuses and FAILS once it stops refusing, so the
-/// #586 change has to switch them on.</para>
 /// </summary>
 public sealed class IcebergGoInteropTests : IDisposable
 {
@@ -123,7 +119,7 @@ public sealed class IcebergGoInteropTests : IDisposable
     public async Task Ew_ReadsIcebergGoManifests(string scenario)
     {
         IcebergGo.Require();
-        await PendingIssue586(() => CompareManifests(scenario));
+        await CompareManifests(scenario);
     }
 
     private async Task CompareManifests(string scenario)
@@ -182,13 +178,14 @@ public sealed class IcebergGoInteropTests : IDisposable
                 AssertCounts(ge.GetProperty("column_sizes"), e.DataFile.ColumnSizes, where + " column_sizes");
                 AssertCounts(ge.GetProperty("value_counts"), e.DataFile.ValueCounts, where + " value_counts");
                 AssertCounts(ge.GetProperty("null_value_counts"), e.DataFile.NullValueCounts, where + " null_value_counts");
+                AssertCounts(ge.GetProperty("nan_value_counts"), e.DataFile.NanValueCounts, where + " nan_value_counts");
                 // Bound values are Appendix D binary, comparable only once EW has those codecs (#953 item 5);
                 // until then, check that the same fields carry bounds.
                 Assert.True(
-                    Ids(ge.GetProperty("lower_bound_ids")).SequenceEqual(SortedKeys(e.DataFile.ColumnLowerBounds)),
+                    Ids(ge.GetProperty("lower_bound_ids")).SequenceEqual(SortedKeys(e.DataFile.LowerBounds)),
                     where + " lower_bounds field ids");
                 Assert.True(
-                    Ids(ge.GetProperty("upper_bound_ids")).SequenceEqual(SortedKeys(e.DataFile.ColumnUpperBounds)),
+                    Ids(ge.GetProperty("upper_bound_ids")).SequenceEqual(SortedKeys(e.DataFile.UpperBounds)),
                     where + " upper_bounds field ids");
                 Assert.True(
                     NullableInt64List(ge.GetProperty("split_offsets")).SequenceEqual(e.DataFile.SplitOffsets ?? []),
@@ -198,13 +195,22 @@ public sealed class IcebergGoInteropTests : IDisposable
                 // A data file's spec id is its manifest's; EW keeps it only on the manifest.
                 Assert.True(ge.GetProperty("spec_id").GetInt32() == m.PartitionSpecId, where + " spec_id");
 
-                // Fields EW's DataFile cannot hold yet. Losing them is what #586 is about, so the comparison
-                // fails here, naming the field, as soon as the codec stops refusing foreign manifests.
-                RequireUnmodelled(ge.GetProperty("partition").EnumerateObject().Any(), "the partition tuple", where);
-                RequireUnmodelled(ge.GetProperty("equality_ids").ValueKind == JsonValueKind.Array
-                    && ge.GetProperty("equality_ids").GetArrayLength() > 0, "equality_ids", where);
-                RequireUnmodelled(ge.GetProperty("nan_value_counts").EnumerateObject().Any(), "nan_value_counts", where);
-                RequireUnmodelled(ge.GetProperty("has_key_metadata").GetBoolean(), "key_metadata", where);
+                // The partition tuple, keyed by partition field id. The driver prints each value with Go's
+                // fmt, which for the int and date results of these scenarios' transforms is the integer.
+                var goPartition = ge.GetProperty("partition").EnumerateObject()
+                    .ToDictionary(p => int.Parse(p.Name, System.Globalization.CultureInfo.InvariantCulture), p => p.Value.GetString());
+                var ewPartition = (e.DataFile.Partition?.Values ?? []).ToDictionary(
+                    v => v.FieldId, v => Convert.ToString(v.Value, System.Globalization.CultureInfo.InvariantCulture));
+                Assert.True(goPartition.Count == ewPartition.Count, where + " partition field count");
+                foreach (var (fieldId, value) in goPartition)
+                    Assert.True(ewPartition.TryGetValue(fieldId, out var ew) && ew == value, $"{where} partition field {fieldId}");
+
+                var goEqualityIds = ge.GetProperty("equality_ids").ValueKind == JsonValueKind.Array
+                    ? Ids(ge.GetProperty("equality_ids")).ToList()
+                    : [];
+                Assert.True(goEqualityIds.SequenceEqual(e.DataFile.EqualityIds ?? []), where + " equality_ids");
+                Assert.True(ge.GetProperty("has_key_metadata").GetBoolean() == (e.DataFile.KeyMetadata is { Length: > 0 }),
+                    where + " key_metadata");
             }
         }
     }
@@ -214,7 +220,7 @@ public sealed class IcebergGoInteropTests : IDisposable
     public async Task Ew_ListsTheLiveFilesIcebergGoPlans(string scenario)
     {
         IcebergGo.Require();
-        await PendingIssue586(() => CompareLiveFiles(scenario));
+        await CompareLiveFiles(scenario);
     }
 
     private async Task CompareLiveFiles(string scenario)
@@ -240,6 +246,83 @@ public sealed class IcebergGoInteropTests : IDisposable
             .Distinct()
             .ToList();
         Assert.All(applied, p => Assert.Contains(p, deleteFiles.Select(f => f.FilePath)));
+    }
+
+    /// <summary>
+    /// EW removes one of iceberg-go's data files, which rewrites the iceberg-go manifest that lists it, and
+    /// iceberg-go then reads EW's manifests and manifest list: the same live files as EW, the rewritten
+    /// manifest's survivors as EXISTING with their original sequence numbers, and every remaining row.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Scenarios))]
+    public async Task IcebergGo_ReadsEwsRewriteOfItsManifests(string scenario, long[] expectedIds)
+    {
+        IcebergGo.Require();
+        string metadataLocation = IcebergGo.Scenario(_warehouse, scenario);
+        var fs = new FileUriFileSystem(_warehouse);
+        var md = IcebergJsonSerializer.Deserialize<TableMetadata>(
+            System.Text.Encoding.UTF8.GetString(await fs.ReadAllBytesAsync(metadataLocation)));
+        var ops = new TableOperations(fs);
+
+        var (before, deletes) = await ops.ScanFilesAsync(md);
+        // The victim goes with the delete files that name it (its DV), as the spec requires, so that the
+        // delete manifest is rewritten too.
+        var victim = before.OrderBy(f => f.FilePath, StringComparer.Ordinal).Last();
+        var victimDeletes = deletes.Where(d => d.ReferencedDataFile == victim.FilePath).ToList();
+        var removed = new HashSet<string>(victimDeletes.Select(d => d.FilePath)) { victim.FilePath };
+        var goBefore = Describe(metadataLocation);
+        var originalSequence = goBefore.GetProperty("manifests").EnumerateArray()
+            .SelectMany(m => m.GetProperty("entries").EnumerateArray())
+            .Where(e => e.GetProperty("status").GetString() != "DELETED")
+            .ToDictionary(e => e.GetProperty("file_path").GetString()!, e => e.GetProperty("data_sequence_number").GetInt64());
+
+        var lineageBefore = Scan(metadataLocation, rowLineage: true)
+            .ToDictionary(r => r["id"].GetInt64(), r => r["_row_id"].ToString());
+
+        var updated = await ops.OverwriteFilesAsync(md, [victim, .. victimDeletes], []);
+        string updatedLocation = $"{md.Location}/metadata/ew-{Guid.NewGuid():N}.metadata.json";
+        await fs.WriteAllBytesAsync(updatedLocation,
+            System.Text.Encoding.UTF8.GetBytes(IcebergJsonSerializer.Serialize(updated)));
+
+        var go = Describe(updatedLocation);
+        var (after, _) = await ops.ScanFilesAsync(updated);
+        Assert.Equal(
+            before.Select(f => f.FilePath).Where(p => p != victim.FilePath).OrderBy(p => p, StringComparer.Ordinal),
+            after.Select(f => f.FilePath).OrderBy(p => p, StringComparer.Ordinal));
+        Assert.Equal(
+            after.Select(f => f.FilePath).OrderBy(p => p, StringComparer.Ordinal),
+            go.GetProperty("tasks").EnumerateArray().Select(t => t.GetProperty("file").GetString()!).OrderBy(p => p, StringComparer.Ordinal));
+
+        foreach (var entry in go.GetProperty("manifests").EnumerateArray().SelectMany(m => m.GetProperty("entries").EnumerateArray()))
+        {
+            string path = entry.GetProperty("file_path").GetString()!;
+            string status = entry.GetProperty("status").GetString()!;
+            if (removed.Contains(path))
+            {
+                Assert.Equal("DELETED", status);
+                continue;
+            }
+            // Manifests EW did not rewrite still hold the DELETED entries of earlier snapshots.
+            if (status == "DELETED")
+                continue;
+            Assert.True(originalSequence[path] == entry.GetProperty("data_sequence_number").GetInt64(),
+                $"{scenario}: {path} kept its data sequence number");
+        }
+
+        // Every row iceberg-go still reads was there before. Unless a delete without a referenced data file
+        // (an equality delete, or a v2 position delete) might have removed some of the victim's rows, exactly
+        // the victim's rows are gone.
+        // Row lineage survives the rewrite: every remaining row keeps the _row_id it had.
+        foreach (var row in Scan(updatedLocation, rowLineage: true))
+            Assert.True(lineageBefore[row["id"].GetInt64()] == row["_row_id"].ToString(), $"{scenario}: _row_id of id {row["id"]}");
+
+        var ids = Scan(updatedLocation, rowLineage: false).Select(r => r["id"].GetInt64()).ToList();
+        Assert.All(ids, id => Assert.Contains(id, expectedIds));
+        bool victimRowsKnown = deletes.All(d => d.ReferencedDataFile is not null) && victimDeletes.Count == 0;
+        if (victimRowsKnown)
+            Assert.Equal(expectedIds.Length - victim.RecordCount, ids.Count);
+        else
+            Assert.True(ids.Count < expectedIds.Length, $"{scenario}: removing {victim.FilePath} removed no rows");
     }
 
     /// <summary>The driver's write commands work on a table it adopts by metadata location, which is how
@@ -311,27 +394,6 @@ public sealed class IcebergGoInteropTests : IDisposable
 
     // --- helpers ---
 
-    /// <summary>
-    /// Runs a comparison that EW's manifest codec cannot pass until #586: it refuses manifests written by
-    /// anyone else. Passes while that refusal is what stops the comparison, and fails both when anything
-    /// else does and when the comparison runs to completion. In the last case #586 has landed: remove this
-    /// wrapper so the comparison is asserted directly.
-    /// </summary>
-    private static async Task PendingIssue586(Func<Task> comparison)
-    {
-        try
-        {
-            await comparison();
-        }
-        catch (NotSupportedException e) when (e.Message.Contains("issues/586", StringComparison.Ordinal))
-        {
-            return;
-        }
-
-        Assert.Fail("EW read iceberg-go's manifests and they matched, so #586 has landed: remove PendingIssue586 "
-            + "and assert the comparison directly.");
-    }
-
     private static JsonElement Describe(string metadataLocation) =>
         IcebergGo.Invoke("describe", new { metadata_location = metadataLocation });
 
@@ -362,10 +424,6 @@ public sealed class IcebergGoInteropTests : IDisposable
             $"{what}: iceberg-go {{{string.Join(", ", expected.OrderBy(kv => kv.Key))}}}, "
             + $"EW {{{string.Join(", ", actual.OrderBy(kv => kv.Key))}}}");
     }
-
-    /// <summary>Fails when iceberg-go reports a value for a field EW's model has nowhere to put.</summary>
-    private static void RequireUnmodelled(bool goHasValue, string field, string where) =>
-        Assert.False(goHasValue, $"{where}: iceberg-go reports {field}, which EW's DataFile does not model yet, so EW drops it.");
 
     private static IEnumerable<int> Ids(JsonElement e) => e.EnumerateArray().Select(x => x.GetInt32());
 

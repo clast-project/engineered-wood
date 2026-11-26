@@ -28,6 +28,8 @@ public enum FileFormat
     Parquet,
     /// <summary>Apache ORC format.</summary>
     Orc,
+    /// <summary>Puffin, the format of v3 deletion vectors.</summary>
+    Puffin,
 }
 
 internal sealed class FileFormatConverter : JsonConverter<FileFormat>
@@ -38,6 +40,7 @@ internal sealed class FileFormatConverter : JsonConverter<FileFormat>
             "AVRO" => FileFormat.Avro,
             "PARQUET" => FileFormat.Parquet,
             "ORC" => FileFormat.Orc,
+            "PUFFIN" => FileFormat.Puffin,
             var s => throw new JsonException($"Unknown file format: {s}")
         };
 
@@ -47,6 +50,7 @@ internal sealed class FileFormatConverter : JsonConverter<FileFormat>
             FileFormat.Avro => "AVRO",
             FileFormat.Parquet => "PARQUET",
             FileFormat.Orc => "ORC",
+            FileFormat.Puffin => "PUFFIN",
             _ => throw new JsonException($"Unknown file format: {value}")
         });
 }
@@ -86,18 +90,46 @@ public sealed record DataFile
     public required long RecordCount { get; init; }
     /// <summary>Total file size in bytes.</summary>
     public required long FileSizeInBytes { get; init; }
+    /// <summary>
+    /// The file's partition tuple, typed by its partition spec, or <see langword="null"/> for an unpartitioned
+    /// file. Not part of the JSON manifest format.
+    /// </summary>
+    [JsonIgnore] public PartitionData? Partition { get; init; }
+    /// <summary>The v1 <c>block_size_in_bytes</c>, which v1 manifests require; <see langword="null"/> otherwise.</summary>
+    public long? BlockSizeInBytes { get; init; }
     /// <summary>Per-column sizes in bytes, keyed by field ID.</summary>
     public IReadOnlyDictionary<int, long>? ColumnSizes { get; init; }
     /// <summary>Per-column non-null value counts, keyed by field ID.</summary>
     public IReadOnlyDictionary<int, long>? ValueCounts { get; init; }
     /// <summary>Per-column null value counts, keyed by field ID.</summary>
     public IReadOnlyDictionary<int, long>? NullValueCounts { get; init; }
+    /// <summary>Per-column NaN value counts, keyed by field ID.</summary>
+    public IReadOnlyDictionary<int, long>? NanValueCounts { get; init; }
+    /// <summary>Per-column distinct value counts, keyed by field ID (deprecated; never written in v3).</summary>
+    public IReadOnlyDictionary<int, long>? DistinctCounts { get; init; }
+    /// <summary>
+    /// Per-column lower bounds exactly as the manifest stores them (Appendix D single-value binary), keyed by
+    /// field ID. Kept so that a rewrite writes them back unchanged.
+    /// </summary>
+    public IReadOnlyDictionary<int, byte[]>? LowerBounds { get; init; }
+    /// <summary>Per-column upper bounds as the manifest stores them; see <see cref="LowerBounds"/>.</summary>
+    public IReadOnlyDictionary<int, byte[]>? UpperBounds { get; init; }
+    /// <summary>
+    /// Encryption key metadata. A file that has any is encrypted, and this library refuses to read or
+    /// rewrite its manifest (see <see cref="UnsupportedTableFeatureException"/>).
+    /// </summary>
+    public byte[]? KeyMetadata { get; init; }
+    /// <summary>For an equality delete file, the field IDs its rows are matched on.</summary>
+    public IReadOnlyList<int>? EqualityIds { get; init; }
     /// <summary>Suggested split points within the file.</summary>
     public IReadOnlyList<long>? SplitOffsets { get; init; }
     /// <summary>Identifier of the sort order used to write the file.</summary>
     public int? SortOrderId { get; init; }
 
-    /// <summary>Per-column lower bounds for scan planning, keyed by field ID. Not serialized.</summary>
+    /// <summary>
+    /// Per-column lower bounds for scan planning, keyed by field ID. Not serialized: a manifest's bounds are
+    /// in <see cref="LowerBounds"/>.
+    /// </summary>
     [JsonIgnore] public IReadOnlyDictionary<int, LiteralValue>? ColumnLowerBounds { get; init; }
     /// <summary>Per-column upper bounds for scan planning, keyed by field ID. Not serialized.</summary>
     [JsonIgnore] public IReadOnlyDictionary<int, LiteralValue>? ColumnUpperBounds { get; init; }
@@ -149,19 +181,46 @@ public sealed record ManifestListEntry
     public long MinSequenceNumber { get; init; }
     /// <summary>Snapshot ID that created this manifest.</summary>
     public required long AddedSnapshotId { get; init; }
-    /// <summary>Number of data file entries with Added status.</summary>
-    public int AddedDataFilesCount { get; init; }
-    /// <summary>Number of data file entries with Existing status.</summary>
-    public int ExistingDataFilesCount { get; init; }
-    /// <summary>Number of data file entries with Deleted status.</summary>
-    public int DeletedDataFilesCount { get; init; }
-    /// <summary>Total rows across added data files.</summary>
-    public long AddedRowsCount { get; init; }
-    /// <summary>Total rows across existing data files.</summary>
-    public long ExistingRowsCount { get; init; }
-    /// <summary>Total rows across deleted data files.</summary>
-    public long DeletedRowsCount { get; init; }
+    // The counts are required from v2 on. A v1 manifest list may leave them out, which means "unknown", and
+    // readers must then assume the manifest holds such files: null is not zero.
+
+    /// <summary>Number of entries with Added status, or <see langword="null"/> if unknown (v1).</summary>
+    public int? AddedDataFilesCount { get; init; }
+    /// <summary>Number of entries with Existing status, or <see langword="null"/> if unknown (v1).</summary>
+    public int? ExistingDataFilesCount { get; init; }
+    /// <summary>Number of entries with Deleted status, or <see langword="null"/> if unknown (v1).</summary>
+    public int? DeletedDataFilesCount { get; init; }
+    /// <summary>Total rows across added files, or <see langword="null"/> if unknown (v1).</summary>
+    public long? AddedRowsCount { get; init; }
+    /// <summary>Total rows across existing files, or <see langword="null"/> if unknown (v1).</summary>
+    public long? ExistingRowsCount { get; init; }
+    /// <summary>Total rows across deleted files, or <see langword="null"/> if unknown (v1).</summary>
+    public long? DeletedRowsCount { get; init; }
+
+    /// <summary>
+    /// One summary per partition field of the manifest's spec, or <see langword="null"/> when the manifest
+    /// list has none (readers then cannot skip the manifest by partition).
+    /// </summary>
+    public IReadOnlyList<PartitionFieldSummary>? Partitions { get; init; }
+
+    /// <summary>
+    /// Encryption key metadata. A manifest that has any is encrypted, and this library refuses to read it
+    /// (see <see cref="UnsupportedTableFeatureException"/>).
+    /// </summary>
+    public byte[]? KeyMetadata { get; init; }
 
     /// <summary>First row ID assigned to rows in this manifest (v3).</summary>
     public long? FirstRowId { get; init; }
 }
+
+/// <summary>
+/// A manifest list's summary of one partition field over a manifest's files, used to skip the manifest.
+/// </summary>
+/// <param name="ContainsNull">Whether any file's value for the field is null.</param>
+/// <param name="ContainsNan">Whether any file's value is NaN, or <see langword="null"/> if unknown.</param>
+/// <param name="LowerBound">
+/// The least non-null, non-NaN value, as Appendix D single-value binary of the partition field's type, or
+/// <see langword="null"/> when every value is null or NaN.
+/// </param>
+/// <param name="UpperBound">The greatest such value; see <paramref name="LowerBound"/>.</param>
+public sealed record PartitionFieldSummary(bool ContainsNull, bool? ContainsNan, byte[]? LowerBound, byte[]? UpperBound);

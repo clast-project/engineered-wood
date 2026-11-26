@@ -1,22 +1,24 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using EngineeredWood.Avro;
-using EngineeredWood.Avro.Container;
-using EngineeredWood.Avro.Encoding;
-using EngineeredWood.Avro.Schema;
-using EngineeredWood.Buffers;
 using EngineeredWood.Iceberg.Serialization;
 using EngineeredWood.IO;
 
 namespace EngineeredWood.Iceberg.Manifest;
 
 /// <summary>
-/// Reads and writes Iceberg manifest files and manifest lists,
-/// dispatching between Avro and JSON formats based on file extension.
+/// Reads and writes Iceberg manifest files and manifest lists, dispatching between Avro (the Iceberg format)
+/// and JSON (an EngineeredWood debugging format) by file extension.
 /// </summary>
+/// <remarks>
+/// Avro manifests are decoded by field id against each file's own writer schema, so manifests from any
+/// writer (Java, Spark, pyiceberg, iceberg-rust, iceberg-go) and any format version read. They are written in
+/// the spec's schema for the table's format version, with the partition tuple typed by the spec and the
+/// header metadata readers expect.
+/// </remarks>
 public static class ManifestIO
 {
     private static readonly JsonSerializerOptions JsonOptions = CreateJsonOptions();
@@ -37,58 +39,96 @@ public static class ManifestIO
     // --- Dispatch by format ---
 
     /// <summary>
-    /// Writes manifest entries to the given path, choosing Avro or JSON format
-    /// based on the file extension. Returns the number of bytes written.
+    /// Writes an unpartitioned format-version-2 data manifest. Returns the number of bytes written. Use the
+    /// overload taking <see cref="ManifestWriteOptions"/> for anything else.
+    /// </summary>
+    public static ValueTask<long> WriteManifestAsync(
+        ITableFileSystem fs, string path, IReadOnlyList<ManifestEntry> entries,
+        CancellationToken ct = default) =>
+        WriteManifestAsync(fs, path, entries, new ManifestWriteOptions(), ct);
+
+    /// <summary>
+    /// Writes manifest entries to the given path, choosing Avro or JSON format based on the file extension.
+    /// Returns the number of bytes written.
     /// </summary>
     public static async ValueTask<long> WriteManifestAsync(
-        ITableFileSystem fs, string path, IReadOnlyList<ManifestEntry> entries,
+        ITableFileSystem fs, string path, IReadOnlyList<ManifestEntry> entries, ManifestWriteOptions options,
         CancellationToken ct = default)
     {
-        if (path.EndsWith(".avro", StringComparison.OrdinalIgnoreCase))
-            return await WriteManifestAvroAsync(fs, path, entries, ct).ConfigureAwait(false);
+        byte[] data;
+        if (IsAvro(path))
+        {
+            data = ManifestCodec.EncodeManifest(
+                entries, options.FormatVersion, options.Content, options.ResolvePartitionType(entries),
+                options.HeaderMetadata());
+        }
         else
-            return await WriteManifestJsonAsync(fs, path, entries, ct).ConfigureAwait(false);
+        {
+            ManifestCodec.ValidateContent(entries, options.Content);
+            if (entries.Any(e => e.DataFile.Partition is { Values.Count: > 0 }))
+                throw new NotSupportedException(
+                    $"Cannot write '{path}': the JSON manifest format does not hold partition values. Use an .avro path.");
+            data = JsonSerializer.SerializeToUtf8Bytes(entries, JsonOptions.TypeInfo<IReadOnlyList<ManifestEntry>>());
+        }
+
+        await fs.WriteAllBytesAsync(path, data, ct).ConfigureAwait(false);
+        return data.Length;
     }
 
     /// <summary>
-    /// Reads manifest entries from the given path, choosing Avro or JSON format
-    /// based on the file extension.
+    /// Reads manifest entries from the given path, choosing Avro or JSON format based on the file extension.
+    /// Entries are as stored: values a reader inherits from the manifest list (a null snapshot id or
+    /// sequence number) are left null. The partition tuple is typed from the file's own schema.
     /// </summary>
     public static async ValueTask<List<ManifestEntry>> ReadManifestAsync(
         ITableFileSystem fs, string path, CancellationToken ct = default)
     {
-        if (path.EndsWith(".avro", StringComparison.OrdinalIgnoreCase))
-            return await ReadManifestAvroAsync(fs, path, ct).ConfigureAwait(false);
-        else
-            return await ReadManifestJsonAsync(fs, path, ct).ConfigureAwait(false);
+        var data = await fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
+        return IsAvro(path)
+            ? ManifestCodec.DecodeManifest(data, path, partitionType: null).Entries
+            : JsonSerializer.Deserialize(data, JsonOptions.TypeInfo<List<ManifestEntry>>())
+                ?? throw new InvalidOperationException($"Failed to read manifest: {path}");
     }
 
     /// <summary>
-    /// Writes manifest list entries to the given path, choosing Avro or JSON format
-    /// based on the file extension. Returns the number of bytes written.
+    /// Writes a format-version-2 manifest list. Returns the number of bytes written. Use the overload
+    /// taking <see cref="ManifestListWriteOptions"/> for anything else.
+    /// </summary>
+    public static ValueTask<long> WriteManifestListAsync(
+        ITableFileSystem fs, string path, IReadOnlyList<ManifestListEntry> entries,
+        CancellationToken ct = default) =>
+        WriteManifestListAsync(fs, path, entries, new ManifestListWriteOptions(), ct);
+
+    /// <summary>
+    /// Writes manifest list entries to the given path, choosing Avro or JSON format based on the file
+    /// extension. Returns the number of bytes written.
     /// </summary>
     public static async ValueTask<long> WriteManifestListAsync(
-        ITableFileSystem fs, string path, IReadOnlyList<ManifestListEntry> entries,
+        ITableFileSystem fs, string path, IReadOnlyList<ManifestListEntry> entries, ManifestListWriteOptions options,
         CancellationToken ct = default)
     {
-        if (path.EndsWith(".avro", StringComparison.OrdinalIgnoreCase))
-            return await WriteManifestListAvroAsync(fs, path, entries, ct).ConfigureAwait(false);
-        else
-            return await WriteManifestListJsonAsync(fs, path, entries, ct).ConfigureAwait(false);
+        var data = IsAvro(path)
+            ? ManifestCodec.EncodeManifestList(entries, options.FormatVersion, options.HeaderMetadata())
+            : JsonSerializer.SerializeToUtf8Bytes(entries, JsonOptions.TypeInfo<IReadOnlyList<ManifestListEntry>>());
+        await fs.WriteAllBytesAsync(path, data, ct).ConfigureAwait(false);
+        return data.Length;
     }
 
     /// <summary>
-    /// Reads manifest list entries from the given path, choosing Avro or JSON format
-    /// based on the file extension.
+    /// Reads manifest list entries from the given path, choosing Avro or JSON format based on the file
+    /// extension. A v1 manifest list's entries read as data manifests with sequence number 0.
     /// </summary>
     public static async ValueTask<List<ManifestListEntry>> ReadManifestListAsync(
         ITableFileSystem fs, string path, CancellationToken ct = default)
     {
-        if (path.EndsWith(".avro", StringComparison.OrdinalIgnoreCase))
-            return await ReadManifestListAvroAsync(fs, path, ct).ConfigureAwait(false);
-        else
-            return await ReadManifestListJsonAsync(fs, path, ct).ConfigureAwait(false);
+        var data = await fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
+        return IsAvro(path)
+            ? ManifestCodec.DecodeManifestList(data, path).Entries
+            : JsonSerializer.Deserialize(data, JsonOptions.TypeInfo<List<ManifestListEntry>>())
+                ?? throw new InvalidOperationException($"Failed to read manifest list: {path}");
     }
+
+    // --- Reads through a snapshot ---
 
     /// <summary>
     /// Reads a snapshot's manifest list, throwing <see cref="FileNotFoundException"/> when it is missing. A
@@ -110,404 +150,260 @@ public static class ManifestIO
     }
 
     /// <summary>
-    /// Reads a manifest a snapshot's manifest list names, throwing <see cref="FileNotFoundException"/> when
-    /// it is missing, for the same reason as <see cref="ReadSnapshotManifestListAsync"/>.
+    /// Reads a snapshot's manifest list for a commit that will write it out again. On top of
+    /// <see cref="ReadSnapshotManifestListAsync"/>'s checks, refuses a list holding a field this library does not
+    /// model (rewriting the list would drop it) or an encrypted manifest (carrying it into a list this library
+    /// writes would put a plaintext list over encrypted data).
+    /// </summary>
+    internal static async ValueTask<List<ManifestListEntry>> ReadSnapshotManifestListForRewriteAsync(
+        ITableFileSystem fs, TableMetadata metadata, Snapshot snapshot, CancellationToken ct)
+    {
+        metadata.ThrowIfDataInaccessible(snapshot);
+        if (!await fs.ExistsAsync(snapshot.ManifestList, ct).ConfigureAwait(false))
+            throw new FileNotFoundException(
+                $"Snapshot {snapshot.SnapshotId}'s manifest list '{snapshot.ManifestList}' does not exist; " +
+                "the table's metadata references a missing file.",
+                snapshot.ManifestList);
+
+        var data = await fs.ReadAllBytesAsync(snapshot.ManifestList, ct).ConfigureAwait(false);
+        List<ManifestListEntry> entries;
+        if (IsAvro(snapshot.ManifestList))
+        {
+            var decoded = ManifestCodec.DecodeManifestList(data, snapshot.ManifestList);
+            if (decoded.UnmodelledFields.Count > 0)
+                throw new NotSupportedException(
+                    $"Cannot rewrite manifest list '{snapshot.ManifestList}': it holds fields this library does not " +
+                    $"model ({string.Join(", ", decoded.UnmodelledFields)}), and the next snapshot's list would drop them.");
+            entries = decoded.Entries;
+        }
+        else
+        {
+            entries = JsonSerializer.Deserialize(data, JsonOptions.TypeInfo<List<ManifestListEntry>>())
+                ?? throw new InvalidOperationException($"Failed to read manifest list: {snapshot.ManifestList}");
+        }
+
+        ThrowIfEncryptedManifest(entries, snapshot, "the table cannot be written");
+        return entries;
+    }
+
+    /// <summary>Refuses a manifest-list entry with key metadata: its manifest is encrypted.</summary>
+    internal static void ThrowIfEncryptedManifest(IEnumerable<ManifestListEntry> entries, Snapshot snapshot, string consequence)
+    {
+        if (entries.FirstOrDefault(e => e.KeyMetadata is not null) is { } encrypted)
+            throw new UnsupportedTableFeatureException(
+                $"Manifest '{encrypted.ManifestPath}' of snapshot {snapshot.SnapshotId} is encrypted (it has key " +
+                $"metadata); table encryption is not supported, so {consequence}.");
+    }
+
+    /// <summary>
+    /// Reads a manifest a snapshot's manifest list names, with the partition tuple typed by the manifest's
+    /// spec and inherited values filled in (see <see cref="ManifestCodec.Inherit"/>). Throws
+    /// <see cref="FileNotFoundException"/> when it is missing, for the same reason as
+    /// <see cref="ReadSnapshotManifestListAsync"/>, and <see cref="UnsupportedTableFeatureException"/> when the
+    /// manifest or a file it lists is encrypted.
     /// </summary>
     internal static async ValueTask<List<ManifestEntry>> ReadSnapshotManifestAsync(
-        ITableFileSystem fs, Snapshot snapshot, ManifestListEntry manifest, CancellationToken ct)
+        ITableFileSystem fs, TableMetadata metadata, Snapshot snapshot, ManifestListEntry manifest, CancellationToken ct)
     {
+        var decoded = await ReadSnapshotManifestDecodedAsync(fs, metadata, snapshot, manifest, ct).ConfigureAwait(false);
+        return ManifestCodec.Inherit(decoded, manifest);
+    }
+
+    /// <summary>As <see cref="ReadSnapshotManifestAsync"/>, but before inheritance and with what a rewrite needs to know.</summary>
+    internal static async ValueTask<DecodedManifest> ReadSnapshotManifestDecodedAsync(
+        ITableFileSystem fs, TableMetadata metadata, Snapshot snapshot, ManifestListEntry manifest, CancellationToken ct)
+    {
+        if (manifest.KeyMetadata is not null)
+            throw new UnsupportedTableFeatureException(
+                $"Manifest '{manifest.ManifestPath}' of snapshot {snapshot.SnapshotId} is encrypted (it has key " +
+                "metadata); table encryption is not supported, so it cannot be read.");
         if (!await fs.ExistsAsync(manifest.ManifestPath, ct).ConfigureAwait(false))
             throw new FileNotFoundException(
                 $"Manifest '{manifest.ManifestPath}' of snapshot {snapshot.SnapshotId} does not exist; " +
                 "the table's metadata references a missing file.",
                 manifest.ManifestPath);
-        return await ReadManifestAsync(fs, manifest.ManifestPath, ct).ConfigureAwait(false);
-    }
 
-    // --- JSON format ---
-
-    private static async ValueTask<long> WriteManifestJsonAsync(
-        ITableFileSystem fs, string path, IReadOnlyList<ManifestEntry> entries,
-        CancellationToken ct = default)
-    {
-        var ms = new MemoryStream();
-        JsonSerializer.Serialize(ms, entries, JsonOptions.TypeInfo<IReadOnlyList<ManifestEntry>>());
-        var data = ms.ToArray();
-        await fs.WriteAllBytesAsync(path, data, ct).ConfigureAwait(false);
-        return data.Length;
-    }
-
-    private static async ValueTask<List<ManifestEntry>> ReadManifestJsonAsync(
-        ITableFileSystem fs, string path, CancellationToken ct = default)
-    {
-        var data = await fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
-        return JsonSerializer.Deserialize(data, JsonOptions.TypeInfo<List<ManifestEntry>>())
-            ?? throw new InvalidOperationException($"Failed to read manifest: {path}");
-    }
-
-    private static async ValueTask<long> WriteManifestListJsonAsync(
-        ITableFileSystem fs, string path, IReadOnlyList<ManifestListEntry> entries,
-        CancellationToken ct = default)
-    {
-        var ms = new MemoryStream();
-        JsonSerializer.Serialize(ms, entries, JsonOptions.TypeInfo<IReadOnlyList<ManifestListEntry>>());
-        var data = ms.ToArray();
-        await fs.WriteAllBytesAsync(path, data, ct).ConfigureAwait(false);
-        return data.Length;
-    }
-
-    private static async ValueTask<List<ManifestListEntry>> ReadManifestListJsonAsync(
-        ITableFileSystem fs, string path, CancellationToken ct = default)
-    {
-        var data = await fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
-        return JsonSerializer.Deserialize(data, JsonOptions.TypeInfo<List<ManifestListEntry>>())
-            ?? throw new InvalidOperationException($"Failed to read manifest list: {path}");
-    }
-
-    // --- Avro format ---
-
-    private static async ValueTask<long> WriteManifestAvroAsync(
-        ITableFileSystem fs, string path, IReadOnlyList<ManifestEntry> entries,
-        CancellationToken ct = default)
-    {
-        var ms = new MemoryStream();
-        using (var writer = new OcfWriter(ms, AvroCodec.Null))
+        var data = await fs.ReadAllBytesAsync(manifest.ManifestPath, ct).ConfigureAwait(false);
+        DecodedManifest decoded;
+        if (IsAvro(manifest.ManifestPath))
         {
-            writer.WriteHeader(ManifestAvroSchemas.ManifestEntrySchema);
-            var buf = new GrowableBuffer();
-            var bw = new AvroBinaryWriter(buf);
-            foreach (var entry in entries)
-                EncodeManifestEntry(bw, entry);
-            writer.WriteBlock(bw.WrittenSpan, entries.Count);
+            IReadOnlyList<PartitionValueType>? partitionType = null;
+            var spec = metadata.PartitionSpecs.FirstOrDefault(s => s.SpecId == manifest.PartitionSpecId);
+            if (spec is not null)
+            {
+                var schemas = metadata.Schemas.Where(s => s.SchemaId == metadata.CurrentSchemaId)
+                    .Concat(metadata.Schemas.Where(s => s.SchemaId != metadata.CurrentSchemaId).Reverse());
+                // A spec this library cannot type (an unknown transform) is typed from the file instead.
+                if (PartitionTypes.TryResolve(spec, schemas, out var resolved, out _))
+                    partitionType = resolved;
+            }
+            decoded = ManifestCodec.DecodeManifest(data, manifest.ManifestPath, partitionType);
         }
-        var data = ms.ToArray();
-        await fs.WriteAllBytesAsync(path, data, ct).ConfigureAwait(false);
-        return data.Length;
-    }
-
-    private static async ValueTask<List<ManifestEntry>> ReadManifestAvroAsync(
-        ITableFileSystem fs, string path, CancellationToken ct = default)
-    {
-        var data = await fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
-        using var ms = new MemoryStream(data);
-        using var reader = OcfReader.Open(ms);
-        RequireCodecSchema(reader, ManifestEntryCanonicalSchema, "manifest", path);
-        var results = new List<ManifestEntry>();
-        while (reader.ReadBlock() is { } block)
+        else
         {
-            var br = new AvroBinaryReader(block.data.Span);
-            for (long i = 0; i < block.objectCount; i++)
-                results.Add(DecodeManifestEntry(ref br));
+            var entries = JsonSerializer.Deserialize(data, JsonOptions.TypeInfo<List<ManifestEntry>>())
+                ?? throw new InvalidOperationException($"Failed to read manifest: {manifest.ManifestPath}");
+            decoded = new DecodedManifest(entries, new Dictionary<string, byte[]>(), HasSequenceNumbers: true, []);
         }
-        return results;
-    }
 
-    private static async ValueTask<long> WriteManifestListAvroAsync(
-        ITableFileSystem fs, string path, IReadOnlyList<ManifestListEntry> entries,
-        CancellationToken ct = default)
-    {
-        var ms = new MemoryStream();
-        using (var writer = new OcfWriter(ms, AvroCodec.Null))
+        foreach (var entry in decoded.Entries)
         {
-            writer.WriteHeader(ManifestAvroSchemas.ManifestListSchema);
-            var buf = new GrowableBuffer();
-            var bw = new AvroBinaryWriter(buf);
-            foreach (var entry in entries)
-                EncodeManifestListEntry(bw, entry);
-            writer.WriteBlock(bw.WrittenSpan, entries.Count);
+            if (entry.DataFile.KeyMetadata is not null)
+                throw new UnsupportedTableFeatureException(
+                    $"Data file '{entry.DataFile.FilePath}' is encrypted (it has key metadata); table encryption " +
+                    "is not supported, so it cannot be read.");
         }
-        var data = ms.ToArray();
-        await fs.WriteAllBytesAsync(path, data, ct).ConfigureAwait(false);
-        return data.Length;
+        return decoded;
     }
 
-    private static async ValueTask<List<ManifestListEntry>> ReadManifestListAvroAsync(
-        ITableFileSystem fs, string path, CancellationToken ct = default)
-    {
-        var data = await fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
-        using var ms = new MemoryStream(data);
-        using var reader = OcfReader.Open(ms);
-        RequireCodecSchema(reader, ManifestListCanonicalSchema, "manifest list", path);
-        var results = new List<ManifestListEntry>();
-        while (reader.ReadBlock() is { } block)
-        {
-            var br = new AvroBinaryReader(block.data.Span);
-            for (long i = 0; i < block.objectCount; i++)
-                results.Add(DecodeManifestListEntry(ref br));
-        }
-        return results;
-    }
+    private static bool IsAvro(string path) => path.EndsWith(".avro", StringComparison.OrdinalIgnoreCase);
 
-    // --- Writer-schema guard ---
+    internal static byte[] Utf8(string value) => System.Text.Encoding.UTF8.GetBytes(value);
 
-    private static readonly string ManifestEntryCanonicalSchema =
-        ParsingCanonicalForm.ToCanonicalJson(ManifestAvroSchemas.ManifestEntrySchema);
+    internal static byte[] Utf8(long value) => Utf8(value.ToString(CultureInfo.InvariantCulture));
+}
 
-    private static readonly string ManifestListCanonicalSchema =
-        ParsingCanonicalForm.ToCanonicalJson(ManifestAvroSchemas.ManifestListSchema);
+/// <summary>What a manifest is written for: the format version, the partition spec its files use, and the table schema.</summary>
+public sealed record ManifestWriteOptions
+{
+    /// <summary>The table's format version, which decides the manifest's schema (default 2).</summary>
+    public int FormatVersion { get; init; } = 2;
+
+    /// <summary>The partition spec of the manifest's files (default unpartitioned).</summary>
+    public PartitionSpec PartitionSpec { get; init; } = PartitionSpec.Unpartitioned;
 
     /// <summary>
-    /// The Avro decoders below read fields by position, in the layout EW itself writes.
-    /// They do not resolve the file's writer schema, so a manifest written by another
-    /// engine (or a V1 manifest) would be misread from its first unfamiliar field on, and
-    /// a commit that rewrites it would write the misread values back. Refuse any file whose
-    /// writer schema is not EW's own, compared in Avro Parsing Canonical Form (which keeps
-    /// what fixes the binary layout and drops attributes such as field-id). See issue #586.
+    /// The table schema, written to the manifest header and used to type the partition tuple. Without it,
+    /// the tuple is typed from the entries' <see cref="PartitionData"/>.
     /// </summary>
-    private static void RequireCodecSchema(OcfReader reader, string expectedCanonical, string kind, string path)
+    public Schema? Schema { get; init; }
+
+    /// <summary>Whether the manifest holds data files or delete files.</summary>
+    public ManifestContent Content { get; init; } = ManifestContent.Data;
+
+    /// <summary>Further schemas to resolve partition source fields in (a dropped source column's spec).</summary>
+    internal IReadOnlyList<Schema> OtherSchemas { get; init; } = [];
+
+    /// <summary>Options for a manifest of <paramref name="table"/>'s spec <paramref name="specId"/>.</summary>
+    public static ManifestWriteOptions For(TableMetadata table, int specId, ManifestContent content)
     {
-        var actual = ParsingCanonicalForm.ToCanonicalJson(reader.WriterSchema);
-        if (!string.Equals(actual, expectedCanonical, StringComparison.Ordinal))
+        var spec = table.PartitionSpecs.FirstOrDefault(s => s.SpecId == specId)
+            ?? throw new ArgumentException($"Table has no partition spec {specId}.", nameof(specId));
+
+        // The header's schema must be one the spec binds to: readers rebuild the spec from the header's
+        // schema and partition-spec. For an old spec whose source column has since been dropped that is not
+        // the current schema, so take the newest schema that still has every source field.
+        var candidates = table.Schemas.Where(s => s.SchemaId == table.CurrentSchemaId)
+            .Concat(table.Schemas.Where(s => s.SchemaId != table.CurrentSchemaId).Reverse())
+            .ToList();
+        // Binding needs only the source fields, so this also works for a spec whose transforms this library
+        // cannot evaluate.
+        var sourceIds = spec.Fields.SelectMany(f => f.SourceIds ?? [f.SourceId]).Distinct().ToList();
+        var header = candidates.FirstOrDefault(s => sourceIds.All(id => PartitionTypes.FindField(s.Fields, id) is not null))
+            ?? candidates[0];
+        return new ManifestWriteOptions
+        {
+            FormatVersion = table.FormatVersion,
+            PartitionSpec = spec,
+            Schema = header,
+            Content = content,
+            OtherSchemas = candidates.Where(s => !ReferenceEquals(s, header)).ToList(),
+        };
+    }
+
+    /// <summary>
+    /// Set for a rewrite of an existing manifest: then a spec this library cannot type itself (an unknown
+    /// transform) is typed from the entries' own tuples, which the manifest already holds. New files may not
+    /// be written under such a spec.
+    /// </summary>
+    internal bool RewritesExistingManifest { get; init; }
+
+    internal IReadOnlyList<PartitionValueType> ResolvePartitionType(IReadOnlyList<ManifestEntry> entries)
+    {
+        if (PartitionSpec.Fields.Count == 0)
+            return [];
+
+        if (!RewritesExistingManifest
+            && PartitionSpec.Fields.FirstOrDefault(f => f.Transform is UnknownTransform || f.SourceIds is { Count: > 1 }) is { } unknown)
+        {
             throw new NotSupportedException(
-                $"Cannot read Iceberg {kind} '{path}': its Avro writer schema differs from the one " +
-                "EngineeredWood writes, and the codec cannot yet decode other layouts (for example " +
-                "manifests written by Iceberg Java, Spark or pyiceberg, partitioned manifests, or V1 " +
-                "manifests). Reading or rewriting it could lose or corrupt metadata. See " +
-                "https://github.com/clast-project/engineered-wood/issues/586.");
-    }
+                $"Cannot write new files under partition spec {PartitionSpec.SpecId}: field '{unknown.Name}' has a " +
+                "transform this library does not know, and the spec forbids committing files under one.");
+        }
 
-    // --- Avro encoding: Manifest entries ---
-
-    private static void EncodeManifestEntry(AvroBinaryWriter w, ManifestEntry entry)
-    {
-        w.WriteInt((int)entry.Status);
-        WriteNullableLong(w, entry.SnapshotId);
-        WriteNullableLong(w, entry.SequenceNumber);
-        WriteNullableLong(w, entry.FileSequenceNumber);
-        EncodeDataFile(w, entry.DataFile);
-    }
-
-    private static void EncodeDataFile(AvroBinaryWriter w, DataFile df)
-    {
-        w.WriteInt((int)df.Content);
-        w.WriteString(df.FilePath);
-        w.WriteString(df.FileFormat.ToString().ToUpperInvariant());
-        // partition: empty record (0 fields = 0 bytes)
-        w.WriteLong(df.RecordCount);
-        w.WriteLong(df.FileSizeInBytes);
-        WriteNullableIntLongMap(w, df.ColumnSizes);
-        WriteNullableIntLongMap(w, df.ValueCounts);
-        WriteNullableIntLongMap(w, df.NullValueCounts);
-        WriteNullableLongArray(w, df.SplitOffsets);
-        WriteNullableInt(w, df.SortOrderId);
-    }
-
-    private static ManifestEntry DecodeManifestEntry(ref AvroBinaryReader r)
-    {
-        var status = (ManifestEntryStatus)r.ReadInt();
-        var snapshotId = ReadNullableLong(ref r);
-        var sequenceNumber = ReadNullableLong(ref r);
-        var fileSequenceNumber = ReadNullableLong(ref r);
-        var dataFile = DecodeDataFile(ref r);
-
-        return new ManifestEntry
+        string? reason = "no table schema was given";
+        if (Schema is not null)
         {
-            Status = status,
-            SnapshotId = snapshotId,
-            SequenceNumber = sequenceNumber,
-            FileSequenceNumber = fileSequenceNumber,
-            DataFile = dataFile,
+            if (PartitionTypes.TryResolve(PartitionSpec, [Schema, .. OtherSchemas], out var type, out reason))
+                return type;
+        }
+
+        // Fall back to the entries' own typed tuples (a rewrite of a manifest whose spec this library cannot
+        // type itself), provided they are the spec's fields.
+        var sample = entries.Select(e => e.DataFile.Partition).FirstOrDefault(p => p is { Values.Count: > 0 });
+        if (sample is not null
+            && sample.Values.Select(v => v.FieldId).SequenceEqual(PartitionSpec.Fields.Select(f => f.FieldId)))
+        {
+            return sample.Values.Select(v => new PartitionValueType(v.FieldId, v.Name, v.Type)).ToList();
+        }
+
+        throw new NotSupportedException(
+            $"Cannot type the partition tuple of spec {PartitionSpec.SpecId}: {reason}.");
+    }
+
+    // The keys Iceberg Java writes and readers look for.
+    internal IReadOnlyDictionary<string, byte[]> HeaderMetadata()
+    {
+        var md = new Dictionary<string, byte[]>(StringComparer.Ordinal)
+        {
+            ["partition-spec"] = ManifestIO.Utf8(IcebergJsonSerializer.Serialize(PartitionSpec.Fields)),
+            ["partition-spec-id"] = ManifestIO.Utf8(PartitionSpec.SpecId),
+            ["format-version"] = ManifestIO.Utf8(FormatVersion),
         };
-    }
-
-    private static DataFile DecodeDataFile(ref AvroBinaryReader r)
-    {
-        var content = (FileContent)r.ReadInt();
-        var filePath = r.ReadString();
-        var fileFormatStr = r.ReadString();
-        // partition: empty record (skip 0 bytes)
-        var recordCount = r.ReadLong();
-        var fileSizeInBytes = r.ReadLong();
-        var columnSizes = ReadNullableIntLongMap(ref r);
-        var valueCounts = ReadNullableIntLongMap(ref r);
-        var nullValueCounts = ReadNullableIntLongMap(ref r);
-        var splitOffsets = ReadNullableLongArray(ref r);
-        var sortOrderId = ReadNullableInt(ref r);
-
-        var fileFormat = fileFormatStr.ToUpperInvariant() switch
+        if (Schema is not null)
         {
-            "PARQUET" => FileFormat.Parquet,
-            "AVRO" => FileFormat.Avro,
-            "ORC" => FileFormat.Orc,
-            _ => FileFormat.Parquet,
+            md["schema"] = ManifestIO.Utf8(IcebergJsonSerializer.Serialize(Schema));
+            md["schema-id"] = ManifestIO.Utf8(Schema.SchemaId);
+        }
+        if (FormatVersion >= 2)
+            md["content"] = ManifestIO.Utf8(Content == ManifestContent.Data ? "data" : "deletes");
+        return md;
+    }
+}
+
+/// <summary>What a manifest list is written for: the format version and the snapshot it belongs to.</summary>
+public sealed record ManifestListWriteOptions
+{
+    /// <summary>The table's format version, which decides the manifest list's schema (default 2).</summary>
+    public int FormatVersion { get; init; } = 2;
+
+    /// <summary>The snapshot the list belongs to, written to the header when set.</summary>
+    public long? SnapshotId { get; init; }
+
+    /// <summary>The snapshot's parent, written to the header (as <c>null</c> when it has none) with <see cref="SnapshotId"/>.</summary>
+    public long? ParentSnapshotId { get; init; }
+
+    /// <summary>The snapshot's sequence number, written to the header when set (format version 2 and later).</summary>
+    public long? SequenceNumber { get; init; }
+
+    /// <summary>The snapshot's first row id, written to the header when set (format version 3).</summary>
+    public long? FirstRowId { get; init; }
+
+    internal IReadOnlyDictionary<string, byte[]> HeaderMetadata()
+    {
+        var md = new Dictionary<string, byte[]>(StringComparer.Ordinal)
+        {
+            ["format-version"] = ManifestIO.Utf8(FormatVersion),
         };
-
-        return new DataFile
+        if (SnapshotId is { } id)
         {
-            Content = content,
-            FilePath = filePath,
-            FileFormat = fileFormat,
-            RecordCount = recordCount,
-            FileSizeInBytes = fileSizeInBytes,
-            ColumnSizes = columnSizes,
-            ValueCounts = valueCounts,
-            NullValueCounts = nullValueCounts,
-            SplitOffsets = splitOffsets,
-            SortOrderId = sortOrderId,
-        };
-    }
-
-    // --- Avro encoding: Manifest list entries ---
-
-    private static void EncodeManifestListEntry(AvroBinaryWriter w, ManifestListEntry entry)
-    {
-        w.WriteString(entry.ManifestPath);
-        w.WriteLong(entry.ManifestLength);
-        w.WriteInt(entry.PartitionSpecId);
-        w.WriteInt((int)entry.Content);
-        w.WriteLong(entry.SequenceNumber);
-        w.WriteLong(entry.MinSequenceNumber);
-        w.WriteLong(entry.AddedSnapshotId);
-        w.WriteInt(entry.AddedDataFilesCount);
-        w.WriteInt(entry.ExistingDataFilesCount);
-        w.WriteInt(entry.DeletedDataFilesCount);
-        w.WriteLong(entry.AddedRowsCount);
-        w.WriteLong(entry.ExistingRowsCount);
-        w.WriteLong(entry.DeletedRowsCount);
-        // partitions: null
-        w.WriteUnionIndex(0);
-        // key_metadata: null
-        w.WriteUnionIndex(0);
-    }
-
-    private static ManifestListEntry DecodeManifestListEntry(ref AvroBinaryReader r)
-    {
-        var manifestPath = r.ReadString();
-        var manifestLength = r.ReadLong();
-        var partitionSpecId = r.ReadInt();
-        var content = (ManifestContent)r.ReadInt();
-        var sequenceNumber = r.ReadLong();
-        var minSequenceNumber = r.ReadLong();
-        var addedSnapshotId = r.ReadLong();
-        var addedDataFilesCount = r.ReadInt();
-        var existingDataFilesCount = r.ReadInt();
-        var deletedDataFilesCount = r.ReadInt();
-        var addedRowsCount = r.ReadLong();
-        var existingRowsCount = r.ReadLong();
-        var deletedRowsCount = r.ReadLong();
-
-        // partitions: skip nullable array of records
-        var partitionsIndex = r.ReadUnionIndex();
-        if (partitionsIndex != 0)
-        {
-            var count = r.ReadLong();
-            while (count != 0)
-            {
-                for (long i = 0; i < Math.Abs(count); i++)
-                {
-                    r.ReadBoolean(); // contains_null
-                    ReadNullableInt(ref r); // contains_nan (reuse nullable read, it's union)
-                    var lbIdx = r.ReadUnionIndex(); // lower_bound
-                    if (lbIdx != 0) r.ReadBytes();
-                    var ubIdx = r.ReadUnionIndex(); // upper_bound
-                    if (ubIdx != 0) r.ReadBytes();
-                }
-                count = r.ReadLong();
-            }
+            md["snapshot-id"] = ManifestIO.Utf8(id);
+            md["parent-snapshot-id"] = ParentSnapshotId is { } parent ? ManifestIO.Utf8(parent) : ManifestIO.Utf8("null");
         }
-
-        // key_metadata: skip nullable bytes
-        var kmIndex = r.ReadUnionIndex();
-        if (kmIndex != 0) r.ReadBytes();
-
-        return new ManifestListEntry
-        {
-            ManifestPath = manifestPath,
-            ManifestLength = manifestLength,
-            PartitionSpecId = partitionSpecId,
-            Content = content,
-            SequenceNumber = sequenceNumber,
-            MinSequenceNumber = minSequenceNumber,
-            AddedSnapshotId = addedSnapshotId,
-            AddedDataFilesCount = addedDataFilesCount,
-            ExistingDataFilesCount = existingDataFilesCount,
-            DeletedDataFilesCount = deletedDataFilesCount,
-            AddedRowsCount = addedRowsCount,
-            ExistingRowsCount = existingRowsCount,
-            DeletedRowsCount = deletedRowsCount,
-        };
-    }
-
-    // --- Nullable union helpers ---
-
-    private static void WriteNullableLong(AvroBinaryWriter w, long? value)
-    {
-        if (value is null) { w.WriteUnionIndex(0); return; }
-        w.WriteUnionIndex(1);
-        w.WriteLong(value.Value);
-    }
-
-    private static void WriteNullableInt(AvroBinaryWriter w, int? value)
-    {
-        if (value is null) { w.WriteUnionIndex(0); return; }
-        w.WriteUnionIndex(1);
-        w.WriteInt(value.Value);
-    }
-
-    private static void WriteNullableIntLongMap(AvroBinaryWriter w, IReadOnlyDictionary<int, long>? map)
-    {
-        if (map is null) { w.WriteUnionIndex(0); return; }
-        w.WriteUnionIndex(1);
-        if (map.Count > 0)
-        {
-            w.WriteLong(map.Count);
-            foreach (var (key, value) in map)
-            {
-                w.WriteInt(key);
-                w.WriteLong(value);
-            }
-        }
-        w.WriteLong(0);
-    }
-
-    private static void WriteNullableLongArray(AvroBinaryWriter w, IReadOnlyList<long>? values)
-    {
-        if (values is null) { w.WriteUnionIndex(0); return; }
-        w.WriteUnionIndex(1);
-        if (values.Count > 0)
-        {
-            w.WriteLong(values.Count);
-            foreach (var v in values)
-                w.WriteLong(v);
-        }
-        w.WriteLong(0);
-    }
-
-    private static long? ReadNullableLong(ref AvroBinaryReader r)
-    {
-        return r.ReadUnionIndex() == 0 ? null : r.ReadLong();
-    }
-
-    private static int? ReadNullableInt(ref AvroBinaryReader r)
-    {
-        return r.ReadUnionIndex() == 0 ? null : r.ReadInt();
-    }
-
-    private static IReadOnlyDictionary<int, long>? ReadNullableIntLongMap(ref AvroBinaryReader r)
-    {
-        if (r.ReadUnionIndex() == 0) return null;
-        var map = new Dictionary<int, long>();
-        var count = r.ReadLong();
-        while (count != 0)
-        {
-            for (long i = 0; i < Math.Abs(count); i++)
-                map[r.ReadInt()] = r.ReadLong();
-            count = r.ReadLong();
-        }
-        return map;
-    }
-
-    private static IReadOnlyList<long>? ReadNullableLongArray(ref AvroBinaryReader r)
-    {
-        if (r.ReadUnionIndex() == 0) return null;
-        var list = new List<long>();
-        var count = r.ReadLong();
-        while (count != 0)
-        {
-            for (long i = 0; i < Math.Abs(count); i++)
-                list.Add(r.ReadLong());
-            count = r.ReadLong();
-        }
-        return list;
+        if (FormatVersion >= 2 && SequenceNumber is { } seq)
+            md["sequence-number"] = ManifestIO.Utf8(seq);
+        if (FormatVersion >= 3 && FirstRowId is { } first)
+            md["first-row-id"] = ManifestIO.Utf8(first);
+        return md;
     }
 }

@@ -181,30 +181,188 @@ public class SparkCorpusTests
     }
 
     /// <summary>
-    /// The phase 0 exit criterion, held open for the manifest codec rewrite: EW reads every corpus manifest.
-    /// Until #586 lands, EW refuses another writer's manifest schema (#775), and this passes on the refusal.
+    /// The phase 0 exit criterion: EW reads every corpus manifest list and manifest, field by field, as Spark's
+    /// <c>manifests</c> and <c>files</c> metadata tables report them. Partition values and partition-summary
+    /// bounds are compared as Appendix D bytes, so both sides go through the same codec.
     /// </summary>
     [Theory]
     [MemberData(nameof(IcebergCorpus.SparkTables), MemberType = typeof(IcebergCorpus))]
-    public async Task ManifestsRead_PendingIssue586(string table)
+    public async Task ManifestsMatchSpark(string table)
     {
         var md = Corpus.Metadata(table);
+        var expected = Corpus.Expected(table);
         var current = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
         var fs = new CorpusFileSystem(Corpus);
-        try
+
+        var list = await ManifestIO.ReadSnapshotManifestListAsync(fs, md, current, default);
+        var sparkManifests = expected.GetProperty("manifests").EnumerateArray()
+            .ToDictionary(m => m.GetProperty("path").GetString()!);
+        Assert.Equal(sparkManifests.Keys.OrderBy(k => k, StringComparer.Ordinal),
+            list.Select(m => m.ManifestPath).OrderBy(k => k, StringComparer.Ordinal));
+
+        var files = new List<(ManifestEntry Entry, int SpecId)>();
+        foreach (var mle in list)
         {
-            var list = await ManifestIO.ReadManifestListAsync(fs, current.ManifestList);
-            foreach (var manifest in list)
-                await ManifestIO.ReadManifestAsync(fs, manifest.ManifestPath);
-        }
-        catch (NotSupportedException e) when (e.Message.Contains("issues/586", StringComparison.Ordinal))
-        {
-            return;
+            var sm = sparkManifests[mle.ManifestPath];
+            string where = $"{table}: {mle.ManifestPath}";
+            Assert.True(sm.GetProperty("length").GetInt64() == mle.ManifestLength, where + " length");
+            Assert.True(sm.GetProperty("partition_spec_id").GetInt32() == mle.PartitionSpecId, where + " spec id");
+            Assert.True(sm.GetProperty("content").GetInt32() == (int)mle.Content, where + " content");
+            Assert.True(sm.GetProperty("added_snapshot_id").GetInt64() == mle.AddedSnapshotId, where + " added snapshot");
+            // Spark splits the counts by content: a data manifest's are data-file counts, a delete manifest's delete-file counts.
+            string kind = mle.Content == ManifestContent.Data ? "data" : "delete";
+            Assert.True(sm.GetProperty($"added_{kind}_files_count").GetInt32() == mle.AddedDataFilesCount, where + " added count");
+            Assert.True(sm.GetProperty($"existing_{kind}_files_count").GetInt32() == mle.ExistingDataFilesCount, where + " existing count");
+            Assert.True(sm.GetProperty($"deleted_{kind}_files_count").GetInt32() == mle.DeletedDataFilesCount, where + " deleted count");
+
+            var spec = md.PartitionSpecs.Single(s => s.SpecId == mle.PartitionSpecId);
+            var partitionType = PartitionTypes.Resolve(spec, md);
+            var summaries = sm.GetProperty("partition_summaries").EnumerateArray().ToList();
+            Assert.True(summaries.Count == (mle.Partitions?.Count ?? 0), where + " partition summary count");
+            for (int i = 0; i < summaries.Count; i++)
+            {
+                var ss = summaries[i];
+                var es = mle.Partitions![i];
+                var type = partitionType[i].Type;
+                Assert.True(ss.GetProperty("contains_null").GetBoolean() == es.ContainsNull, $"{where} summary {i} contains_null");
+                if (ss.TryGetProperty("contains_nan", out var nan) && nan.ValueKind != JsonValueKind.Null)
+                    Assert.True(nan.GetBoolean() == es.ContainsNan, $"{where} summary {i} contains_nan");
+                var transform = spec.Fields[i].Transform;
+                AssertSummaryBound(ss, "lower_bound", type, transform, es.LowerBound, $"{where} summary {i}");
+                AssertSummaryBound(ss, "upper_bound", type, transform, es.UpperBound, $"{where} summary {i}");
+            }
+
+            foreach (var entry in await ManifestIO.ReadSnapshotManifestAsync(fs, md, current, mle, default))
+            {
+                if (entry.Status != ManifestEntryStatus.Deleted)
+                    files.Add((entry, mle.PartitionSpecId));
+            }
         }
 
-        Assert.Fail("EW read Spark's manifests, so #586 has landed: replace this test with a field-by-field "
-            + "comparison against expected/<table>.json (files, manifests) and drop the PendingIssue586 suffix.");
+        // The files table lists the live files; a DV is one blob of its Puffin file, so it is keyed by offset too.
+        static string Key(string path, long? offset) => offset is { } o ? $"{path}@{o}" : path;
+        var sparkFiles = expected.GetProperty("files").EnumerateArray()
+            .ToDictionary(f => Key(f.GetProperty("file_path").GetString()!, OptionalInt64(f, "content_offset")));
+        Assert.Equal(sparkFiles.Keys.OrderBy(k => k, StringComparer.Ordinal),
+            files.Select(f => Key(f.Entry.DataFile.FilePath, f.Entry.DataFile.ContentOffset)).OrderBy(k => k, StringComparer.Ordinal));
+
+        foreach (var (entry, specId) in files)
+        {
+            var df = entry.DataFile;
+            var sf = sparkFiles[Key(df.FilePath, df.ContentOffset)];
+            string where = $"{table}: {df.FilePath}";
+            Assert.True(sf.GetProperty("content").GetInt32() == (int)df.Content, where + " content");
+            Assert.True(sf.GetProperty("file_format").GetString() == df.FileFormat.ToString().ToUpperInvariant(), where + " format");
+            Assert.True(sf.GetProperty("spec_id").GetInt32() == specId, where + " spec id");
+            Assert.True(sf.GetProperty("record_count").GetInt64() == df.RecordCount, where + " record count");
+            Assert.True(sf.GetProperty("file_size_in_bytes").GetInt64() == df.FileSizeInBytes, where + " size");
+            AssertCounts(sf, "column_sizes", df.ColumnSizes, where);
+            AssertCounts(sf, "value_counts", df.ValueCounts, where);
+            AssertCounts(sf, "null_value_counts", df.NullValueCounts, where);
+            AssertCounts(sf, "nan_value_counts", df.NanValueCounts, where);
+            AssertSameBounds(sf, "lower_bounds", df.LowerBounds ?? new Dictionary<int, byte[]>());
+            AssertSameBounds(sf, "upper_bounds", df.UpperBounds ?? new Dictionary<int, byte[]>());
+            Assert.True(OptionalInt64List(sf, "split_offsets").SequenceEqual(df.SplitOffsets ?? []), where + " split offsets");
+            Assert.True(OptionalInt64List(sf, "equality_ids").Select(x => (int)x).SequenceEqual(df.EqualityIds ?? []), where + " equality ids");
+            Assert.True(OptionalInt64(sf, "sort_order_id") == df.SortOrderId, where + " sort order");
+            Assert.True(OptionalInt64(sf, "first_row_id") == df.FirstRowId, where + " first row id (inherited)");
+            Assert.True(OptionalString(sf, "referenced_data_file") == df.ReferencedDataFile, where + " referenced data file");
+            Assert.True(OptionalInt64(sf, "content_offset") == df.ContentOffset, where + " content offset");
+            Assert.True(OptionalInt64(sf, "content_size_in_bytes") == df.ContentSizeInBytes, where + " content size");
+            Assert.True(!sf.TryGetProperty("key_metadata", out var km) || km.ValueKind == JsonValueKind.Null, where + " key metadata");
+
+            // The partition tuple: Spark's to_json leaves out null fields.
+            var sparkPartition = sf.TryGetProperty("partition", out var sp) && sp.ValueKind == JsonValueKind.Object
+                ? sp.EnumerateObject().ToDictionary(p => p.Name, p => p.Value)
+                : [];
+            foreach (var value in df.Partition?.Values ?? [])
+            {
+                if (value.Value is null)
+                {
+                    Assert.False(sparkPartition.ContainsKey(value.Name), $"{where} partition {value.Name} is null");
+                    continue;
+                }
+                Assert.True(sparkPartition.TryGetValue(value.Name, out var json), $"{where} partition {value.Name}");
+                Assert.True(
+                    SingleValueBinary.Encode(value.Type, SparkLiteral(value.Type, json))
+                        .AsSpan().SequenceEqual(SingleValueBinary.Encode(value.Type, PhysicalLiteral(value.Type, value.Value))),
+                    $"{where} partition {value.Name}");
+            }
+            Assert.Equal(sparkPartition.Count, df.Partition?.Values.Count(v => v.Value is not null) ?? 0);
+        }
     }
+
+    // A partition-summary bound as Spark's manifests table shows it: the value's human string, or "null" when the
+    // field has no non-null value.
+    private static void AssertSummaryBound(
+        JsonElement summary, string key, IcebergType type, Transform transform, byte[]? bound, string where)
+    {
+        string? text = summary.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+        if (text is null or "null")
+        {
+            Assert.True(bound is null, $"{where} {key} is null");
+            return;
+        }
+        Assert.True(bound is not null, $"{where} {key} present");
+
+        // Java's human string of a temporal transform's int result is calendar text, not the number:
+        // year "1982", month "1982-03", hour "1982-03-04-05".
+        LiteralValue expected = transform switch
+        {
+            YearTransform => LiteralValue.Of(int.Parse(text, CultureInfo.InvariantCulture) - 1970),
+            MonthTransform => LiteralValue.Of(MonthsFromEpoch(text)),
+            HourTransform => LiteralValue.Of(HoursFromEpoch(text)),
+            _ => SparkLiteral(type, type is IntegerType or LongType
+                ? JsonDocument.Parse(text).RootElement
+                : JsonDocument.Parse(JsonSerializer.Serialize(text)).RootElement),
+        };
+        Assert.True(SingleValueBinary.Encode(type, expected).AsSpan().SequenceEqual(bound), $"{where} {key} {text}");
+
+        static int MonthsFromEpoch(string t)
+        {
+            var parts = t.Split('-');
+            return (int.Parse(parts[0], CultureInfo.InvariantCulture) - 1970) * 12 + int.Parse(parts[1], CultureInfo.InvariantCulture) - 1;
+        }
+
+        static int HoursFromEpoch(string t)
+        {
+            var at = DateTime.ParseExact(t, "yyyy-MM-dd-HH", CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal);
+            return checked((int)((at - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).Ticks / TimeSpan.TicksPerHour));
+        }
+    }
+
+    /// <summary>A partition value in its physical form (see <see cref="PartitionData"/>) as a literal.</summary>
+    private static LiteralValue PhysicalLiteral(IcebergType type, object value) => (type, value) switch
+    {
+        (BooleanType, bool b) => LiteralValue.Of(b),
+        (IntegerType, int i) => LiteralValue.Of(i),
+        (LongType, long l) => LiteralValue.Of(l),
+        (StringType, string s) => LiteralValue.Of(s),
+        (BinaryType or FixedType, byte[] b) => LiteralValue.Of(b),
+        (DateType, int days) => IcebergLiterals.DateLiteral(days),
+        (DecimalType d, System.Numerics.BigInteger unscaled) =>
+            IcebergLiterals.Coerce(d, LiteralValue.HighPrecisionDecimalOf(unscaled, d.Scale)),
+        _ => throw new NotSupportedException($"The corpus comparison has no case for a {type} partition value."),
+    };
+
+    private static void AssertCounts(JsonElement file, string key, IReadOnlyDictionary<int, long>? actual, string where)
+    {
+        var expected = file.TryGetProperty(key, out var map) && map.ValueKind == JsonValueKind.Object
+            ? map.EnumerateObject().ToDictionary(p => int.Parse(p.Name, CultureInfo.InvariantCulture), p => p.Value.GetInt64())
+            : [];
+        // Spark shows an absent map and an empty one alike.
+        Assert.True(expected.OrderBy(e => e.Key).SequenceEqual((actual ?? new Dictionary<int, long>()).OrderBy(e => e.Key)),
+            $"{where} {key}");
+    }
+
+    private static long? OptionalInt64(JsonElement e, string key) =>
+        e.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt64() : null;
+
+    private static string? OptionalString(JsonElement e, string key) =>
+        e.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+    private static IEnumerable<long> OptionalInt64List(JsonElement e, string key) =>
+        e.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Array ? v.EnumerateArray().Select(x => x.GetInt64()) : [];
 
     /// <summary>The corpus holds what it is meant to cover; a regenerated corpus that loses a case fails here.</summary>
     [Fact]
