@@ -44,13 +44,17 @@ public sealed class ExpireSnapshots
     }
 
     /// <summary>
-    /// Applies the expiration policy, returning updated metadata and the list of deleted files.
-    /// When a file system is provided, orphaned manifest files are deleted from storage.
+    /// <para>Applies the expiration policy, returning updated metadata and the files no longer referenced.</para>
+    /// <para>When a resolver is provided, those files are deleted from storage, but only those under the table's own
+    /// location: a manifest the metadata names elsewhere (another table's, after a migration or a shallow copy)
+    /// may still be another table's, so it is left in place and reported in
+    /// <see cref="ExpireResult.FilesOutsideTable"/>, as Delta's VACUUM touches only files under its table.</para>
     /// </summary>
     public async ValueTask<ExpireResult> ApplyAsync(
-        TableMetadata metadata, ITableFileSystem? fs = null,
+        TableMetadata metadata, StorageResolver? resolver = null,
         CancellationToken ct = default)
     {
+        ITableFileSystem? fs = resolver is null ? null : new LocationFileSystem(resolver);
         // Expiry rewrites the table's metadata and deletes its files, so it is a write: refuse an encrypted
         // table up front, whatever would be expired and whether or not a file system is given.
         metadata.ThrowIfNotWritable();
@@ -142,13 +146,23 @@ public sealed class ExpireSnapshots
             }
         }
 
-        // Perform deletions
+        // Perform deletions, under the table's location only.
+        var outside = new List<string>();
         if (fs is not null)
         {
+            var tableLocation = StorageLocation.Parse(metadata.Location);
             foreach (var file in deletedFiles)
             {
+                if (!StorageLocation.Parse(file).IsUnder(tableLocation))
+                {
+                    outside.Add(file);
+                    continue;
+                }
+
                 await fs.DeleteAsync(file, ct).ConfigureAwait(false);
             }
+
+            deletedFiles.RemoveAll(outside.Contains);
         }
 
         // Fix parent references in kept snapshots
@@ -175,11 +189,18 @@ public sealed class ExpireSnapshots
             LastUpdatedMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         };
 
-        return new ExpireResult(updatedMetadata, deletedFiles);
+        return new ExpireResult(updatedMetadata, deletedFiles) { FilesOutsideTable = outside };
     }
 }
 
 /// <summary>
-/// The result of a snapshot expiration operation, containing the updated metadata and paths of deleted files.
+/// The result of a snapshot expiration operation, containing the updated metadata and paths of deleted files
+/// (without a resolver, the files that would be deleted).
 /// </summary>
-public sealed record ExpireResult(TableMetadata Metadata, IReadOnlyList<string> DeletedFiles);
+public sealed record ExpireResult(TableMetadata Metadata, IReadOnlyList<string> DeletedFiles)
+{
+    /// <summary>
+    /// Files no longer referenced that lie outside the table's location, and so were left in place.
+    /// </summary>
+    public IReadOnlyList<string> FilesOutsideTable { get; init; } = [];
+}

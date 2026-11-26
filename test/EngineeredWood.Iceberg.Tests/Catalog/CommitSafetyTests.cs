@@ -83,7 +83,7 @@ public class CommitSafetyTests : IDisposable
         var loaded = await writerB.LoadTableAsync(id);
         Assert.Equal("a", loaded.Metadata.Properties["writer"]);
         Assert.EndsWith("/v2.metadata.json", loaded.MetadataLocation);
-        Assert.False(System.IO.File.Exists(Path.Combine(MetadataDir, "v3.metadata.json")));
+        Assert.False(System.IO.File.Exists(TestResolvers.LocalPath(Path.Combine(MetadataDir, "v3.metadata.json"))));
     }
 
     [Fact]
@@ -127,8 +127,8 @@ public class CommitSafetyTests : IDisposable
         var appends = Enumerable.Range(0, writers).Select(i => Task.Run(async () =>
         {
             var fs = new LocalTableFileSystem(_warehouse);
-            var ops = new TableOperations(fs);
-            await new FileSystemCatalog(fs).CommitWithRetryAsync(
+            var ops = new TableOperations(TestResolvers.For(fs));
+            await TestResolvers.Catalog(fs, _warehouse).CommitWithRetryAsync(
                 id,
                 (metadata, ct) => ops.AppendFilesAsync(metadata, [File($"f{i}")], ct),
                 EagerRetry);
@@ -146,7 +146,7 @@ public class CommitSafetyTests : IDisposable
             Assert.Equal(bySequence[i - 1].SnapshotId, bySequence[i].ParentSnapshotId);
         Assert.Equal(bySequence[^1].SnapshotId, table.Metadata.CurrentSnapshotId);
 
-        var files = await new TableOperations(_fs).ListDataFilesAsync(table.Metadata);
+        var files = await new TableOperations(TestResolvers.For(_fs)).ListDataFilesAsync(table.Metadata);
         Assert.Equal(
             Enumerable.Range(0, writers).Select(i => $"db/t/data/f{i}.parquet").OrderBy(p => p),
             files.Select(f => f.FilePath).OrderBy(p => p));
@@ -180,7 +180,7 @@ public class CommitSafetyTests : IDisposable
     public async Task CommitWithRetry_DoesNotRetryAValidationFailure()
     {
         var (catalog, id, _) = await CreateTableAsync();
-        var ops = new TableOperations(_fs);
+        var ops = new TableOperations(TestResolvers.For(_fs));
         var calls = 0;
 
         await Assert.ThrowsAsync<CommitValidationException>(() => catalog.CommitWithRetryAsync(
@@ -224,7 +224,7 @@ public class CommitSafetyTests : IDisposable
 
         var hintPath = Path.Combine(MetadataDir, "version-hint.text");
         if (hint is null)
-            System.IO.File.Delete(hintPath);
+            System.IO.File.Delete(TestResolvers.LocalPath(hintPath));
         else
             System.IO.File.WriteAllText(hintPath, hint);
 
@@ -323,14 +323,14 @@ public class CommitSafetyTests : IDisposable
 
         Assert.False(await catalog.TableExistsAsync(id));
         Assert.Empty(Directory.EnumerateFiles(MetadataDir));
-        Assert.True(System.IO.File.Exists(dataFile)); // without purge, data stays
+        Assert.True(System.IO.File.Exists(TestResolvers.LocalPath(dataFile))); // without purge, data stays
 
         var recreated = await catalog.CreateTableAsync(id, _schema);
         Assert.EndsWith("/v1.metadata.json", recreated.MetadataLocation);
         Assert.False((await catalog.LoadTableAsync(id)).Metadata.Properties.ContainsKey("old"));
 
         await catalog.DropTableAsync(id, purge: true);
-        Assert.False(System.IO.File.Exists(dataFile));
+        Assert.False(System.IO.File.Exists(TestResolvers.LocalPath(dataFile)));
     }
 
     [Fact]
@@ -363,7 +363,7 @@ public class CommitSafetyTests : IDisposable
         Assert.False(await catalog.TableExistsAsync(id));
         var moved = await catalog.LoadTableAsync(to);
         Assert.Equal("v", moved.Metadata.Properties["k"]);
-        Assert.Equal("db/renamed", moved.Location);
+        Assert.Equal(catalog.Warehouse.Combine("db/renamed").ToString(), moved.Location);
         Assert.Empty(moved.Metadata.MetadataLog);
         Assert.EndsWith("/v1.metadata.json", moved.MetadataLocation);
     }
@@ -422,15 +422,15 @@ public class CommitSafetyTests : IDisposable
     public async Task MissingManifestList_IsAnErrorNotAnEmptyTable()
     {
         var (catalog, id, table) = await CreateTableAsync();
-        var ops = new TableOperations(_fs);
+        var ops = new TableOperations(TestResolvers.For(_fs));
         var committed = await catalog.CommitTableAsync(table, await ops.AppendFilesAsync(table.Metadata, [File("a")]));
 
         var snapshot = committed.Metadata.Snapshots.Single();
-        System.IO.File.Delete(Path.Combine(_warehouse, snapshot.ManifestList));
+        System.IO.File.Delete(TestResolvers.LocalPath(snapshot.ManifestList));
 
         await Assert.ThrowsAsync<FileNotFoundException>(() => ops.ListDataFilesAsync(committed.Metadata).AsTask());
         await Assert.ThrowsAsync<FileNotFoundException>(
-            () => new TableScan(committed.Metadata, _fs).PlanFilesAsync().AsTask());
+            () => new TableScan(committed.Metadata, TestResolvers.For(_fs)).PlanFilesAsync().AsTask());
         // The next commit carries the current state forward, so it must not proceed without it either.
         await Assert.ThrowsAsync<FileNotFoundException>(
             () => ops.AppendFilesAsync(committed.Metadata, [File("b")]).AsTask());
@@ -442,16 +442,16 @@ public class CommitSafetyTests : IDisposable
     public async Task MissingManifest_IsAnErrorNotAnEmptyTable()
     {
         var (catalog, id, table) = await CreateTableAsync();
-        var ops = new TableOperations(_fs);
+        var ops = new TableOperations(TestResolvers.For(_fs));
         var committed = await catalog.CommitTableAsync(table, await ops.AppendFilesAsync(table.Metadata, [File("a")]));
 
-        var manifest = (await ManifestIO.ReadManifestListAsync(_fs, committed.Metadata.Snapshots.Single().ManifestList)).Single();
-        System.IO.File.Delete(Path.Combine(_warehouse, manifest.ManifestPath));
+        var manifest = (await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), committed.Metadata.Snapshots.Single().ManifestList)).Single();
+        System.IO.File.Delete(TestResolvers.LocalPath(manifest.ManifestPath));
 
         var ex = await Assert.ThrowsAsync<FileNotFoundException>(() => ops.ListDataFilesAsync(committed.Metadata).AsTask());
         Assert.Equal(manifest.ManifestPath, ex.FileName);
         await Assert.ThrowsAsync<FileNotFoundException>(
-            () => new TableScan(committed.Metadata, _fs).PlanFilesAsync().AsTask());
+            () => new TableScan(committed.Metadata, TestResolvers.For(_fs)).PlanFilesAsync().AsTask());
         await Assert.ThrowsAsync<FileNotFoundException>(
             () => ops.OverwriteFilesAsync(committed.Metadata, [File("a")], [File("b")]).AsTask());
         // An append carries the manifest list forward without opening the manifests (as a fast append
@@ -462,7 +462,7 @@ public class CommitSafetyTests : IDisposable
     public async Task Overwrite_OfAFileTheTableDoesNotHold_WritesNothing()
     {
         var (catalog, id, table) = await CreateTableAsync();
-        var ops = new TableOperations(_fs);
+        var ops = new TableOperations(TestResolvers.For(_fs));
         var committed = await catalog.CommitTableAsync(table, await ops.AppendFilesAsync(table.Metadata, [File("a")]));
         var before = Directory.GetFiles(MetadataDir).Length;
 
@@ -479,7 +479,7 @@ public class CommitSafetyTests : IDisposable
     public async Task Rename_KeepsTheManifestsTheRenamedTableStillReads()
     {
         var (catalog, id, table) = await CreateTableAsync();
-        var ops = new TableOperations(_fs);
+        var ops = new TableOperations(TestResolvers.For(_fs));
         await catalog.CommitTableAsync(table, await ops.AppendFilesAsync(table.Metadata, [File("a")]));
         var to = new TableIdentifier(_ns, "renamed");
 
@@ -488,7 +488,7 @@ public class CommitSafetyTests : IDisposable
         Assert.False(await catalog.TableExistsAsync(id));
         var moved = await catalog.LoadTableAsync(to);
         Assert.Equal(["db/t/data/a.parquet"], (await ops.ListDataFilesAsync(moved.Metadata)).Select(f => f.FilePath));
-        Assert.Single((await new TableScan(moved.Metadata, _fs).PlanFilesAsync()).DataFiles);
+        Assert.Single((await new TableScan(moved.Metadata, TestResolvers.For(_fs)).PlanFilesAsync()).DataFiles);
 
         var appended = await catalog.CommitTableAsync(moved, await ops.AppendFilesAsync(moved.Metadata, [File("b")]));
         Assert.Equal(2, (await ops.ListDataFilesAsync(appended.Metadata)).Count);
@@ -498,7 +498,7 @@ public class CommitSafetyTests : IDisposable
     public async Task CancellationAfterPublication_StillReportsTheCommit()
     {
         var fs = new HintWriteCancelledFileSystem(_fs);
-        var catalog = new FileSystemCatalog(fs);
+        var catalog = TestResolvers.Catalog(fs, _warehouse);
         await catalog.CreateNamespaceAsync(_ns);
         var id = new TableIdentifier(_ns, "t");
 
@@ -584,7 +584,7 @@ public class CommitSafetyTests : IDisposable
                 await other.CreateTableAsync(id, _schema);
             },
         };
-        var catalog = new FileSystemCatalog(hooked);
+        var catalog = TestResolvers.Catalog(hooked, _warehouse);
 
         await Assert.ThrowsAsync<CommitFailedException>(() => catalog.RenameTableAsync(id, to));
 
@@ -645,7 +645,7 @@ public class CommitSafetyTests : IDisposable
                 ? CommitElsewhereAsync(id, "late", "commit")
                 : Task.CompletedTask,
         };
-        var catalog = new FileSystemCatalog(hooked);
+        var catalog = TestResolvers.Catalog(hooked, _warehouse);
 
         await Assert.ThrowsAsync<CommitFailedException>(() => catalog.RenameTableAsync(id, to));
 
@@ -667,7 +667,7 @@ public class CommitSafetyTests : IDisposable
                 ? CommitElsewhereAsync(id, "late", "commit")
                 : Task.CompletedTask,
         };
-        var catalog = new FileSystemCatalog(hooked);
+        var catalog = TestResolvers.Catalog(hooked, _warehouse);
 
         await Assert.ThrowsAsync<CommitFailedException>(() => catalog.RenameTableAsync(id, to));
 
@@ -686,7 +686,7 @@ public class CommitSafetyTests : IDisposable
                 ? CommitElsewhereAsync(id, "late", "commit")
                 : Task.CompletedTask,
         };
-        var catalog = new FileSystemCatalog(hooked);
+        var catalog = TestResolvers.Catalog(hooked, _warehouse);
 
         await catalog.DropTableAsync(id);
 

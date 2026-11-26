@@ -21,7 +21,7 @@ public class DeleteOperationsTests : IDisposable
         _warehouse = Path.Combine(Path.GetTempPath(), $"iceberg-del-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_warehouse);
         _fs = new LocalTableFileSystem(_warehouse);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -207,7 +207,7 @@ public class DeleteOperationsTests : IDisposable
         var snapshot = metadata.Snapshots[0];
         Assert.EndsWith(".avro", snapshot.ManifestList);
 
-        var manifestList = await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList);
+        var manifestList = await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList);
         Assert.EndsWith(".avro", manifestList[0].ManifestPath);
 
         // Verify data is readable

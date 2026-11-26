@@ -24,7 +24,7 @@ public class PartitionSpecUpdateTests : IDisposable
         _tempDir = Path.Combine(Path.GetTempPath(), $"iceberg-psu-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
         _fs = new LocalTableFileSystem(_tempDir);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -34,7 +34,7 @@ public class PartitionSpecUpdateTests : IDisposable
     }
 
     private TableMetadata CreateTable(PartitionSpec? spec = null) =>
-        TableMetadata.Create(_schema, partitionSpec: spec, location: "table");
+        TableMetadata.Create(_schema, partitionSpec: spec, location: Path.Combine(_tempDir, "table"));
 
     // --- Basic add ---
 
@@ -304,7 +304,7 @@ public class PartitionSpecUpdateTests : IDisposable
 
         // Check manifest list entries have correct spec IDs
         var snapshot = v3.Snapshots.Last();
-        var manifestList = await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList);
+        var manifestList = await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList);
 
         // The newest manifest should use the new spec
         var newestManifest = manifestList.Last();

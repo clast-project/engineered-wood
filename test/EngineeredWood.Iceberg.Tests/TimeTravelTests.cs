@@ -20,7 +20,7 @@ public class TimeTravelTests : IDisposable
         _tempDir = Path.Combine(Path.GetTempPath(), $"iceberg-tt-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
         _fs = new LocalTableFileSystem(_tempDir);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -32,7 +32,7 @@ public class TimeTravelTests : IDisposable
     private async Task<TableMetadata> CreateTableWithSnapshotsAsync(
         Action<long>? onSnap1 = null, Action<long>? onSnap2 = null, Action<long>? onSnap3 = null)
     {
-        var metadata = TableMetadata.Create(_schema, location: "table");
+        var metadata = TableMetadata.Create(_schema, location: Path.Combine(_tempDir, "table"));
 
         var m1 = await _ops.AppendFilesAsync(metadata, [
             new DataFile { FilePath = "f1.parquet", RecordCount = 100, FileSizeInBytes = 5000 }

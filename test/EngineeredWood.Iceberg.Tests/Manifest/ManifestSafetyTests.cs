@@ -27,7 +27,7 @@ public class ManifestSafetyTests : IDisposable
     {
         Directory.CreateDirectory(_dir);
         _fs = new LocalTableFileSystem(_dir);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -60,8 +60,8 @@ public class ManifestSafetyTests : IDisposable
         md = await _ops.AppendFilesAsync(md, [File("data/a.parquet", tuple)]);
 
         var snapshot = md.Snapshots.Single();
-        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList));
-        using (var stream = System.IO.File.OpenRead(mle.ManifestPath))
+        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList));
+        using (var stream = System.IO.File.OpenRead(TestResolvers.LocalPath(mle.ManifestPath)))
         using (var reader = new AvroReaderBuilder().Build(stream))
         {
             var avro = (AvroRecordSchema)AvroSchemaParser.Parse(Encoding.UTF8.GetString(reader.Metadata["avro.schema"]));
@@ -85,12 +85,12 @@ public class ManifestSafetyTests : IDisposable
 
         // The default overload writes a data manifest.
         await Assert.ThrowsAsync<ArgumentException>(
-            async () => await ManifestIO.WriteManifestAsync(_fs, Path.Combine(_dir, "m.avro"), [delete]));
+            async () => await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), Path.Combine(_dir, "m.avro"), [delete]));
         await Assert.ThrowsAsync<ArgumentException>(
-            async () => await ManifestIO.WriteManifestAsync(_fs, Path.Combine(_dir, "m.avro"), [data, delete],
+            async () => await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), Path.Combine(_dir, "m.avro"), [data, delete],
                 new ManifestWriteOptions { Content = ManifestContent.Deletes }));
         await Assert.ThrowsAsync<ArgumentException>(
-            async () => await ManifestIO.WriteManifestAsync(_fs, Path.Combine(_dir, "m.json"), [delete]));
+            async () => await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), Path.Combine(_dir, "m.json"), [delete]));
     }
 
     [Fact]
@@ -239,9 +239,9 @@ public class ManifestSafetyTests : IDisposable
             TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]), location: Path.Combine(_dir, "j")),
             [File("data/a.parquet")]);
         var snapshot = md.Snapshots.Single();
-        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList));
+        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList));
         var jsonList = Path.Combine(md.Location, "metadata", "snap-json.json");
-        await ManifestIO.WriteManifestListAsync(_fs, jsonList, [mle with { KeyMetadata = [1] }]);
+        await ManifestIO.WriteManifestListAsync(TestResolvers.Io(_fs), jsonList, [mle with { KeyMetadata = [1] }]);
         md = md with { Snapshots = [snapshot with { ManifestList = jsonList }] };
 
         var before = FilesUnder(md.Location);
@@ -257,11 +257,11 @@ public class ManifestSafetyTests : IDisposable
         md = await _ops.AppendFilesAsync(md, [File("data/a.parquet")]);
         md = await _ops.AppendFilesAsync(md, [File("data/b.parquet")]);
         var current = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
-        var list = await ManifestIO.ReadManifestListAsync(_fs, current.ManifestList);
-        await ManifestIO.WriteManifestListAsync(_fs, current.ManifestList, [list[0] with { KeyMetadata = [1] }, .. list.Skip(1)]);
+        var list = await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), current.ManifestList);
+        await ManifestIO.WriteManifestListAsync(TestResolvers.Io(_fs), current.ManifestList, [list[0] with { KeyMetadata = [1] }, .. list.Skip(1)]);
 
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(async () =>
-            await new ExpireSnapshots().ExpireSnapshotId(md.Snapshots[0].SnapshotId).ApplyAsync(md, _fs));
+            await new ExpireSnapshots().ExpireSnapshotId(md.Snapshots[0].SnapshotId).ApplyAsync(md, TestResolvers.For(_fs)));
     }
 
     [Fact]
@@ -271,8 +271,8 @@ public class ManifestSafetyTests : IDisposable
             TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]), location: Path.Combine(_dir, "e")),
             [File("data/a.parquet")]);
         var snapshot = md.Snapshots.Single();
-        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList));
-        await ManifestIO.WriteManifestListAsync(_fs, snapshot.ManifestList, [mle with { KeyMetadata = [1] }]);
+        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList));
+        await ManifestIO.WriteManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList, [mle with { KeyMetadata = [1] }]);
 
         var before = FilesUnder(md.Location);
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
@@ -287,18 +287,18 @@ public class ManifestSafetyTests : IDisposable
             TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]), location: Path.Combine(_dir, "u")),
             [File("data/a.parquet")]);
         var snapshot = md.Snapshots.Single();
-        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList));
+        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList));
 
         // Rewrite the list with a populated field this library does not know.
         var schemaJson = AvroSchemaWriter.ToJson(ManifestAvroSchemas.ManifestFile(2)).Replace(
             "{\"name\":\"key_metadata\"",
             "{\"name\":\"future_field\",\"type\":[\"null\",\"long\"],\"default\":null,\"field-id\":599},{\"name\":\"key_metadata\"");
         var schema = (AvroRecordSchema)AvroSchemaParser.Parse(schemaJson);
-        var original = (AvroRecordValue)DecodeFirst(await _fs.ReadAllBytesAsync(snapshot.ManifestList))!;
+        var original = (AvroRecordValue)DecodeFirst(await TestResolvers.Io(_fs).ReadAllBytesAsync(snapshot.ManifestList))!;
         var values = schema.Fields.Select(f => f.Name == "future_field"
             ? 1L
             : original.Values[original.Schema.Fields.ToList().FindIndex(o => o.Name == f.Name)]).ToArray();
-        await _fs.WriteAllBytesAsync(snapshot.ManifestList, WriteOne(schema, new AvroRecordValue(schema, values)));
+        await TestResolvers.Io(_fs).WriteAllBytesAsync(snapshot.ManifestList, WriteOne(schema, new AvroRecordValue(schema, values)));
 
         // Reading still works; a commit, which writes the next list from this one, refuses.
         Assert.Single(await _ops.ListDataFilesAsync(md));
@@ -344,11 +344,11 @@ public class ManifestSafetyTests : IDisposable
         var options = new ManifestWriteOptions { PartitionSpec = spec };
 
         await Assert.ThrowsAsync<NotSupportedException>(
-            async () => await ManifestIO.WriteManifestAsync(_fs, Path.Combine(_dir, "n.avro"), [entry], options));
+            async () => await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), Path.Combine(_dir, "n.avro"), [entry], options));
 
         // Rewriting a manifest that already holds such files types the tuple from the entries.
-        await ManifestIO.WriteManifestAsync(_fs, Path.Combine(_dir, "r.avro"), [entry], options with { RewritesExistingManifest = true });
-        Assert.Equal(tuple, Assert.Single(await ManifestIO.ReadManifestAsync(_fs, Path.Combine(_dir, "r.avro"))).DataFile.Partition);
+        await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), Path.Combine(_dir, "r.avro"), [entry], options with { RewritesExistingManifest = true });
+        Assert.Equal(tuple, Assert.Single(await ManifestIO.ReadManifestAsync(TestResolvers.Io(_fs), Path.Combine(_dir, "r.avro"))).DataFile.Partition);
     }
 
     private static object? DecodeFirst(byte[] ocf)

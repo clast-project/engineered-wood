@@ -20,7 +20,7 @@ public class ExpireSnapshotsTests : IDisposable
         _tempDir = Path.Combine(Path.GetTempPath(), $"iceberg-expire-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
         _fs = new LocalTableFileSystem(_tempDir);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -56,7 +56,7 @@ public class ExpireSnapshotsTests : IDisposable
 
         var result = await new ExpireSnapshots()
             .ExpireOlderThan(cutoff)
-            .ApplyAsync(metadata, _fs);
+            .ApplyAsync(metadata, TestResolvers.For(_fs));
 
         // Should keep snap 2 (latest/current) and snap 1 (at cutoff boundary)
         // snap 0 should be expired (its timestamp < cutoff)
@@ -72,7 +72,7 @@ public class ExpireSnapshotsTests : IDisposable
 
         var result = await new ExpireSnapshots()
             .ExpireSnapshotId(firstSnapshotId)
-            .ApplyAsync(metadata, _fs);
+            .ApplyAsync(metadata, TestResolvers.For(_fs));
 
         Assert.Equal(2, result.Metadata.Snapshots.Count);
         Assert.DoesNotContain(result.Metadata.Snapshots,
@@ -86,7 +86,7 @@ public class ExpireSnapshotsTests : IDisposable
 
         var result = await new ExpireSnapshots()
             .ExpireSnapshotId(metadata.CurrentSnapshotId!.Value)
-            .ApplyAsync(metadata, _fs);
+            .ApplyAsync(metadata, TestResolvers.For(_fs));
 
         // Current snapshot should not be expired
         Assert.Single(result.Metadata.Snapshots);
@@ -102,7 +102,7 @@ public class ExpireSnapshotsTests : IDisposable
         var result = await new ExpireSnapshots()
             .ExpireOlderThan(long.MaxValue) // Expire everything...
             .RetainLast(2) // ...but keep the last 2
-            .ApplyAsync(metadata, _fs);
+            .ApplyAsync(metadata, TestResolvers.For(_fs));
 
         Assert.Equal(2, result.Metadata.Snapshots.Count);
         Assert.Equal(newest, result.Metadata.Snapshots.Select(s => s.SnapshotId));
@@ -126,7 +126,7 @@ public class ExpireSnapshotsTests : IDisposable
         var result = await new ExpireSnapshots()
             .ExpireOlderThan(long.MaxValue)
             .RetainLast(2)
-            .ApplyAsync(metadata, _fs);
+            .ApplyAsync(metadata, TestResolvers.For(_fs));
 
         Assert.Equal(2, result.Metadata.Snapshots.Count);
         Assert.Equal(newest, result.Metadata.Snapshots.Select(s => s.SnapshotId));
@@ -139,16 +139,16 @@ public class ExpireSnapshotsTests : IDisposable
         var expiredSnap = metadata.Snapshots[0];
 
         // Verify manifest files exist before expiry
-        Assert.True(await _fs.ExistsAsync(expiredSnap.ManifestList));
-        var manifestList = await ManifestIO.ReadManifestListAsync(_fs, expiredSnap.ManifestList);
-        Assert.True(await _fs.ExistsAsync(manifestList[0].ManifestPath));
+        Assert.True(await TestResolvers.Io(_fs).ExistsAsync(expiredSnap.ManifestList));
+        var manifestList = await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), expiredSnap.ManifestList);
+        Assert.True(await TestResolvers.Io(_fs).ExistsAsync(manifestList[0].ManifestPath));
 
         await new ExpireSnapshots()
             .ExpireSnapshotId(expiredSnap.SnapshotId)
-            .ApplyAsync(metadata, _fs);
+            .ApplyAsync(metadata, TestResolvers.For(_fs));
 
         // Manifest list for expired snapshot should be deleted
-        Assert.False(await _fs.ExistsAsync(expiredSnap.ManifestList));
+        Assert.False(await TestResolvers.Io(_fs).ExistsAsync(expiredSnap.ManifestList));
     }
 
     [Fact]
@@ -158,16 +158,16 @@ public class ExpireSnapshotsTests : IDisposable
 
         // The current snapshot's manifest list references manifests from earlier snapshots
         var currentSnap = metadata.Snapshots.Last();
-        var currentManifests = await ManifestIO.ReadManifestListAsync(_fs, currentSnap.ManifestList);
+        var currentManifests = await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), currentSnap.ManifestList);
 
         // Expire the first snapshot
         var result = await new ExpireSnapshots()
             .ExpireSnapshotId(metadata.Snapshots[0].SnapshotId)
-            .ApplyAsync(metadata, _fs);
+            .ApplyAsync(metadata, TestResolvers.For(_fs));
 
         // Manifests referenced by current snapshot should still exist
         foreach (var m in currentManifests)
-            Assert.True(await _fs.ExistsAsync(m.ManifestPath));
+            Assert.True(await TestResolvers.Io(_fs).ExistsAsync(m.ManifestPath));
     }
 
     [Fact]
@@ -181,7 +181,7 @@ public class ExpireSnapshotsTests : IDisposable
 
         var result = await new ExpireSnapshots()
             .ExpireSnapshotId(firstId)
-            .ApplyAsync(metadata, _fs);
+            .ApplyAsync(metadata, TestResolvers.For(_fs));
 
         // Second snapshot's parent should be cleared
         var updatedSecond = result.Metadata.Snapshots
@@ -197,7 +197,7 @@ public class ExpireSnapshotsTests : IDisposable
 
         var result = await new ExpireSnapshots()
             .ExpireSnapshotId(firstId)
-            .ApplyAsync(metadata, _fs);
+            .ApplyAsync(metadata, TestResolvers.For(_fs));
 
         Assert.DoesNotContain(result.Metadata.SnapshotLog,
             e => e.SnapshotId == firstId);
@@ -210,7 +210,7 @@ public class ExpireSnapshotsTests : IDisposable
 
         var result = await new ExpireSnapshots()
             .ExpireOlderThan(0) // Nothing older than epoch 0
-            .ApplyAsync(metadata, _fs);
+            .ApplyAsync(metadata, TestResolvers.For(_fs));
 
         Assert.Single(result.Metadata.Snapshots);
         Assert.Empty(result.DeletedFiles);
@@ -224,13 +224,13 @@ public class ExpireSnapshotsTests : IDisposable
 
         var result = await new ExpireSnapshots()
             .ExpireSnapshotId(expiredSnap.SnapshotId)
-            .ApplyAsync(metadata, fs: null);
+            .ApplyAsync(metadata, resolver: null);
 
         // Metadata is updated
         Assert.Equal(2, result.Metadata.Snapshots.Count);
 
         // But files still exist
-        Assert.True(await _fs.ExistsAsync(expiredSnap.ManifestList));
+        Assert.True(await TestResolvers.Io(_fs).ExistsAsync(expiredSnap.ManifestList));
     }
 
     [Fact]
@@ -244,7 +244,7 @@ public class ExpireSnapshotsTests : IDisposable
             PartitionStatistics = ids.Select(id => new PartitionStatisticsFile(id, $"pstats-{id}.parquet", 50)).ToList(),
         };
 
-        var result = await new ExpireSnapshots().ExpireSnapshotId(ids[0]).ApplyAsync(metadata, _fs);
+        var result = await new ExpireSnapshots().ExpireSnapshotId(ids[0]).ApplyAsync(metadata, TestResolvers.For(_fs));
 
         Assert.Equal(ids.Skip(1), result.Metadata.Statistics!.Select(s => s.SnapshotId));
         Assert.Equal(ids.Skip(1), result.Metadata.PartitionStatistics!.Select(s => s.SnapshotId));
@@ -256,7 +256,7 @@ public class ExpireSnapshotsTests : IDisposable
     public async Task TableWithoutStatistics_StillHasNone()
     {
         var metadata = await CreateTableWithSnapshotsAsync(2);
-        var result = await new ExpireSnapshots().ExpireSnapshotId(metadata.Snapshots[0].SnapshotId).ApplyAsync(metadata, _fs);
+        var result = await new ExpireSnapshots().ExpireSnapshotId(metadata.Snapshots[0].SnapshotId).ApplyAsync(metadata, TestResolvers.For(_fs));
         Assert.Null(result.Metadata.Statistics);
         Assert.Null(result.Metadata.PartitionStatistics);
     }

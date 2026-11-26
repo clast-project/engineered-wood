@@ -8,20 +8,45 @@ using EngineeredWood.IO;
 namespace EngineeredWood.Iceberg;
 
 /// <summary>
-/// An <see cref="ICatalog"/> implementation that persists namespace and table metadata
-/// as JSON files on an <see cref="ITableFileSystem"/>, using the Hadoop-style layout
-/// with version-hint files and numbered metadata versions.
+/// <para>An <see cref="ICatalog"/> implementation that persists namespace and table metadata
+/// as JSON files under a warehouse location, using the Hadoop-style layout
+/// with version-hint files and numbered metadata versions.</para>
+/// <para>Every location it writes into table metadata is absolute, under the warehouse (for example
+/// <c>file:///C:/wh/db/t</c> or <c>s3://bucket/wh/db/t</c>), as other engines require. Files a table names
+/// elsewhere are reached through the same <see cref="Resolver"/>.</para>
 /// </summary>
 public sealed class FileSystemCatalog : ICatalog
 {
     private readonly ITableFileSystem _fs;
+    private readonly StorageLocation _warehouse;
 
-    /// <summary>Initializes a new <see cref="FileSystemCatalog"/> backed by the given file system.</summary>
-    /// <param name="fs">The file system used to store catalog metadata.</param>
-    public FileSystemCatalog(ITableFileSystem fs)
+    /// <summary>
+    /// Initializes a catalog over the warehouse at <paramref name="warehouse"/>, which <paramref name="resolver"/>
+    /// must reach (it may be registered there itself or lie under a registered prefix).
+    /// </summary>
+    public FileSystemCatalog(StorageResolver resolver, StorageLocation warehouse)
     {
-        _fs = fs;
+        Resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
+        _warehouse = warehouse ?? throw new ArgumentNullException(nameof(warehouse));
+        var resolved = resolver.Resolve(warehouse);
+        _fs = SubtreeFileSystem.Create(resolved.FileSystem, resolved.Path);
     }
+
+    /// <summary>Initializes a catalog over the local directory <paramref name="fs"/> is rooted at.</summary>
+    public FileSystemCatalog(IO.Local.LocalTableFileSystem fs)
+        : this(new StorageResolver().Register(fs), fs.Location)
+    {
+    }
+
+    /// <summary>Reaches the files the catalog's tables name, for <see cref="Manifest.TableOperations"/> and
+    /// <see cref="Expressions.TableScan"/>.</summary>
+    public StorageResolver Resolver { get; }
+
+    /// <summary>The warehouse location tables are created under.</summary>
+    public StorageLocation Warehouse => _warehouse;
+
+    /// <summary>The absolute location of a warehouse-relative path.</summary>
+    private string Absolute(string relativePath) => _warehouse.Combine(relativePath).ToString();
 
     // --- Namespace operations ---
 
@@ -236,7 +261,8 @@ public sealed class FileSystemCatalog : ICatalog
         if (!await _fs.ExistsAsync(NamespacePropertiesPath(identifier.Namespace), ct).ConfigureAwait(false))
             throw new NoSuchNamespaceException(identifier.Namespace);
 
-        var tableLocation = location ?? TablePath(identifier);
+        // Iceberg locations are absolute: a relative one names no base other engines would agree on.
+        var tableLocation = location is null ? Absolute(TablePath(identifier)) : StorageLocation.Parse(location).ToString();
         var metadata = TableMetadata.Create(schema, spec, sortOrder, tableLocation, properties);
         return await CreateAsync(identifier, metadata, ct).ConfigureAwait(false);
     }
@@ -249,7 +275,7 @@ public sealed class FileSystemCatalog : ICatalog
         var path = MetadataFilePath(identifier, version);
         var data = await _fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
         var metadata = IcebergJsonSerializer.Deserialize<TableMetadata>(Encoding.UTF8.GetString(data));
-        return new Table(identifier, metadata, path);
+        return new Table(identifier, metadata, Absolute(path));
     }
 
     /// <summary>
@@ -299,7 +325,7 @@ public sealed class FileSystemCatalog : ICatalog
         var baseVersion = ParseBaseVersion(current);
         var renamed = current.Metadata with
         {
-            Location = TablePath(to),
+            Location = Absolute(TablePath(to)),
             MetadataLog = [],
         };
         await CreateAsync(to, renamed, ct).ConfigureAwait(false);
@@ -367,7 +393,7 @@ public sealed class FileSystemCatalog : ICatalog
                 $"another writer committed version {baseVersion + 1} first.");
 
         await TryWriteVersionHintAsync(identifier, baseVersion + 1).ConfigureAwait(false);
-        return new Table(identifier, committed, path);
+        return new Table(identifier, committed, Absolute(path));
     }
 
     // --- Internal helpers ---
@@ -425,12 +451,12 @@ public sealed class FileSystemCatalog : ICatalog
             throw new TableAlreadyExistsException(identifier);
 
         await TryWriteVersionHintAsync(identifier, 1).ConfigureAwait(false);
-        return new Table(identifier, metadata, path);
+        return new Table(identifier, metadata, Absolute(path));
     }
 
     private int ParseBaseVersion(Table baseTable)
     {
-        var expectedDir = MetadataDir(baseTable.Identifier) + "/";
+        var expectedDir = Absolute(MetadataDir(baseTable.Identifier)) + "/";
         var location = baseTable.MetadataLocation;
         if (location is null || !location.StartsWith(expectedDir, StringComparison.Ordinal) ||
             ParseMetadataVersion(location.Substring(expectedDir.Length)) is not { } version)

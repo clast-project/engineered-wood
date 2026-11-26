@@ -14,11 +14,13 @@ public sealed class TableOperations
     private readonly ITableFileSystem _fs;
 
     /// <summary>
-    /// Initializes a new instance using the specified file system for reading and writing manifests.
+    /// Initializes a new instance that reads and writes manifests at the absolute locations table metadata names,
+    /// through <paramref name="resolver"/>. New manifests and manifest lists are written under the table's own
+    /// location (<c>&lt;location&gt;/metadata/</c>), so that location must resolve.
     /// </summary>
-    public TableOperations(ITableFileSystem fs)
+    public TableOperations(StorageResolver resolver)
     {
-        _fs = fs;
+        _fs = new LocationFileSystem(resolver);
     }
 
     /// <summary>
@@ -74,7 +76,7 @@ public sealed class TableOperations
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var snapshotId = GenerateSnapshotId();
         var sequenceNumber = current.LastSequenceNumber + 1;
-        var metadataDir = $"{current.Location}/metadata";
+        var metadataDir = MetadataDirectory(current);
 
         var manifestListEntries = new List<ManifestListEntry>();
         var deletedPaths = new HashSet<string>(filesToDelete.Select(FileKey));
@@ -285,7 +287,7 @@ public sealed class TableOperations
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var snapshotId = GenerateSnapshotId();
         var sequenceNumber = current.LastSequenceNumber + 1;
-        var metadataDir = $"{current.Location}/metadata";
+        var metadataDir = MetadataDirectory(current);
 
         // Read (and check) the manifests to carry forward before writing anything.
         var manifestListEntries = new List<ManifestListEntry>();
@@ -383,6 +385,13 @@ public sealed class TableOperations
 
         return result;
     }
+
+    /// <summary>
+    /// Where a commit writes its manifests and manifest list: <c>&lt;location&gt;/metadata</c>, as an absolute location
+    /// in the table location's own spelling (a bare local path becomes a <c>file:</c> URI), so other engines can read it.
+    /// </summary>
+    private static string MetadataDirectory(TableMetadata metadata) =>
+        StorageLocation.Parse(metadata.Location).Combine("metadata").ToString();
 
     private ValueTask<List<ManifestListEntry>> ReadManifestListAsync(
         TableMetadata metadata, Snapshot snapshot, CancellationToken ct) =>

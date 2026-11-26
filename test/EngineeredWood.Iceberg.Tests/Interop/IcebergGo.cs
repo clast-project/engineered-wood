@@ -30,7 +30,7 @@ namespace EngineeredWood.Iceberg.Tests.Interop;
 ///
 /// <para><b>Catalog.</b> The driver keeps its tables in a SQL catalog on sqlite under the warehouse,
 /// because iceberg-go's Hadoop catalog does not work on Windows. Tests address tables by metadata-file
-/// location, as <c>file:///</c> URIs; <see cref="FileUriFileSystem"/> maps those onto a local root.</para>
+/// location, as <c>file:///</c> URIs, which EW reaches through a <see cref="EngineeredWood.IO.StorageResolver"/>.</para>
 /// </summary>
 internal static class IcebergGo
 {

@@ -192,7 +192,7 @@ public class SparkCorpusTests
         var md = Corpus.Metadata(table);
         var expected = Corpus.Expected(table);
         var current = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
-        var fs = new CorpusFileSystem(Corpus);
+        var fs = Corpus.FileSystem;
 
         var list = await ManifestIO.ReadSnapshotManifestListAsync(fs, md, current, default);
         var sparkManifests = expected.GetProperty("manifests").EnumerateArray()

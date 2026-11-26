@@ -19,12 +19,13 @@ public sealed class TableScan
     private long? _snapshotId;
 
     /// <summary>
-    /// Initializes a new scan against the specified table metadata and file system.
+    /// Initializes a new scan of <paramref name="metadata"/>, reading its manifest lists and manifests from the
+    /// absolute locations it names through <paramref name="resolver"/>.
     /// </summary>
-    public TableScan(TableMetadata metadata, ITableFileSystem fs)
+    public TableScan(TableMetadata metadata, StorageResolver resolver)
     {
         _metadata = metadata;
-        _fs = fs;
+        _fs = new LocationFileSystem(resolver);
     }
 
     /// <summary>

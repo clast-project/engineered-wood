@@ -20,7 +20,7 @@ public class SnapshotRefsTests : IDisposable
         _tempDir = Path.Combine(Path.GetTempPath(), $"iceberg-refs-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
         _fs = new LocalTableFileSystem(_tempDir);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -31,7 +31,7 @@ public class SnapshotRefsTests : IDisposable
 
     private async Task<TableMetadata> CreateTableWithSnapshotsAsync(int count)
     {
-        var metadata = TableMetadata.Create(_schema, location: "table");
+        var metadata = TableMetadata.Create(_schema, location: Path.Combine(_tempDir, "table"));
         for (int i = 0; i < count; i++)
         {
             metadata = await _ops.AppendFilesAsync(metadata, [

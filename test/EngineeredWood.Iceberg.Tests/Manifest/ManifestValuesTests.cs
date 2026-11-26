@@ -50,7 +50,7 @@ public class ManifestValuesTests
         var metadata = TableMetadata.Create(TableSchema, location: Path.GetTempPath());
         var filter = EngineeredWood.Iceberg.Expressions.Expressions.Equal(
             new UnboundReference("key"), new LiteralExpression(LiteralValue.Of(Guid.Empty)));
-        var planned = new TableScan(metadata, new LocalTableFileSystem(Path.GetTempPath())).Filter(filter).PlanFiles([decoded]);
+        var planned = new TableScan(metadata, TestResolvers.For(new LocalTableFileSystem(Path.GetTempPath()))).Filter(filter).PlanFiles([decoded]);
         Assert.Single(planned.DataFiles);
     }
 }

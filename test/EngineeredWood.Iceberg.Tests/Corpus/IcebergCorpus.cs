@@ -33,7 +33,18 @@ internal sealed class IcebergCorpus
         Info = JsonDocument.Parse(File.ReadAllText(Path.Combine(_root, "corpus.json"))).RootElement;
         _warehouseUri = Info.GetProperty("warehouse_uri").GetString()!.TrimEnd('/');
         Tables = Info.GetProperty("tables").EnumerateArray().Select(t => t.GetString()!).ToArray();
+
+        // The neutral warehouse the tables were written under is the committed copy here: one registration
+        // relocates every absolute location the metadata holds.
+        Resolver = new IO.StorageResolver().Register(
+            IO.StorageLocation.Parse(_warehouseUri), new IO.Local.LocalTableFileSystem(WarehouseDirectory));
     }
+
+    /// <summary>Reaches every location the corpus's metadata names, in the committed copy.</summary>
+    public IO.StorageResolver Resolver { get; }
+
+    /// <summary>The corpus as the absolute-location file system EW's manifest code reads through.</summary>
+    internal IO.ITableFileSystem FileSystem => new LocationFileSystem(Resolver);
 
     public string Engine { get; }
 
@@ -78,14 +89,9 @@ internal sealed class IcebergCorpus
     /// <summary>The committed copy of a file the table's metadata names.</summary>
     public string LocalPath(string location)
     {
-        // iceberg-go writes file:///C:/..., Spark file:/tmp/...; compare without the slashes after the scheme.
-        string Normalize(string uri) => uri.StartsWith("file:", StringComparison.Ordinal)
-            ? "file:" + uri.Substring(5).TrimStart('/')
-            : uri;
-
-        string loc = Normalize(location), prefix = Normalize(_warehouseUri);
-        Assert.StartsWith(prefix + "/", loc, StringComparison.Ordinal);
-        string relative = Uri.UnescapeDataString(loc.Substring(prefix.Length + 1));
+        // Resolved, not string-matched: iceberg-go writes file:///C:/..., Spark file:/tmp/.... Nothing is decoded:
+        // Spark's partition directories hold literal escapes (fx=fwAAAQ%3D%3D) on disk and in the manifests alike.
+        string relative = Resolver.Resolve(location).Path;
         return Path.Combine(WarehouseDirectory, relative.Replace('/', Path.DirectorySeparatorChar));
     }
 
@@ -168,48 +174,3 @@ internal sealed class IcebergCorpus
 /// <summary>A live file of a snapshot, with the bounds its manifest entry carries.</summary>
 internal sealed record ManifestFileBounds(
     string FilePath, int Content, IReadOnlyDictionary<int, byte[]> Lower, IReadOnlyDictionary<int, byte[]> Upper);
-
-/// <summary>
-/// A read-only <see cref="IO.ITableFileSystem"/> over a corpus, resolving the absolute locations its metadata
-/// holds, so EW's own readers (<see cref="Manifest.ManifestIO"/>) can open the committed tables.
-/// </summary>
-internal sealed class CorpusFileSystem : IO.ITableFileSystem
-{
-    private readonly IcebergCorpus _corpus;
-    private readonly IO.Local.LocalTableFileSystem _inner;
-
-    public CorpusFileSystem(IcebergCorpus corpus)
-    {
-        _corpus = corpus;
-        _inner = new IO.Local.LocalTableFileSystem(corpus.WarehouseDirectory);
-    }
-
-    private string Map(string location) =>
-        _corpus.LocalPath(location).Substring(_corpus.WarehouseDirectory.Length + 1).Replace(Path.DirectorySeparatorChar, '/');
-
-    public IO.PathNameConstraints PathConstraints => _inner.PathConstraints;
-
-    public IAsyncEnumerable<IO.TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default) =>
-        _inner.ListAsync(Map(prefix), cancellationToken);
-
-    public ValueTask<IO.IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default) =>
-        _inner.OpenReadAsync(Map(path), cancellationToken);
-
-    public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default) =>
-        _inner.ExistsAsync(Map(path), cancellationToken);
-
-    public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default) =>
-        _inner.ReadAllBytesAsync(Map(path), cancellationToken);
-
-    public ValueTask<IO.ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default) =>
-        throw new NotSupportedException("The committed corpus is read-only.");
-
-    public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default) =>
-        throw new NotSupportedException("The committed corpus is read-only.");
-
-    public ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
-        throw new NotSupportedException("The committed corpus is read-only.");
-
-    public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
-        throw new NotSupportedException("The committed corpus is read-only.");
-}

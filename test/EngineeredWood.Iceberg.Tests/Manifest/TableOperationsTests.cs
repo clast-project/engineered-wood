@@ -21,7 +21,7 @@ public class TableOperationsTests : IDisposable
         _warehouse = Path.Combine(Path.GetTempPath(), $"iceberg-ops-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_warehouse);
         _fs = new LocalTableFileSystem(_warehouse);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -74,15 +74,15 @@ public class TableOperationsTests : IDisposable
 
         // Verify manifest list exists
         var snapshot = updated.Snapshots[0];
-        Assert.True(await _fs.ExistsAsync(snapshot.ManifestList));
+        Assert.True(await TestResolvers.Io(_fs).ExistsAsync(snapshot.ManifestList));
 
         // Verify manifest list contents
-        var manifestList = await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList);
+        var manifestList = await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList);
         Assert.Single(manifestList);
         Assert.Equal(1, manifestList[0].AddedDataFilesCount);
 
         // Verify manifest file contents
-        var manifestEntries = await ManifestIO.ReadManifestAsync(_fs, manifestList[0].ManifestPath);
+        var manifestEntries = await ManifestIO.ReadManifestAsync(TestResolvers.Io(_fs), manifestList[0].ManifestPath);
         Assert.Single(manifestEntries);
         Assert.Equal("data/file1.parquet", manifestEntries[0].DataFile.FilePath);
         Assert.Equal(ManifestEntryStatus.Added, manifestEntries[0].Status);
@@ -218,12 +218,12 @@ public class TableOperationsTests : IDisposable
         var dangling = metadata with { Snapshots = [] };
 
         await Assert.ThrowsAsync<InvalidDataException>(
-            async () => await new EngineeredWood.Iceberg.Expressions.TableScan(dangling, _fs).PlanFilesAsync());
+            async () => await new EngineeredWood.Iceberg.Expressions.TableScan(dangling, TestResolvers.For(_fs)).PlanFilesAsync());
         Assert.Throws<InvalidDataException>(
-            () => new EngineeredWood.Iceberg.Expressions.TableScan(dangling, _fs).PlanFiles([]));
+            () => new EngineeredWood.Iceberg.Expressions.TableScan(dangling, TestResolvers.For(_fs)).PlanFiles([]));
         await Assert.ThrowsAsync<InvalidDataException>(async () => await _ops.ListDataFilesAsync(dangling));
 
         // A table with no current snapshot is still empty.
-        Assert.Empty((await new EngineeredWood.Iceberg.Expressions.TableScan(CreateTable(), _fs).PlanFilesAsync()).DataFiles);
+        Assert.Empty((await new EngineeredWood.Iceberg.Expressions.TableScan(CreateTable(), TestResolvers.For(_fs)).PlanFilesAsync()).DataFiles);
     }
 }
