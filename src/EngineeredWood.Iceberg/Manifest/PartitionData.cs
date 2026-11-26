@@ -97,16 +97,25 @@ public readonly record struct PartitionValue(int FieldId, string Name, IcebergTy
         FieldId == other.FieldId && Name == other.Name && Type.Equals(other.Type) && ValueEquals(Value, other.Value);
 
     /// <inheritdoc/>
-    public override int GetHashCode() =>
-        unchecked(FieldId * 31 + (Value is byte[] b ? b.Length : Value?.GetHashCode() ?? 0));
+    public override int GetHashCode() => unchecked(FieldId * 31 + Value switch
+    {
+        null => 0,
+        byte[] b => b.Length,
+        float f when float.IsNaN(f) => 0x7FC00000,
+        double d when double.IsNaN(d) => 0x7FF80000,
+        _ => Value.GetHashCode(),
+    });
 
     private static bool ValueEquals(object? a, object? b) => (a, b) switch
     {
         (null, null) => true,
         (byte[] x, byte[] y) => x.AsSpan().SequenceEqual(y),
-        // Floats compare by bits, as Iceberg's partition equality does: NaN equals NaN, -0 differs from 0.
-        (float x, float y) => BitConverter.ToInt32(BitConverter.GetBytes(x), 0) == BitConverter.ToInt32(BitConverter.GetBytes(y), 0),
-        (double x, double y) => BitConverter.DoubleToInt64Bits(x) == BitConverter.DoubleToInt64Bits(y),
+        // Iceberg compares floating partition values by their bits with NaN canonicalized: every NaN equals
+        // every other, and -0 differs from 0.
+        (float x, float y) => float.IsNaN(x) ? float.IsNaN(y)
+            : BitConverter.ToInt32(BitConverter.GetBytes(x), 0) == BitConverter.ToInt32(BitConverter.GetBytes(y), 0),
+        (double x, double y) => double.IsNaN(x) ? double.IsNaN(y)
+            : BitConverter.DoubleToInt64Bits(x) == BitConverter.DoubleToInt64Bits(y),
         _ => Equals(a, b),
     };
 

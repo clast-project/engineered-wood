@@ -142,7 +142,7 @@ internal static class ManifestAvroSchemas
         Record(w, "r102", () =>
         {
             foreach (var field in partitionType)
-                Optional(w, field.Name, field.FieldId, () => IcebergAvroTypes.Write(w, field.Type, field.FieldId));
+                Optional(w, AvroCompatibleName(field.Name), field.FieldId, () => IcebergAvroTypes.Write(w, field.Type, field.FieldId));
         });
     }
 
@@ -203,6 +203,34 @@ internal static class ManifestAvroSchemas
         });
         w.WriteNumber("element-id", FieldSummary);
         w.WriteEndObject();
+    }
+
+    /// <summary>
+    /// A partition field name as an Avro field name, escaped as Iceberg Java's <c>AvroSchemaUtil</c> escapes
+    /// it: a leading character that is not a letter or <c>_</c>, and any later one that is not a letter, digit
+    /// or <c>_</c>, becomes <c>_</c> + the digit, or <c>_x</c> + its code in upper-case hex. Readers find the
+    /// field by its id, and take the name from the partition spec.
+    /// </summary>
+    internal static string AvroCompatibleName(string name)
+    {
+        if (name.Length > 0 && IsValidStart(name[0]) && name.Skip(1).All(IsValidPart))
+            return name;
+
+        var sb = new System.Text.StringBuilder(name.Length + 8);
+        for (int i = 0; i < name.Length; i++)
+        {
+            char c = name[i];
+            if (i == 0 ? IsValidStart(c) : IsValidPart(c))
+                sb.Append(c);
+            else if (char.IsDigit(c))
+                sb.Append('_').Append(c);
+            else
+                sb.Append("_x").Append(((int)c).ToString("X", System.Globalization.CultureInfo.InvariantCulture));
+        }
+        return sb.ToString();
+
+        static bool IsValidStart(char c) => char.IsLetter(c) || c == '_';
+        static bool IsValidPart(char c) => char.IsLetterOrDigit(c) || c == '_';
     }
 
     private static void CheckVersion(int formatVersion)

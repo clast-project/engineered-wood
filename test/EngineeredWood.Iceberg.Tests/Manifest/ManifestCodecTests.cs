@@ -132,13 +132,18 @@ public class ManifestCodecTests : IDisposable
             });
         }
 
-        var path = PathOf("m.avro");
-        await ManifestIO.WriteManifestAsync(_fs, path, entries, ManifestWriteOptions.For(table, 1, ManifestContent.Data));
-        var read = await ManifestIO.ReadManifestAsync(_fs, path);
+        // Data files and delete files go to separate manifests.
+        foreach (var content in new[] { ManifestContent.Data, ManifestContent.Deletes })
+        {
+            var expected = entries.Where(e => (e.DataFile.Content == FileContent.Data) == (content == ManifestContent.Data)).ToList();
+            var path = PathOf($"m-{content}.avro");
+            await ManifestIO.WriteManifestAsync(_fs, path, expected, ManifestWriteOptions.For(table, 1, content));
+            var read = await ManifestIO.ReadManifestAsync(_fs, path);
 
-        Assert.Equal(entries.Count, read.Count);
-        for (int i = 0; i < entries.Count; i++)
-            AssertEntryEqual(entries[i], read[i]);
+            Assert.Equal(expected.Count, read.Count);
+            for (int i = 0; i < expected.Count; i++)
+                AssertEntryEqual(expected[i], read[i]);
+        }
     }
 
     [Fact]
@@ -212,11 +217,11 @@ public class ManifestCodecTests : IDisposable
             DataFile = FullFile("a", 2) with { Partition = null },
         };
         Assert.Throws<ArgumentException>(() =>
-            ManifestCodec.EncodeManifest([noTuple], 2, types, new Dictionary<string, byte[]>()));
+            ManifestCodec.EncodeManifest([noTuple], 2, ManifestContent.Data, types, new Dictionary<string, byte[]>()));
 
         var tupleInUnpartitioned = noTuple with { DataFile = FullFile("a", 2) };
         Assert.Throws<ArgumentException>(() =>
-            ManifestCodec.EncodeManifest([tupleInUnpartitioned], 2, [], new Dictionary<string, byte[]>()));
+            ManifestCodec.EncodeManifest([tupleInUnpartitioned], 2, ManifestContent.Data, [], new Dictionary<string, byte[]>()));
     }
 
     [Fact]
@@ -225,7 +230,7 @@ public class ManifestCodecTests : IDisposable
         var types = PartitionTypes.Resolve(Spec, Table(2));
         var v3Only = new ManifestEntry { Status = ManifestEntryStatus.Added, SnapshotId = 1, DataFile = FullFile("a", 3) };
         Assert.Throws<ArgumentException>(() =>
-            ManifestCodec.EncodeManifest([v3Only], 2, types, new Dictionary<string, byte[]>()));
+            ManifestCodec.EncodeManifest([v3Only], 2, ManifestContent.Data, types, new Dictionary<string, byte[]>()));
 
         var delete = new ManifestEntry
         {
@@ -233,7 +238,7 @@ public class ManifestCodecTests : IDisposable
             DataFile = FullFile("a", 1) with { Content = FileContent.PositionDeletes },
         };
         Assert.Throws<ArgumentException>(() =>
-            ManifestCodec.EncodeManifest([delete], 1, types, new Dictionary<string, byte[]>()));
+            ManifestCodec.EncodeManifest([delete], 1, ManifestContent.Deletes, types, new Dictionary<string, byte[]>()));
     }
 
     // ---------------------------------------------------------------- other writers' layouts

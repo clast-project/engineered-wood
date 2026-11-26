@@ -682,7 +682,10 @@ manifest EW rewrote. Remaining gaps:
 - **Rewrites refuse what they can't keep.** A commit rewrites a manifest
   only if every field it holds is modelled. A manifest with a populated
   field this library doesn't know throws `NotSupportedException` instead
-  of losing that field.
+  of losing that field. The same goes for the manifest list a commit
+  carries forward. The two deliberate exceptions are the ones the spec
+  requires on a format upgrade: `block_size_in_bytes` isn't written past
+  v1, and `distinct_counts` isn't written in v3.
 - **No row-lineage assignment.** Commits to v3 tables don't assign
   `first_row_id` or advance `next-row-id` (Phase 2 of
   `doc/iceberg-v3-plan.md`). Rewritten entries carry the row ids they

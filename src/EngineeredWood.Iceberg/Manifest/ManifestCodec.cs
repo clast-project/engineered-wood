@@ -156,19 +156,21 @@ internal static class ManifestCodec
                 if (id is null)
                     throw Invalid(path, $"has partition field '{f.Name}' with no field-id and no partition spec to place it");
 
-                IcebergType? type = null;
+                // The Avro name may be escaped (an Iceberg name need not be a valid Avro name), so the spec,
+                // when at hand, gives the name as well as the type.
+                PartitionValueType? fromSpec = null;
                 if (spec is not null)
                 {
                     foreach (var s in spec)
                     {
                         if (s.FieldId == id)
-                            type = s.Type;
+                            fromSpec = s;
                     }
-                    if (type is null)
+                    if (fromSpec is null)
                         throw Invalid(path, $"has partition field {id}, which its partition spec does not have");
                 }
 
-                _fields[i] = new PartitionValueType(id.Value, f.Name, type ?? IcebergAvroTypes.InferType(f.Schema));
+                _fields[i] = fromSpec ?? new PartitionValueType(id.Value, f.Name, IcebergAvroTypes.InferType(f.Schema));
             }
         }
 
@@ -194,9 +196,10 @@ internal static class ManifestCodec
     /// version cannot carry, rather than dropping it.
     /// </summary>
     public static byte[] EncodeManifest(
-        IReadOnlyList<ManifestEntry> entries, int formatVersion, IReadOnlyList<PartitionValueType> partitionType,
-        IReadOnlyDictionary<string, byte[]> metadata)
+        IReadOnlyList<ManifestEntry> entries, int formatVersion, ManifestContent content,
+        IReadOnlyList<PartitionValueType> partitionType, IReadOnlyDictionary<string, byte[]> metadata)
     {
+        ValidateContent(entries, content);
         bool withDistinct = formatVersion <= 2 && entries.Any(e => e.DataFile.DistinctCounts is not null);
         var schema = S.ManifestEntry(formatVersion, partitionType, withDistinct);
         var dataFileSchema = (AvroRecordSchema)schema.Fields.Single(f => f.FieldId == S.DataFileId).Schema;
@@ -251,12 +254,38 @@ internal static class ManifestCodec
         return WriteOcf(schema, metadata, w, entries.Count);
     }
 
+    /// <summary>
+    /// A manifest holds data files or delete files, never both, and its header says which: readers choose
+    /// manifests by it.
+    /// </summary>
+    internal static void ValidateContent(IReadOnlyList<ManifestEntry> entries, ManifestContent content)
+    {
+        foreach (var entry in entries)
+        {
+            bool isData = entry.DataFile.Content == FileContent.Data;
+            if (isData != (content == ManifestContent.Data))
+                throw new ArgumentException(
+                    $"Entry for '{entry.DataFile.FilePath}' is {entry.DataFile.Content}, which a " +
+                    $"{(content == ManifestContent.Data ? "data" : "delete")} manifest cannot hold.");
+        }
+    }
+
+    /// <remarks>
+    /// Two values are left out on purpose, because the spec says to stop writing them once a table moves on:
+    /// <c>block_size_in_bytes</c> (v1 only, "do not write in v2 or v3") and <c>distinct_counts</c> (not
+    /// written in v3). Everything else a version cannot hold is refused.
+    /// </remarks>
     private static void Validate(ManifestEntry entry, int formatVersion)
     {
         var df = entry.DataFile;
         string where = $"Entry for '{df.FilePath}'";
         if (formatVersion == 1)
         {
+            // v1 has no sequence numbers: every file's is 0, which is what a v1 entry reads back as.
+            if (entry.SequenceNumber is not (null or 0) || entry.FileSequenceNumber is not (null or 0))
+                throw new ArgumentException(
+                    $"{where} has sequence number {entry.SequenceNumber}/{entry.FileSequenceNumber}, which format " +
+                    "version 1 cannot hold.");
             if (df.Content != FileContent.Data)
                 throw new ArgumentException($"{where} is a delete file, which format version 1 cannot hold.");
             if (entry.SnapshotId is null)

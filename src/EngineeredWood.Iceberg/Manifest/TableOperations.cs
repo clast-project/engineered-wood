@@ -76,7 +76,7 @@ public sealed class TableOperations
         var metadataDir = $"{current.Location}/metadata";
 
         var manifestListEntries = new List<ManifestListEntry>();
-        var deletedPaths = new HashSet<string>(filesToDelete.Select(f => f.FilePath));
+        var deletedPaths = new HashSet<string>(filesToDelete.Select(FileKey));
         var foundPaths = new HashSet<string>();
 
         // Read the current manifests and mark the entries of the files being deleted. Nothing is written
@@ -87,11 +87,12 @@ public sealed class TableOperations
             var currentSnapshot = current.Snapshots.First(
                 s => s.SnapshotId == current.CurrentSnapshotId);
 
-            foreach (var mle in await ReadManifestListAsync(current, currentSnapshot, ct).ConfigureAwait(false))
+            foreach (var mle in await ManifestIO.ReadSnapshotManifestListForRewriteAsync(_fs, current, currentSnapshot, ct)
+                         .ConfigureAwait(false))
             {
                 var decoded = await ManifestIO.ReadSnapshotManifestDecodedAsync(_fs, current, currentSnapshot, mle, ct)
                     .ConfigureAwait(false);
-                if (!decoded.Entries.Any(e => e.Status != ManifestEntryStatus.Deleted && deletedPaths.Contains(e.DataFile.FilePath)))
+                if (!decoded.Entries.Any(e => e.Status != ManifestEntryStatus.Deleted && deletedPaths.Contains(FileKey(e.DataFile))))
                 {
                     carried.Add((mle, null));
                     continue;
@@ -112,9 +113,9 @@ public sealed class TableOperations
                 {
                     if (entry.Status == ManifestEntryStatus.Deleted)
                         continue;
-                    if (deletedPaths.Contains(entry.DataFile.FilePath))
+                    if (deletedPaths.Contains(FileKey(entry.DataFile)))
                     {
-                        foundPaths.Add(entry.DataFile.FilePath);
+                        foundPaths.Add(FileKey(entry.DataFile));
                         filtered.Add(entry with { Status = ManifestEntryStatus.Deleted, SnapshotId = snapshotId });
                     }
                     else
@@ -130,7 +131,7 @@ public sealed class TableOperations
         // A file to delete that the table no longer holds means the overwrite was planned against a state
         // that has since changed (another writer removed or rewrote it). Committing anyway would record a
         // replacement for rows that are already gone, so refuse; retrying cannot help.
-        var missing = deletedPaths.Where(p => !foundPaths.Contains(p)).ToList();
+        var missing = deletedPaths.Where(p => !foundPaths.Contains(p)).Select(p => p.Replace(DvKeySeparator, " @ offset ")).ToList();
         if (missing.Count > 0)
             throw new CommitValidationException(
                 $"Cannot delete files the table does not contain: {string.Join(", ", missing.Take(5))}" +
@@ -146,8 +147,8 @@ public sealed class TableOperations
             }
 
             var rewrittenPath = $"{metadataDir}/{Guid.NewGuid():N}.avro";
-            var length = await ManifestIO.WriteManifestAsync(
-                    _fs, rewrittenPath, rewritten, ManifestWriteOptions.For(current, mle.PartitionSpecId, mle.Content), ct)
+            var options = ManifestWriteOptions.For(current, mle.PartitionSpecId, mle.Content) with { RewritesExistingManifest = true };
+            var length = await ManifestIO.WriteManifestAsync(_fs, rewrittenPath, rewritten, options, ct)
                 .ConfigureAwait(false);
             var live = rewritten.Where(e => e.Status != ManifestEntryStatus.Deleted).ToList();
             var gone = rewritten.Where(e => e.Status == ManifestEntryStatus.Deleted).ToList();
@@ -273,24 +274,20 @@ public sealed class TableOperations
         var sequenceNumber = current.LastSequenceNumber + 1;
         var metadataDir = $"{current.Location}/metadata";
 
-        // Write the new files' manifest
-        var newManifest = await WriteNewManifestAsync(
-            current, files, manifestContent, snapshotId, sequenceNumber, metadataDir, ct).ConfigureAwait(false);
-
-        // Build manifest list
+        // Read (and check) the manifests to carry forward before writing anything.
         var manifestListEntries = new List<ManifestListEntry>();
-
-        // Carry forward from current snapshot
         if (current.CurrentSnapshotId is not null)
         {
             var currentSnapshot = current.Snapshots.First(
                 s => s.SnapshotId == current.CurrentSnapshotId);
 
             manifestListEntries.AddRange(
-                await ReadManifestListAsync(current, currentSnapshot, ct).ConfigureAwait(false));
+                await ManifestIO.ReadSnapshotManifestListForRewriteAsync(_fs, current, currentSnapshot, ct).ConfigureAwait(false));
         }
 
-        manifestListEntries.Add(newManifest);
+        // Write the new files' manifest
+        manifestListEntries.Add(await WriteNewManifestAsync(
+            current, files, manifestContent, snapshotId, sequenceNumber, metadataDir, ct).ConfigureAwait(false));
 
         // Write manifest list
         var manifestListPath = $"{metadataDir}/snap-{snapshotId}.avro";
@@ -445,6 +442,17 @@ public sealed class TableOperations
     }
 
     private static long GenerateSnapshotId() => SnapshotIdFactory.Generate();
+
+    private const string DvKeySeparator = "\u0000";
+
+    /// <summary>
+    /// How a commit names a file to remove. Several deletion vectors can share one Puffin file, each at its
+    /// own offset, so a DV is its path and content offset; any other file is its path.
+    /// </summary>
+    private static string FileKey(DataFile file) =>
+        file.ContentOffset is { } offset
+            ? file.FilePath + DvKeySeparator + offset.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            : file.FilePath;
 
     /// <summary>
     /// A reader must accept a partition spec with a transform it does not know, but the spec forbids

@@ -60,7 +60,12 @@ internal static class PartitionTypes
     /// <summary>A single-argument transform's result type for a source of type <paramref name="source"/>.</summary>
     public static IcebergType ResultType(Transform transform, IcebergType source) => transform switch
     {
-        IdentityTransform or TruncateTransform or VoidTransform => source,
+        IdentityTransform or TruncateTransform => source,
+        // A void field is always null, and the spec lets its type be the source's or int. Use int where the
+        // source type has no manifest encoding (variant, geometry, geography, unknown).
+        VoidTransform => source is VariantType or GeometryType or GeographyType or UnknownType or NestedType
+            ? IcebergType.Int
+            : source,
         BucketTransform or YearTransform or MonthTransform or HourTransform => IcebergType.Int,
         DayTransform => IcebergType.Date,
         _ => throw new NotSupportedException($"Transform '{TransformName(transform)}' has no known result type."),

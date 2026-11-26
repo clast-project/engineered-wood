@@ -59,10 +59,12 @@ public static class ManifestIO
         if (IsAvro(path))
         {
             data = ManifestCodec.EncodeManifest(
-                entries, options.FormatVersion, options.ResolvePartitionType(entries), options.HeaderMetadata());
+                entries, options.FormatVersion, options.Content, options.ResolvePartitionType(entries),
+                options.HeaderMetadata());
         }
         else
         {
+            ManifestCodec.ValidateContent(entries, options.Content);
             if (entries.Any(e => e.DataFile.Partition is { Values.Count: > 0 }))
                 throw new NotSupportedException(
                     $"Cannot write '{path}': the JSON manifest format does not hold partition values. Use an .avro path.");
@@ -145,6 +147,39 @@ public static class ManifestIO
                 "the table's metadata references a missing file.",
                 snapshot.ManifestList);
         return await ReadManifestListAsync(fs, snapshot.ManifestList, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reads a snapshot's manifest list for a commit that will write it out again. On top of
+    /// <see cref="ReadSnapshotManifestListAsync"/>'s checks, refuses a list holding a field this library does not
+    /// model (rewriting the list would drop it) or an encrypted manifest (carrying it into a list this library
+    /// writes would put a plaintext list over encrypted data).
+    /// </summary>
+    internal static async ValueTask<List<ManifestListEntry>> ReadSnapshotManifestListForRewriteAsync(
+        ITableFileSystem fs, TableMetadata metadata, Snapshot snapshot, CancellationToken ct)
+    {
+        metadata.ThrowIfDataInaccessible(snapshot);
+        if (!await fs.ExistsAsync(snapshot.ManifestList, ct).ConfigureAwait(false))
+            throw new FileNotFoundException(
+                $"Snapshot {snapshot.SnapshotId}'s manifest list '{snapshot.ManifestList}' does not exist; " +
+                "the table's metadata references a missing file.",
+                snapshot.ManifestList);
+
+        var data = await fs.ReadAllBytesAsync(snapshot.ManifestList, ct).ConfigureAwait(false);
+        if (!IsAvro(snapshot.ManifestList))
+            return JsonSerializer.Deserialize(data, JsonOptions.TypeInfo<List<ManifestListEntry>>())
+                ?? throw new InvalidOperationException($"Failed to read manifest list: {snapshot.ManifestList}");
+
+        var decoded = ManifestCodec.DecodeManifestList(data, snapshot.ManifestList);
+        if (decoded.UnmodelledFields.Count > 0)
+            throw new NotSupportedException(
+                $"Cannot rewrite manifest list '{snapshot.ManifestList}': it holds fields this library does not " +
+                $"model ({string.Join(", ", decoded.UnmodelledFields)}), and the next snapshot's list would drop them.");
+        if (decoded.Entries.FirstOrDefault(e => e.KeyMetadata is not null) is { } encrypted)
+            throw new UnsupportedTableFeatureException(
+                $"Manifest '{encrypted.ManifestPath}' of snapshot {snapshot.SnapshotId} is encrypted (it has key " +
+                "metadata); table encryption is not supported, so the table cannot be written.");
+        return decoded.Entries;
     }
 
     /// <summary>
@@ -241,20 +276,43 @@ public sealed record ManifestWriteOptions
     {
         var spec = table.PartitionSpecs.FirstOrDefault(s => s.SpecId == specId)
             ?? throw new ArgumentException($"Table has no partition spec {specId}.", nameof(specId));
+
+        // The header's schema must be one the spec binds to: readers rebuild the spec from the header's
+        // schema and partition-spec. For an old spec whose source column has since been dropped that is not
+        // the current schema, so take the newest schema that still has every source field.
+        var candidates = table.Schemas.Where(s => s.SchemaId == table.CurrentSchemaId)
+            .Concat(table.Schemas.Where(s => s.SchemaId != table.CurrentSchemaId).Reverse())
+            .ToList();
+        var header = candidates.FirstOrDefault(s => PartitionTypes.TryResolve(spec, [s], out _, out _)) ?? candidates[0];
         return new ManifestWriteOptions
         {
             FormatVersion = table.FormatVersion,
             PartitionSpec = spec,
-            Schema = table.Schemas.First(s => s.SchemaId == table.CurrentSchemaId),
+            Schema = header,
             Content = content,
-            OtherSchemas = table.Schemas.Where(s => s.SchemaId != table.CurrentSchemaId).Reverse().ToList(),
+            OtherSchemas = candidates.Where(s => !ReferenceEquals(s, header)).ToList(),
         };
     }
+
+    /// <summary>
+    /// Set for a rewrite of an existing manifest: then a spec this library cannot type itself (an unknown
+    /// transform) is typed from the entries' own tuples, which the manifest already holds. New files may not
+    /// be written under such a spec.
+    /// </summary>
+    internal bool RewritesExistingManifest { get; init; }
 
     internal IReadOnlyList<PartitionValueType> ResolvePartitionType(IReadOnlyList<ManifestEntry> entries)
     {
         if (PartitionSpec.Fields.Count == 0)
             return [];
+
+        if (!RewritesExistingManifest
+            && PartitionSpec.Fields.FirstOrDefault(f => f.Transform is UnknownTransform || f.SourceIds is { Count: > 1 }) is { } unknown)
+        {
+            throw new NotSupportedException(
+                $"Cannot write new files under partition spec {PartitionSpec.SpecId}: field '{unknown.Name}' has a " +
+                "transform this library does not know, and the spec forbids committing files under one.");
+        }
 
         string? reason = "no table schema was given";
         if (Schema is not null)
