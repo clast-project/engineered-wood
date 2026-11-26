@@ -28,10 +28,14 @@ public abstract record Transform
     public static readonly Transform Void = new VoidTransform();
 
     /// <summary>Creates a bucket transform that hashes values into the specified number of buckets.</summary>
-    public static BucketTransform Bucket(int numBuckets) => new(numBuckets);
+    public static BucketTransform Bucket(int numBuckets) => numBuckets > 0
+        ? new(numBuckets)
+        : throw new ArgumentOutOfRangeException(nameof(numBuckets), numBuckets, "The number of buckets must be positive.");
 
     /// <summary>Creates a truncate transform that truncates values to the specified width.</summary>
-    public static TruncateTransform Truncate(int width) => new(width);
+    public static TruncateTransform Truncate(int width) => width > 0
+        ? new(width)
+        : throw new ArgumentOutOfRangeException(nameof(width), width, "The truncate width must be positive.");
 }
 
 /// <summary>Returns the source value unchanged.</summary>
