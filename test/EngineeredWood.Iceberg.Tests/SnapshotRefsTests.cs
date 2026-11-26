@@ -228,7 +228,8 @@ public class SnapshotRefsTests : IDisposable
     [Fact]
     public async Task SyncMainBranch_CreatesMainRef()
     {
-        var metadata = await CreateTableWithSnapshotsAsync(1);
+        // Commits keep main in step now, so take it away to have something to sync.
+        var metadata = (await CreateTableWithSnapshotsAsync(1)) with { Refs = new Dictionary<string, SnapshotRef>() };
         Assert.False(metadata.Refs.ContainsKey("main"));
 
         var synced = SnapshotRefs.SyncMainBranch(metadata);
@@ -249,11 +250,12 @@ public class SnapshotRefsTests : IDisposable
             new DataFile { FilePath = "data/new.parquet", RecordCount = 50, FileSizeInBytes = 2500 }
         ]);
 
-        // main ref still points to snap1
-        Assert.Equal(snap1, metadata.Refs["main"].SnapshotId);
+        // The append moved main with current-snapshot-id
+        Assert.Equal(metadata.CurrentSnapshotId, metadata.Refs["main"].SnapshotId);
 
-        // Sync fixes it
-        var synced = SnapshotRefs.SyncMainBranch(metadata);
+        // A main left behind (as an older commit path did) is moved by Sync
+        var stale = metadata with { Refs = new Dictionary<string, SnapshotRef> { ["main"] = SnapshotRef.Branch(snap1) } };
+        var synced = SnapshotRefs.SyncMainBranch(stale);
         Assert.Equal(metadata.CurrentSnapshotId, synced.Refs["main"].SnapshotId);
     }
 

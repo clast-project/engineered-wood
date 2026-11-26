@@ -77,7 +77,7 @@ public sealed class TableScan
 
         foreach (var mle in manifestList)
         {
-            var entries = await ManifestIO.ReadSnapshotManifestAsync(_fs, snapshot, mle, ct)
+            var entries = await ManifestIO.ReadSnapshotManifestAsync(_fs, effectiveMetadata, snapshot, mle, ct)
                 .ConfigureAwait(false);
 
             foreach (var entry in entries)

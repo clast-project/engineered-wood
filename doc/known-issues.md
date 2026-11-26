@@ -664,14 +664,29 @@ only raise the reader bar; EW detects column mapping from
 
 ## Iceberg
 
-**EW can operate only on tables whose metadata it wrote itself.** Reading
-any Avro manifest or manifest list whose writer schema differs from EW's
-own (compared in Avro Parsing Canonical Form) throws
-`NotSupportedException` (#775). That covers manifests from Iceberg Java,
-Spark and pyiceberg, V1 manifests, and partitioned manifests. The refusal
-also stops a commit from rewriting a foreign manifest and dropping its
-metadata. See
-[#586](https://github.com/clast-project/engineered-wood/issues/586).
+**Manifests.** The codec decodes every manifest and manifest list by field
+id against the file's own writer schema, so it reads any writer's manifests,
+v1 to v3 (#586). It checks itself against iceberg-go in both directions:
+EW's reading of iceberg-go's manifests, and iceberg-go's reading of a
+manifest EW rewrote. Remaining gaps:
+
+- **Bounds stay raw.** `DataFile.LowerBounds`/`UpperBounds` hold the
+  Appendix D bytes, which are carried through a rewrite unchanged.
+  `ColumnLowerBounds`/`ColumnUpperBounds`, which scan planning prunes on,
+  are not filled from a manifest until the value codecs land (#953 item 5).
+- **No partition summaries yet.** A partitioned manifest EW writes gets
+  `partitions = null` in the manifest list, which readers treat as unknown:
+  they can't skip the manifest by partition, but they never skip it wrongly.
+  Summary bounds are Appendix D values too. Foreign summaries are carried
+  through unchanged.
+- **Rewrites refuse what they can't keep.** A commit rewrites a manifest
+  only if every field it holds is modelled. A manifest with a populated
+  field this library doesn't know throws `NotSupportedException` instead
+  of losing that field.
+- **No row-lineage assignment.** Commits to v3 tables don't assign
+  `first_row_id` or advance `next-row-id` (Phase 2 of
+  `doc/iceberg-v3-plan.md`). Rewritten entries carry the row ids they
+  inherited.
 
 ### Missing features
 
@@ -686,9 +701,6 @@ produce position or equality deletes.
 **Partition transforms.** `Transform.cs` declares `Identity`, `Void`,
 `Bucket`, `Truncate`, `Year`, `Month`, `Day` and `Hour`, but none can be
 applied to a value, so partition values cannot be derived from data.
-
-**V1 manifests.** Only the V2 manifest schema exists
-(`ManifestAvroSchemas.cs`); V1 manifests can be neither read nor written.
 
 **Puffin files.** Statistics and V3 deletion-vector sidecars are not
 implemented.
@@ -709,8 +721,9 @@ reorder, nested add, or `FIRST`/`AFTER`. No format-version upgrade.
 
 **Views, materialized views, manifest compaction.** Not implemented.
 
-**Table encryption.** `key_metadata` is always written null; no KMS
-plumbing.
+**Table encryption.** Not implemented. A table with `encryption-keys`, a
+snapshot with `key-id`, a manifest or data file with `key_metadata` are
+refused (`UnsupportedTableFeatureException`) by scans and commits.
 
 ### Commits
 

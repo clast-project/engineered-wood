@@ -160,13 +160,13 @@ with schema fingerprints and a `SchemaStore`. Codecs: null, deflate, snappy, zst
 - **Vortex:** reads and writes Vortex files, cross-validated against Rust `vortex-array` 0.86 in both
   directions. Supports projection, row-range slices and zone-stat pruning. Coverage is in
   [doc/vortex.md](https://github.com/clast-project/engineered-wood/blob/main/doc/vortex.md).
-- **Iceberg:** parses table metadata (v1–v3), reads and writes manifests, and plans scans with predicate
-  pruning. It refuses (`NotSupportedException`) any manifest it didn't write itself rather than misreading
-  it, so for now scans work only on tables EngineeredWood wrote. The manifests it writes lack bounds and
-  partition tuples, and partition transforms can't yet be applied to values. **Do not use it to write
-  tables other engines will read.** Table metadata round-trips without loss, including properties it
-  doesn't model. It refuses (`UnsupportedTableFeatureException`) `format-version` 4 or later, and won't read
-  or write the data of an encrypted table.
+- **Iceberg:** parses table metadata (v1–v3) and plans scans with predicate pruning. It reads manifests
+  from any writer and any format version by field id, and writes the spec's manifest schema for the
+  table's version, with typed partition tuples. Both directions are checked against iceberg-go. Column
+  bounds stay raw bytes until the value codecs land, and partition transforms can't yet be applied to
+  values. **Do not use it to write tables other engines will read.** Table metadata round-trips without
+  loss, including properties it doesn't model. It refuses (`UnsupportedTableFeatureException`)
+  `format-version` 4 or later, and won't read or write the data of an encrypted table.
 
 ## Usage
 

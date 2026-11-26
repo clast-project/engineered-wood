@@ -87,26 +87,41 @@ public sealed class TableOperations
 
             foreach (var mle in await ReadManifestListAsync(current, currentSnapshot, ct).ConfigureAwait(false))
             {
-                var entries = await ReadManifestAsync(currentSnapshot, mle, ct).ConfigureAwait(false);
-                var rewritten = false;
-                var filtered = new List<ManifestEntry>(entries.Count);
-
-                foreach (var entry in entries)
+                var decoded = await ManifestIO.ReadSnapshotManifestDecodedAsync(_fs, current, currentSnapshot, mle, ct)
+                    .ConfigureAwait(false);
+                if (!decoded.Entries.Any(e => e.Status != ManifestEntryStatus.Deleted && deletedPaths.Contains(e.DataFile.FilePath)))
                 {
-                    if (entry.Status != ManifestEntryStatus.Deleted &&
-                        deletedPaths.Contains(entry.DataFile.FilePath))
+                    carried.Add((mle, null));
+                    continue;
+                }
+
+                // This manifest must be rewritten. Do so only if every field it holds survives: a field the
+                // codec does not model would be silently dropped from another engine's metadata.
+                if (decoded.UnmodelledFields.Count > 0)
+                    throw new NotSupportedException(
+                        $"Cannot rewrite manifest '{mle.ManifestPath}': it holds fields this library does not " +
+                        $"model ({string.Join(", ", decoded.UnmodelledFields)}), and rewriting it would drop them.");
+
+                // Entries move to a manifest of a new snapshot, so they can no longer inherit: every inherited
+                // value is written out, ADDED entries become EXISTING, and entries this manifest already marked
+                // DELETED (informational only, for their own snapshot) are not carried.
+                var filtered = new List<ManifestEntry>(decoded.Entries.Count);
+                foreach (var entry in ManifestCodec.Inherit(decoded, mle))
+                {
+                    if (entry.Status == ManifestEntryStatus.Deleted)
+                        continue;
+                    if (deletedPaths.Contains(entry.DataFile.FilePath))
                     {
                         foundPaths.Add(entry.DataFile.FilePath);
                         filtered.Add(entry with { Status = ManifestEntryStatus.Deleted, SnapshotId = snapshotId });
-                        rewritten = true;
                     }
                     else
                     {
-                        filtered.Add(entry);
+                        filtered.Add(entry with { Status = ManifestEntryStatus.Existing });
                     }
                 }
 
-                carried.Add((mle, rewritten ? filtered : null));
+                carried.Add((mle, filtered));
             }
         }
 
@@ -129,49 +144,40 @@ public sealed class TableOperations
             }
 
             var rewrittenPath = $"{metadataDir}/{Guid.NewGuid():N}.avro";
-            var length = await ManifestIO.WriteManifestAsync(_fs, rewrittenPath, rewritten, ct)
+            var length = await ManifestIO.WriteManifestAsync(
+                    _fs, rewrittenPath, rewritten, ManifestWriteOptions.For(current, mle.PartitionSpecId, mle.Content), ct)
                 .ConfigureAwait(false);
+            var live = rewritten.Where(e => e.Status != ManifestEntryStatus.Deleted).ToList();
+            var gone = rewritten.Where(e => e.Status == ManifestEntryStatus.Deleted).ToList();
             manifestListEntries.Add(mle with
             {
                 ManifestPath = rewrittenPath,
                 ManifestLength = length,
-                DeletedDataFilesCount = mle.DeletedDataFilesCount + rewritten.Count(e => e.Status == ManifestEntryStatus.Deleted),
+                SequenceNumber = sequenceNumber,
+                MinSequenceNumber = live.Count > 0 ? live.Min(e => e.SequenceNumber ?? sequenceNumber) : sequenceNumber,
+                AddedSnapshotId = snapshotId,
+                AddedDataFilesCount = 0,
+                ExistingDataFilesCount = live.Count,
+                DeletedDataFilesCount = gone.Count,
+                AddedRowsCount = 0,
+                ExistingRowsCount = live.Sum(e => e.DataFile.RecordCount),
+                DeletedRowsCount = gone.Sum(e => e.DataFile.RecordCount),
+                // Every entry now carries its first_row_id, so nothing inherits one. The partition summaries
+                // still bound what is left, so they are kept.
+                FirstRowId = null,
             });
         }
 
         // Write new files manifest
         if (filesToAdd.Count > 0)
         {
-            var newEntries = filesToAdd.Select(f => new ManifestEntry
-            {
-                Status = ManifestEntryStatus.Added,
-                SnapshotId = snapshotId,
-                SequenceNumber = sequenceNumber,
-                FileSequenceNumber = sequenceNumber,
-                DataFile = f,
-            }).ToList();
-
-            var manifestPath = $"{metadataDir}/{Guid.NewGuid():N}.avro";
-            var manifestLength = await ManifestIO.WriteManifestAsync(_fs, manifestPath, newEntries, ct)
-                .ConfigureAwait(false);
-
-            manifestListEntries.Add(new ManifestListEntry
-            {
-                ManifestPath = manifestPath,
-                ManifestLength = manifestLength,
-                PartitionSpecId = current.DefaultSpecId,
-                Content = ManifestContent.Data,
-                SequenceNumber = sequenceNumber,
-                MinSequenceNumber = sequenceNumber,
-                AddedSnapshotId = snapshotId,
-                AddedDataFilesCount = filesToAdd.Count,
-                AddedRowsCount = filesToAdd.Sum(f => f.RecordCount),
-            });
+            manifestListEntries.Add(await WriteNewManifestAsync(
+                current, filesToAdd, ManifestContent.Data, snapshotId, sequenceNumber, metadataDir, ct).ConfigureAwait(false));
         }
 
         // Write manifest list
         var manifestListPath = $"{metadataDir}/snap-{snapshotId}.avro";
-        await ManifestIO.WriteManifestListAsync(_fs, manifestListPath, manifestListEntries, ct)
+        await WriteManifestListAsync(current, manifestListPath, manifestListEntries, snapshotId, sequenceNumber, ct)
             .ConfigureAwait(false);
 
         var deletedRecords = filesToDelete.Sum(f => f.RecordCount);
@@ -200,14 +206,16 @@ public sealed class TableOperations
         var snapshotLog = current.SnapshotLog.ToList();
         snapshotLog.Add(new SnapshotLogEntry(now, snapshotId));
 
-        return current with
+        // "There is always a main branch reference pointing to the current-snapshot-id": moving one without
+        // the other leaves metadata other readers reject.
+        return SnapshotRefs.SyncMainBranch(current with
         {
             LastSequenceNumber = sequenceNumber,
             LastUpdatedMs = now,
             CurrentSnapshotId = snapshotId,
             Snapshots = snapshots,
             SnapshotLog = snapshotLog,
-        };
+        });
     }
 
     /// <summary>
@@ -261,20 +269,9 @@ public sealed class TableOperations
         var sequenceNumber = current.LastSequenceNumber + 1;
         var metadataDir = $"{current.Location}/metadata";
 
-        // Create manifest entries
-        var entries = files.Select(f => new ManifestEntry
-        {
-            Status = ManifestEntryStatus.Added,
-            SnapshotId = snapshotId,
-            SequenceNumber = sequenceNumber,
-            FileSequenceNumber = sequenceNumber,
-            DataFile = f,
-        }).ToList();
-
-        // Write manifest
-        var manifestPath = $"{metadataDir}/{Guid.NewGuid():N}.avro";
-        var manifestLength = await ManifestIO.WriteManifestAsync(_fs, manifestPath, entries, ct)
-            .ConfigureAwait(false);
+        // Write the new files' manifest
+        var newManifest = await WriteNewManifestAsync(
+            current, files, manifestContent, snapshotId, sequenceNumber, metadataDir, ct).ConfigureAwait(false);
 
         // Build manifest list
         var manifestListEntries = new List<ManifestListEntry>();
@@ -289,23 +286,11 @@ public sealed class TableOperations
                 await ReadManifestListAsync(current, currentSnapshot, ct).ConfigureAwait(false));
         }
 
-        manifestListEntries.Add(new ManifestListEntry
-        {
-            ManifestPath = manifestPath,
-            ManifestLength = manifestLength,
-            PartitionSpecId = current.DefaultSpecId,
-            Content = manifestContent,
-            SequenceNumber = sequenceNumber,
-            MinSequenceNumber = sequenceNumber,
-            AddedSnapshotId = snapshotId,
-            AddedDataFilesCount = manifestContent == ManifestContent.Data ? files.Count : 0,
-            DeletedDataFilesCount = manifestContent == ManifestContent.Deletes ? files.Count : 0,
-            AddedRowsCount = files.Sum(f => f.RecordCount),
-        });
+        manifestListEntries.Add(newManifest);
 
         // Write manifest list
         var manifestListPath = $"{metadataDir}/snap-{snapshotId}.avro";
-        await ManifestIO.WriteManifestListAsync(_fs, manifestListPath, manifestListEntries, ct)
+        await WriteManifestListAsync(current, manifestListPath, manifestListEntries, snapshotId, sequenceNumber, ct)
             .ConfigureAwait(false);
 
         // Build summary
@@ -343,14 +328,16 @@ public sealed class TableOperations
         var snapshotLog = current.SnapshotLog.ToList();
         snapshotLog.Add(new SnapshotLogEntry(now, snapshotId));
 
-        return current with
+        // "There is always a main branch reference pointing to the current-snapshot-id": moving one without
+        // the other leaves metadata other readers reject.
+        return SnapshotRefs.SyncMainBranch(current with
         {
             LastSequenceNumber = sequenceNumber,
             LastUpdatedMs = now,
             CurrentSnapshotId = snapshotId,
             Snapshots = snapshots,
             SnapshotLog = snapshotLog,
-        };
+        });
     }
 
     private async ValueTask<IReadOnlyList<DataFile>> ListFilesByContentAsync(
@@ -367,7 +354,7 @@ public sealed class TableOperations
 
         foreach (var mle in manifestList)
         {
-            var entries = await ReadManifestAsync(snapshot, mle, ct).ConfigureAwait(false);
+            var entries = await ReadManifestAsync(metadata, snapshot, mle, ct).ConfigureAwait(false);
             foreach (var entry in entries)
             {
                 if (entry.Status != ManifestEntryStatus.Deleted && entry.DataFile.Content == contentType)
@@ -383,8 +370,62 @@ public sealed class TableOperations
         ManifestIO.ReadSnapshotManifestListAsync(_fs, metadata, snapshot, ct);
 
     private ValueTask<List<ManifestEntry>> ReadManifestAsync(
-        Snapshot snapshot, ManifestListEntry manifest, CancellationToken ct) =>
-        ManifestIO.ReadSnapshotManifestAsync(_fs, snapshot, manifest, ct);
+        TableMetadata metadata, Snapshot snapshot, ManifestListEntry manifest, CancellationToken ct) =>
+        ManifestIO.ReadSnapshotManifestAsync(_fs, metadata, snapshot, manifest, ct);
+
+    /// <summary>
+    /// Writes a manifest of new files in the table's default spec, and returns its manifest-list entry. The
+    /// entries are ADDED with their sequence numbers left to inheritance, as Iceberg writers do, so they take
+    /// the sequence number of the snapshot that commits them.
+    /// </summary>
+    private async ValueTask<ManifestListEntry> WriteNewManifestAsync(
+        TableMetadata current, IReadOnlyList<DataFile> files, ManifestContent content,
+        long snapshotId, long sequenceNumber, string metadataDir, CancellationToken ct)
+    {
+        var entries = files.Select(f => new ManifestEntry
+        {
+            Status = ManifestEntryStatus.Added,
+            SnapshotId = snapshotId,
+            DataFile = f,
+        }).ToList();
+
+        var options = ManifestWriteOptions.For(current, current.DefaultSpecId, content);
+        var manifestPath = $"{metadataDir}/{Guid.NewGuid():N}.avro";
+        var manifestLength = await ManifestIO.WriteManifestAsync(_fs, manifestPath, entries, options, ct)
+            .ConfigureAwait(false);
+
+        return new ManifestListEntry
+        {
+            ManifestPath = manifestPath,
+            ManifestLength = manifestLength,
+            PartitionSpecId = current.DefaultSpecId,
+            Content = content,
+            SequenceNumber = sequenceNumber,
+            MinSequenceNumber = sequenceNumber,
+            AddedSnapshotId = snapshotId,
+            AddedDataFilesCount = files.Count,
+            ExistingDataFilesCount = 0,
+            DeletedDataFilesCount = 0,
+            AddedRowsCount = files.Sum(f => f.RecordCount),
+            ExistingRowsCount = 0,
+            DeletedRowsCount = 0,
+            Partitions = PartitionSummaries.Build(options.ResolvePartitionType(entries), files, encodeBound: null),
+        };
+    }
+
+    private async ValueTask WriteManifestListAsync(
+        TableMetadata current, string path, IReadOnlyList<ManifestListEntry> entries,
+        long snapshotId, long sequenceNumber, CancellationToken ct)
+    {
+        var options = new ManifestListWriteOptions
+        {
+            FormatVersion = current.FormatVersion,
+            SnapshotId = snapshotId,
+            ParentSnapshotId = current.CurrentSnapshotId,
+            SequenceNumber = sequenceNumber,
+        };
+        await ManifestIO.WriteManifestListAsync(_fs, path, entries, options, ct).ConfigureAwait(false);
+    }
 
     private static long CurrentTotalRecords(TableMetadata metadata)
     {
