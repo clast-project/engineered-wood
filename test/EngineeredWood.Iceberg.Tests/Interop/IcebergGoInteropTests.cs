@@ -241,6 +241,46 @@ public sealed class IcebergGoInteropTests : IDisposable
         Assert.Equal([3L, 4, 5, 6, 8, 9, 50], Scan(appended, rowLineage: false).Select(r => r["id"].GetInt64()).OrderBy(x => x));
     }
 
+    /// <summary>Longs above 2^53 reach the table exactly. The driver used to decode its arguments into
+    /// float64, which rounds 2^53 + 1 to 2^53 and a present-day nanosecond timestamp (~1.7e18) to a
+    /// multiple of 256.</summary>
+    [SkippableFact]
+    public void IcebergGo_AppendAndDeleteKeepLongsAbove2Pow53()
+    {
+        IcebergGo.Require();
+        string metadata = IcebergGo.Scenario(_warehouse, "v3_dv");
+        string adopter = Path.Combine(_warehouse, "adopter");
+        const long big = (1L << 53) + 1;
+        const long nanos = 1_700_000_000_000_000_123;
+
+        string appended = IcebergGo.Invoke("append", new
+        {
+            warehouse = adopter,
+            metadata_location = metadata,
+            rows = new object[]
+            {
+                new { id = big, name = "big", ts = nanos, score = 1 },
+                new { id = big - 1, name = "neighbour", ts = nanos, score = 1 },
+            },
+        }).GetProperty("metadata_location").GetString()!;
+
+        var row = Assert.Single(Scan(appended, rowLineage: false), r => r["name"].GetString() == "big");
+        Assert.Equal(big, row["id"].GetInt64());
+        Assert.Equal(nanos, row["ts"].GetInt64());
+
+        // Deleting 2^53 + 1 must leave 2^53, which a float64 cannot tell apart from it.
+        string deleted = IcebergGo.Invoke("delete", new
+        {
+            warehouse = adopter,
+            metadata_location = appended,
+            column = "id",
+            values = new[] { big },
+        }).GetProperty("metadata_location").GetString()!;
+        var ids = Scan(deleted, rowLineage: false).Select(r => r["id"].GetInt64()).ToList();
+        Assert.DoesNotContain(big, ids);
+        Assert.Contains(big - 1, ids);
+    }
+
     // --- helpers ---
 
     /// <summary>

@@ -20,6 +20,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -84,8 +85,13 @@ func run(command, argsFile string) (res result) {
 	if err != nil {
 		return fail(err)
 	}
+	// UseNumber: a float64 holds integers exactly only up to 2^53, and Iceberg longs routinely exceed
+	// that (a nanosecond timestamp today is ~1.7e18). json.Number keeps the literal, which re-marshals
+	// unchanged for append and parses exactly for delete.
 	var args map[string]any
-	if err := json.Unmarshal(raw, &args); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&args); err != nil {
 		return fail(fmt.Errorf("parse args: %w", err))
 	}
 
@@ -774,11 +780,13 @@ func deleteRows(args map[string]any) (result, error) {
 	}
 	values := make([]int64, len(raw))
 	for i, v := range raw {
-		f, ok := v.(float64)
+		n, ok := v.(json.Number)
 		if !ok {
 			return nil, fmt.Errorf("value %v is not a number", v)
 		}
-		values[i] = int64(f)
+		if values[i], err = n.Int64(); err != nil {
+			return nil, fmt.Errorf("value %v is not a 64-bit integer: %w", v, err)
+		}
 	}
 	next, err := tbl.Delete(ctx, iceberg.IsIn(iceberg.Reference(column), values...), nil)
 	if err != nil {
