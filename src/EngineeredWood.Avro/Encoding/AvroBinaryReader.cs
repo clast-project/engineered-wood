@@ -104,28 +104,29 @@ internal ref struct AvroBinaryReader
             case AvroPrimitiveSchema { Type: AvroType.Null }:
                 break;
             case AvroPrimitiveSchema { Type: AvroType.Boolean }:
-                _pos++;
+                Advance(1);
                 break;
             case AvroPrimitiveSchema { Type: AvroType.Int or AvroType.Long }:
                 Varint.ReadSigned(_data, ref _pos);
                 break;
             case AvroPrimitiveSchema { Type: AvroType.Float }:
-                _pos += 4;
+                Advance(4);
                 break;
             case AvroPrimitiveSchema { Type: AvroType.Double }:
-                _pos += 8;
+                Advance(8);
                 break;
             case AvroPrimitiveSchema { Type: AvroType.Bytes or AvroType.String }:
                 ReadBytes();
                 break;
             case AvroFixedSchema f:
-                _pos += f.Size;
+                Advance(f.Size);
                 break;
             case AvroEnumSchema:
                 Varint.ReadSigned(_data, ref _pos);
                 break;
             case AvroRecordSchema r:
-                foreach (var field in r.Fields)
+                // A recursive reference has no fields of its own; its values are its definition's.
+                foreach (var field in (r.Definition ?? r).Fields)
                     Skip(field.Schema);
                 break;
             case AvroArraySchema a:
@@ -141,6 +142,19 @@ internal ref struct AvroBinaryReader
             default:
                 throw new InvalidOperationException($"Cannot skip unknown schema type: {schema.Type}");
         }
+    }
+
+    /// <summary>
+    /// Moves past <paramref name="count"/> bytes that are skipped, not read. Reading checks its bounds through the
+    /// span, but a bare advance did not, so a block that ended inside a skipped fixed-width value read on as if
+    /// the bytes were there.
+    /// </summary>
+    private void Advance(int count)
+    {
+        if (count > _data.Length - _pos)
+            throw new InvalidDataException(
+                $"Avro data ends inside a value: {count} bytes needed at offset {_pos}, {_data.Length - _pos} left.");
+        _pos += count;
     }
 
     private void SkipArray(AvroSchemaNode items)

@@ -224,4 +224,132 @@ public class EmptyRecordTests
         using (var file = Ocf(onlyEmpty, [], [], []))
             Assert.Equal(3, FastavroOracle.Read(file).Records!.Value.GetArrayLength());
     }
+
+    // ─── Review round 1 ───
+
+    /// <summary>
+    /// A reference to a record from inside its own definition is parsed as a stand-in with no fields. Stripping
+    /// took it for an empty record and dropped <c>B.a</c>, whose values are whole records on the wire.
+    /// </summary>
+    private const string Recursive = """
+        {"type": "record", "name": "A", "fields": [
+          {"name": "value", "type": "int"},
+          {"name": "next", "type": ["null", {"type": "record", "name": "B", "fields": [
+            {"name": "x", "type": "int"}, {"name": "a", "type": "A"}
+          ]}]}
+        ]}
+        """;
+
+    [Fact]
+    public void ARecursiveReference_IsRefusedAsRecursion_NotStripped()
+    {
+        var e = Assert.Throws<NotSupportedException>(() => new AvroSchema(Recursive).ToArrowSchema());
+        Assert.Contains("'A' refers to itself", e.Message);
+    }
+
+    // A(value:int, next:[null, A]): value=1 then next = A(value=2, next=null); then value=3, next=null.
+    private const string LinkedList = """
+        {"type": "record", "name": "A", "fields": [{"name": "value", "type": "int"}, {"name": "next", "type": ["null", "A"]}]}
+        """;
+    private static readonly byte[][] LinkedListRecords = [[0x02, 0x02, 0x04, 0x00], [0x06, 0x00]];
+
+    /// <summary>
+    /// Pre-existing: skipping a recursive field skipped the stand-in's (zero) fields, not the record it stands
+    /// for, so the second row read the first row's nested value and came back as 1, 2.
+    /// </summary>
+    [Fact]
+    public void ProjectingAwayARecursiveField_SkipsWholeRecords()
+    {
+        using var file = Ocf(LinkedList, LinkedListRecords);
+        using var reader = new AvroReaderBuilder().WithProjection("value").Build(file);
+        Assert.Equal([1, 3], Ints(reader.ReadNextBatch()!.Column("value")));
+    }
+
+    [SkippableFact]
+    public void Fastavro_ReadsTheLinkedListTheSameWay()
+    {
+        Skip.IfNot(FastavroOracle.IsAvailable, "fastavro is not installed.");
+        using var file = Ocf(LinkedList, LinkedListRecords);
+        var rows = FastavroOracle.Read(file).Records!.Value;
+        Assert.Equal([1, 3], rows.EnumerateArray().Select(r => (int?)r.GetProperty("value").GetInt32()));
+        Assert.Equal(2, rows[0].GetProperty("next").GetProperty("value").GetInt32());
+    }
+
+    /// <summary>
+    /// The writer's empty record evolves into a reader record whose field has a default. Stripping the writer
+    /// as well as the reader left the reader's record unmatched, and resolution asked for a default for it.
+    /// </summary>
+    [Fact]
+    public void AWritersEmptyRecord_ResolvesToAReaderRecordsDefaults()
+    {
+        string writer = S("""
+            {"type": "record", "name": "T", "fields": [{"name": "a", "type": "int"}, {"name": "p", "type": __EMPTY__}]}
+            """);
+        const string reader = """
+            {"type": "record", "name": "T", "fields": [
+              {"name": "a", "type": "int"},
+              {"name": "p", "type": {"type": "record", "name": "r102", "fields": [{"name": "x", "type": "int", "default": 7}]}}
+            ]}
+            """;
+        using var file = Ocf(writer, [0x02]);
+        var p = (StructArray)ReadOne(file, new AvroSchema(reader)).Column("p");
+        Assert.Equal([7], Ints(p.Fields[0]));
+    }
+
+    /// <summary>A projection that keeps the struct holding the empty record (the reader keeps it, the writer skips it).</summary>
+    [Fact]
+    public void ProjectingTheStructThatHoldsIt_LeavesItOut()
+    {
+        string schema = S("""
+            {"type": "record", "name": "manifest_entry", "fields": [
+              {"name": "status", "type": "int"},
+              {"name": "data_file", "type": {"type": "record", "name": "r2", "fields": [
+                {"name": "x", "type": "int"}, {"name": "partition", "type": __EMPTY__}, {"name": "y", "type": "int"}
+              ]}}
+            ]}
+            """);
+        using var file = Ocf(schema, [0x02, 0x04, 0x06]);
+        using var reader = new AvroReaderBuilder().WithProjection("data_file").Build(file);
+        var dataFile = (StructArray)reader.ReadNextBatch()!.Column("data_file");
+        Assert.Equal(["x", "y"], ((Apache.Arrow.Types.StructType)dataFile.Data.DataType).Fields.Select(f => f.Name));
+        Assert.Equal([3], Ints(dataFile.Fields[1]));
+    }
+
+    /// <summary>
+    /// Each block's records are decoded by count now, so a block whose bytes ran out inside a skipped
+    /// fixed-width value (which advanced without a bounds check) read on as if they were there.
+    /// </summary>
+    [Fact]
+    public void ABlockThatEndsInsideASkippedValue_IsRefused()
+    {
+        const string writer = """{"type": "record", "name": "T", "fields": [{"name": "n", "type": "null"}, {"name": "f", "type": "float"}]}""";
+        const string reader = """{"type": "record", "name": "T", "fields": [{"name": "n", "type": "null"}]}""";
+        // Two records declared, one float's worth of bytes.
+        using var file = RawOcfFile.Create(writer, [[0x00, 0x00, 0x80, 0x3F], []], lengthPrefixed: false);
+        using var r = new AvroReaderBuilder().WithReaderSchema(new AvroSchema(reader)).Build(file);
+        Assert.Throws<InvalidDataException>(() => r.ReadNextBatch());
+    }
+
+    /// <summary>
+    /// R1 has two fields of R0 (empty), R2 two of R1, and so on: walking every reference afresh is 2^n calls,
+    /// which for 40 levels does not finish. Each record is checked once now. All of them are empty, so only
+    /// <c>a</c> is left.
+    /// </summary>
+    [Fact]
+    public void ANamedEmptyRecordReferredToExponentially_IsCheckedOnce()
+    {
+        // Field d_i defines R_i with two fields of R_(i-1), each referred to by name; R0 has no fields.
+        var fields = new List<string> { """{"name": "a", "type": "int"}""", """{"name": "d0", "type": {"type": "record", "name": "R0", "fields": []}}""" };
+        for (int i = 1; i <= 40; i++)
+        {
+            fields.Add("{\"name\": \"d" + i + "\", \"type\": {\"type\": \"record\", \"name\": \"R" + i + "\", \"fields\": [" +
+                "{\"name\": \"f\", \"type\": \"R" + (i - 1) + "\"}, {\"name\": \"g\", \"type\": \"R" + (i - 1) + "\"}]}}");
+        }
+        string schema = """{"type": "record", "name": "T", "fields": [""" + string.Join(", ", fields) + "]}";
+
+        using var file = Ocf(schema, [0x02]);
+        var batch = ReadOne(file);
+        Assert.Equal(["a"], batch.Schema.FieldsList.Select(f => f.Name));
+        Assert.Equal([1], Ints(batch.Column("a")));
+    }
 }

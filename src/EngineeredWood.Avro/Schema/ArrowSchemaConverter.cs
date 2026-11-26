@@ -41,6 +41,9 @@ internal static class ArrowSchemaConverter
                 return (ToArrowPrimitive(p, extensionRegistry), false);
 
             case AvroRecordSchema r:
+                if (r.IsRecursiveReference)
+                    throw new NotSupportedException(
+                        $"The Avro record '{r.FullName}' refers to itself. Recursive schemas cannot be represented in Arrow.");
                 if (r.Fields.Count == 0)
                     throw new NotSupportedException(
                         $"The Avro record '{r.FullName}' has no fields, and Arrow has no struct of no fields. A " +

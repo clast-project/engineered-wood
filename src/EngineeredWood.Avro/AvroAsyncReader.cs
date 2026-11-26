@@ -45,19 +45,22 @@ public sealed class AvroAsyncReader : IAsyncEnumerable<RecordBatch>, IAsyncDispo
         _batchSize = batchSize;
 
         WriterSchema = new AvroSchema(AvroSchemaWriter.ToJson(ocf.WriterSchema));
-        var writerRecord = EmptyRecords.Strip(ocf.WriterSchema);
+        var writerRecord = ocf.WriterSchema;
 
         if (readerSchema != null)
         {
             if (readerSchema.Parsed is not AvroRecordSchema readerRecord)
                 throw new InvalidOperationException("Reader schema must be a record type.");
 
+            // Only the reader's empty records are left out: a writer's empty field is then skipped (zero bytes),
+            // and one the reader gives fields to resolves to their defaults.
             var resolution = SchemaResolver.Resolve(writerRecord, EmptyRecords.Strip(readerRecord));
             Schema = resolution.ArrowSchema;
             _assembler = new RecordBatchAssembler(writerRecord, resolution);
         }
         else
         {
+            writerRecord = EmptyRecords.Strip(writerRecord);
             Schema = ArrowSchemaConverter.ToArrow(writerRecord, extensionRegistry);
             _assembler = new RecordBatchAssembler(writerRecord, Schema);
         }

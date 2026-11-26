@@ -167,8 +167,8 @@ public sealed class AvroDecoder : IDisposable
             ?? throw new InvalidOperationException(
                 $"No schema found in store for fingerprint {fingerprint}.");
 
-        var writerRecord = EmptyRecords.Strip(schema.Parsed as AvroRecordSchema
-            ?? throw new InvalidOperationException("Schema must be a record type."));
+        var writerRecord = schema.Parsed as AvroRecordSchema
+            ?? throw new InvalidOperationException("Schema must be a record type.");
 
         if (_readerSchema != null)
         {
@@ -180,6 +180,7 @@ public sealed class AvroDecoder : IDisposable
         }
         else
         {
+            writerRecord = EmptyRecords.Strip(writerRecord);
             var arrowSchema = ArrowSchemaConverter.ToArrow(writerRecord);
             _assembler = new RecordBatchAssembler(writerRecord, arrowSchema);
             _currentArrowSchema = arrowSchema;

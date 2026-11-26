@@ -25,143 +25,134 @@ internal static class EmptyRecords
     /// <paramref name="record"/> with every field of an empty record type left out, or the same instance when
     /// it has none.
     /// </summary>
+    /// <remarks>
+    /// A named record can be referred to many times, so both the emptiness check and the rewrite are memoized by
+    /// node: walking the tree afresh at each reference is exponential in how deeply such references nest, and a
+    /// shared record stays shared once rewritten.
+    /// </remarks>
     public static AvroRecordSchema Strip(AvroRecordSchema record)
     {
-        if (!Contains(record, new HashSet<AvroSchemaNode>(ReferenceComparer.Instance)))
+        var context = new Context();
+        if (!context.ContainsEmpty(record))
             return record;
-        return (AvroRecordSchema)Strip(record, 0);
+        return (AvroRecordSchema)context.Strip(record, 0);
     }
 
-    /// <summary>Whether a value of <paramref name="node"/> is a record with nothing in it.</summary>
-    public static bool IsEmpty(AvroSchemaNode node) => IsEmpty(node, 0);
-
-    private static bool IsEmpty(AvroSchemaNode node, int depth)
+    private sealed class Context
     {
-        if (node is not AvroRecordSchema r)
-            return false;
-        // A record that refers to itself is never empty: it has no Arrow type for other reasons, which the
-        // converter reports.
-        if (depth >= MaxSchemaDepth)
-            return false;
-        foreach (var f in r.Fields)
+        private readonly Dictionary<AvroSchemaNode, bool> _isEmpty = new(ReferenceComparer.Instance);
+        private readonly Dictionary<AvroSchemaNode, bool> _containsEmpty = new(ReferenceComparer.Instance);
+        private readonly Dictionary<AvroSchemaNode, AvroSchemaNode> _stripped = new(ReferenceComparer.Instance);
+
+        /// <summary>Whether a value of <paramref name="node"/> is a record with nothing in it.</summary>
+        /// <remarks>
+        /// A recursive reference is a record with no fields of its own, but its values are whole records, so it
+        /// is never empty; the converter refuses it as recursion.
+        /// </remarks>
+        public bool IsEmpty(AvroSchemaNode node, int depth = 0)
         {
-            if (!IsEmpty(f.Schema, depth + 1))
+            if (node is not AvroRecordSchema r || r.IsRecursiveReference || depth >= MaxSchemaDepth)
                 return false;
+            if (_isEmpty.TryGetValue(r, out bool known))
+                return known;
+
+            bool empty = true;
+            foreach (var f in r.Fields)
+            {
+                if (!IsEmpty(f.Schema, depth + 1))
+                {
+                    empty = false;
+                    break;
+                }
+            }
+            _isEmpty[r] = empty;
+            return empty;
         }
-        return true;
-    }
 
-    private static bool Contains(AvroSchemaNode node, HashSet<AvroSchemaNode> seen)
-    {
-        if (!seen.Add(node))
-            return false;
-        switch (node)
+        public bool ContainsEmpty(AvroSchemaNode node)
         {
-            case AvroRecordSchema r:
-                if (r.Fields.Count == 0)
-                    return true;
-                foreach (var f in r.Fields)
-                {
-                    if (Contains(f.Schema, seen))
-                        return true;
-                }
-                return false;
-            case AvroArraySchema a:
-                return Contains(a.Items, seen);
-            case AvroMapSchema m:
-                return Contains(m.Values, seen);
-            case AvroUnionSchema u:
-                foreach (var b in u.Branches)
-                {
-                    if (Contains(b, seen))
-                        return true;
-                }
-                return false;
-            default:
-                return false;
+            if (_containsEmpty.TryGetValue(node, out bool known))
+                return known;
+            _containsEmpty[node] = false; // a placeholder while this node is walked
+
+            bool contains = node switch
+            {
+                AvroRecordSchema { IsRecursiveReference: true } => false,
+                AvroRecordSchema r => r.Fields.Count == 0 || r.Fields.Any(f => ContainsEmpty(f.Schema)),
+                AvroArraySchema a => ContainsEmpty(a.Items),
+                AvroMapSchema m => ContainsEmpty(m.Values),
+                AvroUnionSchema u => u.Branches.Any(ContainsEmpty),
+                _ => false,
+            };
+            _containsEmpty[node] = contains;
+            return contains;
         }
-    }
 
-    private static AvroSchemaNode Strip(AvroSchemaNode node, int depth)
-    {
-        if (depth >= MaxSchemaDepth)
-            throw new NotSupportedException(
-                "Avro schema exceeds maximum nesting depth. Recursive schemas cannot be represented in Arrow.");
-
-        switch (node)
+        public AvroSchemaNode Strip(AvroSchemaNode node, int depth)
         {
-            case AvroRecordSchema r:
-            {
-                bool changed = false;
-                var fields = new List<AvroFieldNode>(r.Fields.Count);
-                foreach (var f in r.Fields)
-                {
-                    if (IsEmpty(f.Schema))
-                    {
-                        changed = true;
-                        continue;
-                    }
-
-                    var schema = Strip(f.Schema, depth + 1);
-                    if (ReferenceEquals(schema, f.Schema))
-                    {
-                        fields.Add(f);
-                        continue;
-                    }
-
-                    changed = true;
-                    fields.Add(new AvroFieldNode(f.Name, schema)
-                    {
-                        Aliases = f.Aliases,
-                        Doc = f.Doc,
-                        Default = f.Default,
-                        Properties = f.Properties,
-                    });
-                }
-
-                if (!changed)
-                    return r;
-                return new AvroRecordSchema(r.Name, r.Namespace, fields)
-                {
-                    Doc = r.Doc,
-                    Aliases = r.Aliases,
-                    LogicalType = r.LogicalType,
-                    Properties = r.Properties,
-                };
-            }
-
-            case AvroArraySchema a:
-            {
-                var items = Strip(a.Items, depth + 1);
-                return ReferenceEquals(items, a.Items)
-                    ? a
-                    : new AvroArraySchema(items) { LogicalType = a.LogicalType, Properties = a.Properties };
-            }
-
-            case AvroMapSchema m:
-            {
-                var values = Strip(m.Values, depth + 1);
-                return ReferenceEquals(values, m.Values)
-                    ? m
-                    : new AvroMapSchema(values) { LogicalType = m.LogicalType, Properties = m.Properties };
-            }
-
-            case AvroUnionSchema u:
-            {
-                bool changed = false;
-                var branches = new AvroSchemaNode[u.Branches.Count];
-                for (int i = 0; i < branches.Length; i++)
-                {
-                    branches[i] = Strip(u.Branches[i], depth + 1);
-                    changed |= !ReferenceEquals(branches[i], u.Branches[i]);
-                }
-                return changed
-                    ? new AvroUnionSchema(branches) { LogicalType = u.LogicalType, Properties = u.Properties }
-                    : u;
-            }
-
-            default:
+            if (depth >= MaxSchemaDepth)
+                throw new NotSupportedException(
+                    "Avro schema exceeds maximum nesting depth. Recursive schemas cannot be represented in Arrow.");
+            if (!ContainsEmpty(node))
                 return node;
+            if (_stripped.TryGetValue(node, out var done))
+                return done;
+
+            var result = StripUncached(node, depth);
+            _stripped[node] = result;
+            return result;
+        }
+
+        private AvroSchemaNode StripUncached(AvroSchemaNode node, int depth)
+        {
+            switch (node)
+            {
+                case AvroRecordSchema r:
+                {
+                    var fields = new List<AvroFieldNode>(r.Fields.Count);
+                    foreach (var f in r.Fields)
+                    {
+                        if (IsEmpty(f.Schema))
+                            continue;
+
+                        var schema = Strip(f.Schema, depth + 1);
+                        fields.Add(ReferenceEquals(schema, f.Schema)
+                            ? f
+                            : new AvroFieldNode(f.Name, schema)
+                            {
+                                Aliases = f.Aliases,
+                                Doc = f.Doc,
+                                Default = f.Default,
+                                Properties = f.Properties,
+                            });
+                    }
+
+                    return new AvroRecordSchema(r.Name, r.Namespace, fields)
+                    {
+                        Doc = r.Doc,
+                        Aliases = r.Aliases,
+                        LogicalType = r.LogicalType,
+                        Properties = r.Properties,
+                    };
+                }
+
+                case AvroArraySchema a:
+                    return new AvroArraySchema(Strip(a.Items, depth + 1)) { LogicalType = a.LogicalType, Properties = a.Properties };
+
+                case AvroMapSchema m:
+                    return new AvroMapSchema(Strip(m.Values, depth + 1)) { LogicalType = m.LogicalType, Properties = m.Properties };
+
+                case AvroUnionSchema u:
+                {
+                    var branches = new AvroSchemaNode[u.Branches.Count];
+                    for (int i = 0; i < branches.Length; i++)
+                        branches[i] = Strip(u.Branches[i], depth + 1);
+                    return new AvroUnionSchema(branches) { LogicalType = u.LogicalType, Properties = u.Properties };
+                }
+
+                default:
+                    return node;
+            }
         }
     }
 
