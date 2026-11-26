@@ -17,8 +17,11 @@ public sealed class InMemoryCatalog : ICatalog
     private readonly Dictionary<TableIdentifier, (TableMetadata Metadata, string Location)> _tables = new();
     private long _nextVersion;
 
+    // Unique to this instance, so a table loaded from another InMemoryCatalog never matches a token here.
+    private readonly string _instanceId = Guid.NewGuid().ToString("N");
+
     private string NextLocation(TableIdentifier identifier) =>
-        $"{_warehouseLocation}/{identifier.Namespace}/{identifier.Name}/metadata/{++_nextVersion}";
+        $"{_warehouseLocation}/{identifier.Namespace}/{identifier.Name}/metadata/{_instanceId}-{++_nextVersion}";
 
     /// <summary>Initializes a new <see cref="InMemoryCatalog"/> with the given warehouse location URI.</summary>
     /// <param name="warehouseLocation">The base URI used to construct table locations.</param>
@@ -246,6 +249,10 @@ public sealed class InMemoryCatalog : ICatalog
         {
             if (!_tables.TryGetValue(identifier, out var current))
                 throw new NoSuchTableException(identifier);
+
+            if (current.Metadata.TableUuid != baseTable.Metadata.TableUuid)
+                throw new CommitFailedException(identifier,
+                    $"the commit is based on table {baseTable.Metadata.TableUuid}, but {identifier} is table {current.Metadata.TableUuid}.");
 
             if (baseTable.MetadataLocation != current.Location)
                 throw new CommitFailedException(identifier,

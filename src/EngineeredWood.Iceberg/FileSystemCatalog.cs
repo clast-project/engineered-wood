@@ -262,11 +262,7 @@ public sealed class FileSystemCatalog : ICatalog
         if (!await TableExistsAsync(identifier, ct).ConfigureAwait(false))
             throw new NoSuchTableException(identifier);
 
-        // The hint first, then the versions oldest first, so a drop that fails part way leaves the newest
-        // versions (which a reader would find) rather than resurrecting an older one.
-        await _fs.DeleteAsync(VersionHintPath(identifier), ct).ConfigureAwait(false);
-        foreach (var (_, path) in await ListVersionsAsync(identifier, ct).ConfigureAwait(false))
-            await _fs.DeleteAsync(path, ct).ConfigureAwait(false);
+        await RemoveVersionsAsync(identifier, ct).ConfigureAwait(false);
 
         var prefix = (purge ? TablePath(identifier) : MetadataDir(identifier)) + "/";
         var remaining = new List<string>();
@@ -285,14 +281,16 @@ public sealed class FileSystemCatalog : ICatalog
             throw new NoSuchNamespaceException(to.Namespace);
 
         // The destination is created like a new table, so a concurrent create or rename of `to` loses
-        // cleanly; then the source's metadata goes. Data files are not moved.
+        // cleanly. Then only the source's version files and hint go: the renamed table's snapshots still
+        // name the manifest lists and manifests under the source's metadata directory, and its data files
+        // stay where they are. Nothing is moved.
         var renamed = current.Metadata with
         {
             Location = TablePath(to),
             MetadataLog = [],
         };
         await CreateAsync(to, renamed, ct).ConfigureAwait(false);
-        await DropTableAsync(from, purge: false, ct).ConfigureAwait(false);
+        await RemoveVersionsAsync(from, ct).ConfigureAwait(false);
     }
 
     public async Task<bool> TableExistsAsync(
@@ -334,11 +332,23 @@ public sealed class FileSystemCatalog : ICatalog
             throw new CommitFailedException(identifier,
                 $"another writer committed version {baseVersion + 1} first.");
 
-        await TryWriteVersionHintAsync(identifier, baseVersion + 1, ct).ConfigureAwait(false);
+        await TryWriteVersionHintAsync(identifier, baseVersion + 1).ConfigureAwait(false);
         return new Table(identifier, committed, path);
     }
 
     // --- Internal helpers ---
+
+    /// <summary>
+    /// Ends the table's existence by deleting its hint and version files. The hint goes first, then the
+    /// versions oldest first, so a removal that fails part way leaves the newest versions (which a reader
+    /// would find) rather than resurrecting an older one.
+    /// </summary>
+    private async ValueTask RemoveVersionsAsync(TableIdentifier identifier, CancellationToken ct)
+    {
+        await _fs.DeleteAsync(VersionHintPath(identifier), ct).ConfigureAwait(false);
+        foreach (var (_, path) in await ListVersionsAsync(identifier, ct).ConfigureAwait(false))
+            await _fs.DeleteAsync(path, ct).ConfigureAwait(false);
+    }
 
     private async ValueTask<Table> CreateAsync(
         TableIdentifier identifier, TableMetadata metadata, CancellationToken ct)
@@ -352,7 +362,7 @@ public sealed class FileSystemCatalog : ICatalog
         if (!await _fs.TryWriteAllBytesAsync(path, Encoding.UTF8.GetBytes(json), ct).ConfigureAwait(false))
             throw new TableAlreadyExistsException(identifier);
 
-        await TryWriteVersionHintAsync(identifier, 1, ct).ConfigureAwait(false);
+        await TryWriteVersionHintAsync(identifier, 1).ConfigureAwait(false);
         return new Table(identifier, metadata, path);
     }
 
@@ -464,17 +474,22 @@ public sealed class FileSystemCatalog : ICatalog
     /// Points the hint at <paramref name="version"/>. Best effort: the commit has already happened, and a
     /// reader finds the version without the hint, so a failure here is not the commit's failure.
     /// </summary>
-    private async ValueTask TryWriteVersionHintAsync(TableIdentifier identifier, int version, CancellationToken ct)
+    /// <remarks>
+    /// Runs only after the version is published, so it takes no cancellation token and swallows every
+    /// failure, cancellation included: a caller cancelled at this point must see the commit it made, not an
+    /// exception that invites retrying (and so duplicating) it.
+    /// </remarks>
+    private async ValueTask TryWriteVersionHintAsync(TableIdentifier identifier, int version)
     {
         try
         {
             await _fs.WriteAllBytesAsync(
                     VersionHintPath(identifier),
                     Encoding.UTF8.GetBytes(version.ToString(System.Globalization.CultureInfo.InvariantCulture)),
-                    ct)
+                    CancellationToken.None)
                 .ConfigureAwait(false);
         }
-        catch (Exception e) when (e is not OperationCanceledException)
+        catch (Exception)
         {
             // Ignored, as above.
         }

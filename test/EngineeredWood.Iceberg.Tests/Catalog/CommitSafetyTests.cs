@@ -472,4 +472,124 @@ public class CommitSafetyTests : IDisposable
         Assert.DoesNotContain("db/t/data/a.parquet", ex.Message);
         Assert.Equal(before, Directory.GetFiles(MetadataDir).Length);
     }
+
+    // --- Review fixes ---
+
+    [Fact]
+    public async Task Rename_KeepsTheManifestsTheRenamedTableStillReads()
+    {
+        var (catalog, id, table) = await CreateTableAsync();
+        var ops = new TableOperations(_fs);
+        await catalog.CommitTableAsync(table, await ops.AppendFilesAsync(table.Metadata, [File("a")]));
+        var to = new TableIdentifier(_ns, "renamed");
+
+        await catalog.RenameTableAsync(id, to);
+
+        Assert.False(await catalog.TableExistsAsync(id));
+        var moved = await catalog.LoadTableAsync(to);
+        Assert.Equal(["db/t/data/a.parquet"], (await ops.ListDataFilesAsync(moved.Metadata)).Select(f => f.FilePath));
+        Assert.Single((await new TableScan(moved.Metadata, _fs).PlanFilesAsync()).DataFiles);
+
+        var appended = await catalog.CommitTableAsync(moved, await ops.AppendFilesAsync(moved.Metadata, [File("b")]));
+        Assert.Equal(2, (await ops.ListDataFilesAsync(appended.Metadata)).Count);
+    }
+
+    [Fact]
+    public async Task CancellationAfterPublication_StillReportsTheCommit()
+    {
+        var fs = new HintWriteCancelledFileSystem(_fs);
+        var catalog = new FileSystemCatalog(fs);
+        await catalog.CreateNamespaceAsync(_ns);
+        var id = new TableIdentifier(_ns, "t");
+
+        // Create and commit both publish their version, then hit a cancelled hint write.
+        var created = await catalog.CreateTableAsync(id, _schema);
+        var committed = await catalog.CommitTableAsync(created, WithProperty(created.Metadata, "k", "v"));
+
+        Assert.True(fs.HintWritesCancelled >= 2);
+        Assert.EndsWith("/v2.metadata.json", committed.MetadataLocation);
+        Assert.Equal("v", (await catalog.LoadTableAsync(id)).Metadata.Properties["k"]);
+    }
+
+    [Fact]
+    public async Task InMemory_RejectsABaseFromAnotherCatalog()
+    {
+        var a = new InMemoryCatalog();
+        var b = new InMemoryCatalog();
+        await a.CreateNamespaceAsync(_ns);
+        await b.CreateNamespaceAsync(_ns);
+        var id = new TableIdentifier(_ns, "t");
+        var fromA = await a.CreateTableAsync(id, _schema);
+        await b.CreateTableAsync(id, _schema);
+
+        await Assert.ThrowsAsync<CommitFailedException>(
+            () => b.CommitTableAsync(fromA, WithProperty(fromA.Metadata, "foreign", "yes")));
+        Assert.False((await b.LoadTableAsync(id)).Metadata.Properties.ContainsKey("foreign"));
+    }
+
+    [Fact]
+    public async Task CommitWithRetry_StartsNoAttemptAfterTheTimeout()
+    {
+        var (catalog, id, _) = await CreateTableAsync();
+        var interloper = new FileSystemCatalog(new LocalTableFileSystem(_warehouse));
+        var calls = 0;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+
+        // The first backoff (10 s) is longer than the whole budget (100 ms), so the wait is cut to the
+        // budget and no second attempt follows.
+        await Assert.ThrowsAsync<CommitFailedException>(() => catalog.CommitWithRetryAsync(
+            id,
+            async (metadata, ct) =>
+            {
+                calls++;
+                var current = await interloper.LoadTableAsync(id, ct);
+                await interloper.CommitTableAsync(current, WithProperty(current.Metadata, "n", calls.ToString()), ct);
+                return WithProperty(metadata, "mine", "yes");
+            },
+            new CommitRetryOptions(100, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(100))));
+
+        Assert.Equal(1, calls);
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(5), $"took {clock.Elapsed}");
+    }
+
+    /// <summary>Throws <see cref="OperationCanceledException"/> from every version-hint write.</summary>
+    private sealed class HintWriteCancelledFileSystem(EngineeredWood.IO.ITableFileSystem inner)
+        : EngineeredWood.IO.ITableFileSystem
+    {
+        public int HintWritesCancelled { get; private set; }
+
+        public EngineeredWood.IO.PathNameConstraints PathConstraints => inner.PathConstraints;
+
+        public IAsyncEnumerable<EngineeredWood.IO.TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default) =>
+            inner.ListAsync(prefix, cancellationToken);
+
+        public ValueTask<EngineeredWood.IO.IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default) =>
+            inner.OpenReadAsync(path, cancellationToken);
+
+        public ValueTask<EngineeredWood.IO.ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default) =>
+            inner.CreateAsync(path, overwrite, cancellationToken);
+
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default) =>
+            inner.DeleteAsync(path, cancellationToken);
+
+        public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default) =>
+            inner.ExistsAsync(path, cancellationToken);
+
+        public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default) =>
+            inner.ReadAllBytesAsync(path, cancellationToken);
+
+        public ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
+            inner.TryWriteAllBytesAsync(path, data, cancellationToken);
+
+        public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+        {
+            if (path.EndsWith("version-hint.text", StringComparison.Ordinal))
+            {
+                HintWritesCancelled++;
+                throw new OperationCanceledException();
+            }
+
+            return inner.WriteAllBytesAsync(path, data, cancellationToken);
+        }
+    }
 }

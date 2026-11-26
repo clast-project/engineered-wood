@@ -737,6 +737,11 @@ unreadable. Gaps:
   of catalogs that don't use the Hadoop layout.
 - `DropTableAsync` without `purge` deletes the table's metadata directory and
   keeps its data files.
+- `RenameTableAsync` moves no files. It writes the destination's `v1` and
+  removes the source's version files and hint. The renamed table's manifests
+  and data stay under the old path and are still referenced from there. A
+  table later created under the old name and dropped with `purge` deletes
+  them.
 
 ### Correctness / interop issues
 

@@ -145,12 +145,35 @@ public sealed class LocalTableFileSystem : ITableFileSystem
     }
 
     /// <inheritdoc/>
-    public ValueTask<byte[]> ReadAllBytesAsync(
+    /// <remarks>
+    /// On Windows, a file that was just published (renamed into place, as <see cref="TryWriteAllBytesAsync"/>
+    /// does) can briefly refuse to open with a sharing or lock violation, even though nothing in the process
+    /// holds it: MEASURED (#960), about 1 read in 300 when eight writers race to commit table versions while
+    /// reading the previous one. It persists with every in-process writer serialized, so the holder is
+    /// outside the process (the OS or a scanner). Those errors are retried for up to about half a second
+    /// before they surface. Any other failure is thrown at once.
+    /// </remarks>
+    public async ValueTask<byte[]> ReadAllBytesAsync(
         string path, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return new ValueTask<byte[]>(File.ReadAllBytes(ResolvePath(path)));
+        string fullPath = ResolvePath(path);
+        for (int delayMs = 1; ; delayMs *= 2)
+        {
+            try
+            {
+                return File.ReadAllBytes(fullPath);
+            }
+            catch (IOException e) when (IsTransientSharingViolation(e) && delayMs <= 256)
+            {
+                await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
+
+    // ERROR_SHARING_VIOLATION (32) and ERROR_LOCK_VIOLATION (33), as HRESULTs.
+    private static bool IsTransientSharingViolation(IOException e) =>
+        e.HResult is unchecked((int)0x80070020) or unchecked((int)0x80070021);
 
     /// <inheritdoc/>
     public ValueTask<bool> TryWriteAllBytesAsync(

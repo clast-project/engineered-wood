@@ -74,7 +74,7 @@ public static class CatalogCommitExtensions
         if (catalog is null) throw new ArgumentNullException(nameof(catalog));
         if (update is null) throw new ArgumentNullException(nameof(update));
 
-        var started = DateTimeOffset.UtcNow;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
         var random = new Random();
         for (var attempt = 0; ; attempt++)
         {
@@ -86,13 +86,24 @@ public static class CatalogCommitExtensions
             {
                 return await catalog.CommitTableAsync(table, newMetadata, ct).ConfigureAwait(false);
             }
-            catch (CommitFailedException) when (
-                attempt < options.NumRetries && DateTimeOffset.UtcNow - started < options.TotalTimeout)
+            catch (CommitFailedException)
             {
-                // Exponential backoff with +-10% jitter, as Iceberg Java waits.
+                var remaining = options.TotalTimeout - clock.Elapsed;
+                if (attempt >= options.NumRetries || remaining <= TimeSpan.Zero)
+                    throw;
+
+                // Exponential backoff with +-10% jitter, as Iceberg Java waits, but never past the deadline:
+                // no attempt starts once TotalTimeout has passed.
                 var scaled = options.MinWait.TotalMilliseconds * Math.Pow(2, attempt);
                 var wait = Math.Min(scaled, options.MaxWait.TotalMilliseconds) * (0.9 + 0.2 * random.NextDouble());
-                await Task.Delay(TimeSpan.FromMilliseconds(wait), ct).ConfigureAwait(false);
+                // A wait cut short to the remaining budget ends at the deadline by construction; deciding that
+                // from the clock instead would let a timer that fires a fraction early start one more attempt.
+                var reachesDeadline = wait >= remaining.TotalMilliseconds;
+                await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(wait, remaining.TotalMilliseconds)), ct)
+                    .ConfigureAwait(false);
+
+                if (reachesDeadline || clock.Elapsed >= options.TotalTimeout)
+                    throw;
             }
         }
     }
