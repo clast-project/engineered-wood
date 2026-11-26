@@ -97,13 +97,18 @@ internal static class AvroSchemaParser
                 LogicalType = logicalType,
                 Precision = precision,
                 Scale = scale,
+                Properties = ExtraProperties(obj, PrimitiveAttributes),
             };
         }
 
         // Check for primitive type as object (e.g. {"type": "string"})
         if (IsPrimitiveName(typeName) && !obj.TryGetProperty("logicalType", out _))
         {
-            return ParseTypeName(typeName, namedTypes, enclosingNamespace);
+            var primitive = ParseTypeName(typeName, namedTypes, enclosingNamespace);
+            var properties = ExtraProperties(obj, PrimitiveAttributes);
+            return properties.Count == 0
+                ? primitive
+                : new AvroPrimitiveSchema(primitive.Type) { Properties = properties };
         }
 
         return typeName switch
@@ -144,6 +149,7 @@ internal static class AvroSchemaParser
                 Doc = fieldEl.TryGetProperty("doc", out var docEl) ? docEl.GetString() : null,
                 Default = fieldEl.TryGetProperty("default", out var defEl) ? defEl.Clone() : null,
                 Aliases = ParseStringArray(fieldEl, "aliases"),
+                Properties = ExtraProperties(fieldEl, FieldAttributes),
             };
             fields.Add(field);
         }
@@ -152,6 +158,7 @@ internal static class AvroSchemaParser
         {
             Doc = obj.TryGetProperty("doc", out var rdocEl) ? rdocEl.GetString() : null,
             Aliases = ParseStringArray(obj, "aliases"),
+            Properties = ExtraProperties(obj, RecordAttributes),
         };
 
         // Replace placeholder with real record
@@ -177,6 +184,7 @@ internal static class AvroSchemaParser
             Default = obj.TryGetProperty("default", out var defEl) ? defEl.GetString() : null,
             Doc = obj.TryGetProperty("doc", out var docEl) ? docEl.GetString() : null,
             Aliases = ParseStringArray(obj, "aliases"),
+            Properties = ExtraProperties(obj, EnumAttributes),
         };
 
         namedTypes[fullName] = schema;
@@ -188,14 +196,23 @@ internal static class AvroSchemaParser
         JsonElement obj, Dictionary<string, AvroSchemaNode> namedTypes, string? enclosingNamespace)
     {
         var items = ParseElement(obj.GetProperty("items"), namedTypes, enclosingNamespace);
-        return new AvroArraySchema(items);
+        return new AvroArraySchema(items)
+        {
+            // Iceberg writes a map with non-string keys as an array of key/value records with logicalType "map".
+            LogicalType = obj.TryGetProperty("logicalType", out var ltEl) ? ltEl.GetString() : null,
+            Properties = ExtraProperties(obj, ArrayAttributes),
+        };
     }
 
     private static AvroMapSchema ParseMap(
         JsonElement obj, Dictionary<string, AvroSchemaNode> namedTypes, string? enclosingNamespace)
     {
         var values = ParseElement(obj.GetProperty("values"), namedTypes, enclosingNamespace);
-        return new AvroMapSchema(values);
+        return new AvroMapSchema(values)
+        {
+            LogicalType = obj.TryGetProperty("logicalType", out var ltEl) ? ltEl.GetString() : null,
+            Properties = ExtraProperties(obj, MapAttributes),
+        };
     }
 
     private static AvroFixedSchema ParseFixed(
@@ -214,6 +231,7 @@ internal static class AvroSchemaParser
             LogicalType = logicalType,
             Precision = precision,
             Scale = scale,
+            Properties = ExtraProperties(obj, FixedAttributes),
         };
 
         namedTypes[fullName] = schema;
@@ -264,6 +282,43 @@ internal static class AvroSchemaParser
     /// </summary>
     private static int MaxFixedDigits(int bytes) =>
         bytes < 1 ? 0 : (int)Math.Floor((8.0 * bytes - 1) * Math.Log10(2));
+
+    // The attributes the Avro specification defines for each kind of schema object. Everything else is an
+    // extra attribute, kept in Properties. A decimal's precision and scale are defined attributes only on a
+    // decimal (even one whose annotation turns out to be invalid and is ignored); on any other schema they
+    // are extra attributes like the rest.
+    private static readonly HashSet<string> PrimitiveAttributes =
+        new(StringComparer.Ordinal) { "type", "logicalType" };
+    private static readonly HashSet<string> RecordAttributes =
+        new(StringComparer.Ordinal) { "type", "name", "namespace", "doc", "aliases", "fields" };
+    private static readonly HashSet<string> FieldAttributes =
+        new(StringComparer.Ordinal) { "name", "type", "default", "doc", "aliases" };
+    private static readonly HashSet<string> EnumAttributes =
+        new(StringComparer.Ordinal) { "type", "name", "namespace", "symbols", "default", "doc", "aliases" };
+    private static readonly HashSet<string> ArrayAttributes =
+        new(StringComparer.Ordinal) { "type", "items", "logicalType" };
+    private static readonly HashSet<string> MapAttributes =
+        new(StringComparer.Ordinal) { "type", "values", "logicalType" };
+    private static readonly HashSet<string> FixedAttributes =
+        new(StringComparer.Ordinal) { "type", "name", "namespace", "size", "aliases", "logicalType" };
+
+    private static IReadOnlyDictionary<string, JsonElement> ExtraProperties(JsonElement obj, HashSet<string> defined)
+    {
+        Dictionary<string, JsonElement>? extra = null;
+        bool isDecimal = obj.TryGetProperty("logicalType", out var lt)
+            && lt.ValueKind == JsonValueKind.String && lt.GetString() == "decimal";
+        foreach (var property in obj.EnumerateObject())
+        {
+            if (defined.Contains(property.Name))
+                continue;
+            if (isDecimal && property.Name is "precision" or "scale")
+                continue;
+            extra ??= new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+            // Clone: the element must outlive the JsonDocument it was parsed from.
+            extra[property.Name] = property.Value.Clone();
+        }
+        return extra ?? AvroSchemaProperties.Empty;
+    }
 
     private static IReadOnlyList<string> ParseStringArray(JsonElement obj, string property)
     {

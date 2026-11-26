@@ -20,6 +20,7 @@ public sealed class AvroWriterBuilder
     private string? _recordNamespace;
     private AvroSchema? _explicitAvroSchema;
     private FingerprintStrategy? _fingerprintStrategy;
+    private readonly Dictionary<string, byte[]> _metadata = new(StringComparer.Ordinal);
 
     public AvroWriterBuilder(Apache.Arrow.Schema arrowSchema)
     {
@@ -40,6 +41,25 @@ public sealed class AvroWriterBuilder
         _recordNamespace = ns;
         return this;
     }
+
+    /// <summary>
+    /// Adds a key/value pair to the OCF header's metadata, replacing any earlier value for the key. Keys
+    /// starting with <c>avro.</c> are reserved by the Avro specification and are refused. Readers see the
+    /// pair in <see cref="AvroReader.Metadata"/>.
+    /// </summary>
+    public AvroWriterBuilder WithMetadata(string key, byte[] value)
+    {
+        Container.OcfMetadata.ValidateUserKey(key);
+        _metadata[key] = (byte[])(value ?? throw new ArgumentNullException(nameof(value))).Clone();
+        return this;
+    }
+
+    /// <summary>
+    /// Adds a key/value pair to the OCF header's metadata, with the value encoded as UTF-8. See
+    /// <see cref="WithMetadata(string, byte[])"/>.
+    /// </summary>
+    public AvroWriterBuilder WithMetadata(string key, string value) =>
+        WithMetadata(key, System.Text.Encoding.UTF8.GetBytes(value ?? throw new ArgumentNullException(nameof(value))));
 
     /// <summary>OCF block compression codec (default: Null / no compression).</summary>
     public AvroWriterBuilder WithCompression(AvroCodec codec)
@@ -73,7 +93,7 @@ public sealed class AvroWriterBuilder
     {
         var avroRecord = ResolveAvroSchema();
         var ocf = new OcfWriter(output, _codec, _compressionLevel, _customCompressionLevel);
-        return new AvroWriter(ocf, _arrowSchema, avroRecord);
+        return new AvroWriter(ocf, _arrowSchema, avroRecord, _metadata);
     }
 
     /// <summary>Build an asynchronous OCF writer targeting the given stream.</summary>
@@ -81,7 +101,7 @@ public sealed class AvroWriterBuilder
     {
         var avroRecord = ResolveAvroSchema();
         var ocf = new OcfWriterAsync(output, _codec, _compressionLevel, _customCompressionLevel);
-        await ocf.WriteHeaderAsync(avroRecord, ct).ConfigureAwait(false);
+        await ocf.WriteHeaderAsync(avroRecord, _metadata, ct).ConfigureAwait(false);
         return new AvroAsyncWriter(ocf, _arrowSchema, avroRecord);
     }
 
