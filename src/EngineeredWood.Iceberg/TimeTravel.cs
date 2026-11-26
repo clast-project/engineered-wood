@@ -101,7 +101,9 @@ public static class TimeTravel
             TimestampMs: now,
             ManifestList: snapshot.ManifestList,
             Summary: CherryPickSummary(snapshot.Summary, snapshotId),
-            SchemaId: snapshot.SchemaId);
+            SchemaId: snapshot.SchemaId,
+            // The new snapshot reuses the source's manifest list, so it is encrypted exactly as that list is.
+            KeyId: snapshot.KeyId);
 
         var snapshots = metadata.Snapshots.ToList();
         snapshots.Add(cherryPicked);

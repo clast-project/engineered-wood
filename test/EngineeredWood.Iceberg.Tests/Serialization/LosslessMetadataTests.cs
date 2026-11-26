@@ -32,7 +32,7 @@ public class LosslessMetadataTests
               "fields": [
                 {"id": 1, "name": "id", "required": true, "type": "long", "x-field-extra": "kept"},
                 {"id": 2, "name": "amount", "required": false, "type": "decimal(9, 2)"},
-                {"id": 3, "name": "place", "required": false, "type": "geography(srid:4326, planar)"},
+                {"id": 3, "name": "place", "required": false, "type": "geography(srid:4326, vincenty)"},
                 {"id": 4, "name": "ts", "required": false, "type": "timestamp"}
               ]
             }
@@ -150,7 +150,7 @@ public class LosslessMetadataTests
 
         var fields = md.Schemas[0].Fields;
         Assert.Equal(IcebergType.Decimal(9, 2), fields[1].Type);
-        Assert.Equal(IcebergType.Geography("srid:4326", "planar"), fields[2].Type);
+        Assert.Equal(IcebergType.Geography("srid:4326", "vincenty"), fields[2].Type);
 
         var multi = md.PartitionSpecs[0].Fields[1];
         Assert.Equal([1, 4], multi.SourceIds!);
@@ -229,17 +229,45 @@ public class LosslessMetadataTests
     }
 
     [Theory]
-    [InlineData("geography(srid:4326,planar)", "srid:4326", "planar")]
-    [InlineData("geography(srid:4326, planar)", "srid:4326", "planar")]
-    [InlineData("geography( srid:4326 , planar )", "srid:4326", "planar")]
+    [InlineData("geography(srid:4326,vincenty)", "srid:4326", "vincenty")]
+    [InlineData("geography(srid:4326, vincenty)", "srid:4326", "vincenty")]
+    [InlineData("geography( srid:4326 , vincenty )", "srid:4326", "vincenty")]
     [InlineData("geography(srid:4326)", "srid:4326", "spherical")]
     [InlineData("geography", "OGC:CRS84", "spherical")]
-    [InlineData("GEOGRAPHY(srid:4326, planar)", "srid:4326", "planar")]
+    [InlineData("GEOGRAPHY(srid:4326, vincenty)", "srid:4326", "vincenty")]
     public void Geography_AcceptsOptionalWhitespaceAndDefaults(string spelling, string crs, string algorithm)
     {
         var type = IcebergJsonSerializer.Deserialize<IcebergType>(JsonSerializer.Serialize(spelling));
         Assert.Equal(IcebergType.Geography(crs, algorithm), type);
         Assert.Equal(JsonSerializer.Serialize($"geography({crs}, {algorithm})"), IcebergJsonSerializer.Serialize(type));
+    }
+
+    [Theory]
+    [InlineData("spherical")]
+    [InlineData("vincenty")]
+    [InlineData("thomas")]
+    [InlineData("andoyer")]
+    [InlineData("KARNEY")]
+    public void Geography_AcceptsEverySpecEdgeAlgorithm(string algorithm)
+    {
+        var type = IcebergJsonSerializer.Deserialize<IcebergType>(JsonSerializer.Serialize($"geography(OGC:CRS84, {algorithm})"));
+        Assert.Equal(IcebergType.Geography("OGC:CRS84", algorithm.ToLowerInvariant()), type);
+    }
+
+    [Fact]
+    public void EmptyEncryptionKeyList_IsNotEncryption()
+    {
+        // An empty list names no key, so nothing can be encrypted with one; a snapshot key-id or a file's
+        // key_metadata is still refused on its own.
+        var json = System.Text.RegularExpressions.Regex.Replace(
+            V3Json.Replace("\"key-id\": \"snapshot-key\",", ""),
+            @"""encryption-keys"":\s*\[.*?\],", @"""encryption-keys"": [],",
+            System.Text.RegularExpressions.RegexOptions.Singleline);
+        var md = IcebergJsonSerializer.Deserialize<TableMetadata>(json);
+        Assert.NotNull(md.EncryptionKeys);
+        Assert.Empty(md.EncryptionKeys);
+        Assert.False(md.IsEncrypted);
+        Assert.Contains("\"encryption-keys\":[]", IcebergJsonSerializer.Serialize(md));
     }
 
     [Theory]
@@ -274,6 +302,8 @@ public class LosslessMetadataTests
     [InlineData("geography()")]
     [InlineData("geography(, spherical)")]
     [InlineData("geography(srid:4326, )")]
+    [InlineData("geography(OGC:CRS84, bogus)")]
+    [InlineData("geography(OGC:CRS84, planar)")]
     public void MalformedParameterizedTypes_AreRefused(string spelling)
     {
         Assert.Throws<JsonException>(() =>

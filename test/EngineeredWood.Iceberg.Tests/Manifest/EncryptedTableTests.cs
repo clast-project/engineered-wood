@@ -170,4 +170,24 @@ public class EncryptedTableTests : IDisposable
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
             async () => await new ExpireSnapshots().ExpireOlderThan(long.MaxValue).ApplyAsync(md, fs: null));
     }
+
+    [Fact]
+    public async Task CherryPick_KeepsTheSourceSnapshotsKey()
+    {
+        var md = await TableWithOneSnapshotAsync();
+        md = await _ops.AppendFilesAsync(md, [File1 with { FilePath = "data/file2.parquet" }]);
+        var source = md.Snapshots[1];
+        md = md with
+        {
+            Snapshots = [md.Snapshots[0], source with { KeyId = "k1" }],
+            CurrentSnapshotId = md.Snapshots[0].SnapshotId,
+        };
+
+        var picked = TimeTravel.CherryPick(md, source.SnapshotId);
+        var current = picked.Snapshots.Single(s => s.SnapshotId == picked.CurrentSnapshotId);
+        Assert.Equal(source.ManifestList, current.ManifestList);
+        Assert.Equal("k1", current.KeyId);
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await new TableScan(picked, _fs).PlanFilesAsync());
+    }
 }

@@ -151,7 +151,7 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
             // are refused.
             var crs = m.Groups[1].Success ? NonEmpty(m.Groups[1].Value, "CRS", typeString) : DefaultCrs;
             var algorithm = m.Groups[2].Success
-                ? NonEmpty(m.Groups[2].Value, "edge algorithm", typeString)
+                ? EdgeAlgorithm(NonEmpty(m.Groups[2].Value, "edge algorithm", typeString), typeString)
                 : DefaultEdgeAlgorithm;
             return new GeographyType(crs, algorithm);
         }
@@ -177,6 +177,20 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
             "variant" => IcebergType.Variant,
             _ => throw new JsonException($"Unknown primitive type: {typeString}")
         };
+    }
+
+    // The spec's edge-interpolation algorithms. Java's EdgeAlgorithm.fromName accepts them in any case and
+    // refuses anything else; they are kept in the spec's lower-case spelling.
+    private static readonly string[] EdgeAlgorithms = ["spherical", "vincenty", "thomas", "andoyer", "karney"];
+
+    private static string EdgeAlgorithm(string name, string typeString)
+    {
+        foreach (var known in EdgeAlgorithms)
+        {
+            if (string.Equals(known, name, StringComparison.OrdinalIgnoreCase))
+                return known;
+        }
+        throw new JsonException($"Invalid type {typeString}: unknown edge algorithm '{name}'.");
     }
 
     private static string NonEmpty(string value, string what, string typeString) =>
