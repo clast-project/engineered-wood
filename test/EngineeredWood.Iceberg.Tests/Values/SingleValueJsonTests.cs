@@ -83,9 +83,17 @@ public class SingleValueJsonTests
         Assert.Throws<ArgumentException>(() => SingleValueJson.ToJsonString(IcebergType.Double, LiteralValue.Of(double.NaN)));
         Assert.Throws<ArgumentException>(() => SingleValueJson.ToJsonString(IcebergType.Float, LiteralValue.Of(float.NegativeInfinity)));
         Assert.Throws<ArgumentException>(() => SingleValueJson.ToJsonString(IcebergType.String, LiteralValue.Of(1)));
-        Assert.Throws<NotSupportedException>(() => SingleValueJson.ToJsonString(IcebergType.Variant, LiteralValue.Of(1)));
+        // variant and unknown have no value but null: a non-null one is not one of the type's.
+        Assert.Throws<ArgumentException>(() => SingleValueJson.ToJsonString(IcebergType.Variant, LiteralValue.Of(1)));
+        Assert.Throws<ArgumentException>(() => SingleValueJson.ToJsonString(IcebergType.Unknown, LiteralValue.Of("x")));
+        // geometry is an EngineeredWood gap, not a malformed value.
+        Assert.Throws<NotSupportedException>(() => SingleValueJson.ToJsonString(IcebergType.Geometry("srid:4326"), LiteralValue.Of(new byte[] { 1 })));
     }
 
+    /// <summary>
+    /// A non-null default for these types is malformed metadata (FormatException), the same answer
+    /// <see cref="SingleValueJson.Validate"/> gives, and distinct from an EngineeredWood gap (NotSupportedException).
+    /// </summary>
     [Fact]
     public void VariantAndUnknown_HaveOnlyNull()
     {
