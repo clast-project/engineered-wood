@@ -74,6 +74,48 @@ public class PythonProcessTests
         }
     }
 
+    /// <summary>
+    /// Python exits but leaves a process it started holding its stdout. Waiting for the output used to give up
+    /// after 5 s per pipe and return what it had, empty, as if the run had finished.
+    /// </summary>
+    [SkippableFact]
+    public void OutputHeldOpenByAChild_IsReportedNotReturnedEmpty()
+    {
+        Skip.If(Python.Value == null, "Python is not on the PATH.");
+        string dir = Path.Combine(Path.GetTempPath(), $"ew_python_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        string script = Path.Combine(dir, "spawn.py");
+        string pidFile = Path.Combine(dir, "child.pid");
+        File.WriteAllText(script, """
+            import subprocess, sys
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdout=sys.stdout, stderr=sys.stderr)
+            with open(sys.argv[1], "w") as f:
+                f.write(str(child.pid))
+            print("parent done", flush=True)
+            """);
+        int? pid = null;
+        try
+        {
+            var started = DateTime.UtcNow;
+            var e = Assert.Throws<IOException>(() =>
+                PythonProcess.Run(Python.Value!, $"-I \"{script}\" \"{pidFile}\"", 30_000));
+            Assert.Contains("still open", e.Message);
+            // One grace period for both pipes, well inside the child's sleep.
+            Assert.True(DateTime.UtcNow - started < TimeSpan.FromSeconds(45));
+            pid = int.Parse(File.ReadAllText(pidFile));
+        }
+        finally
+        {
+            if (pid == null && File.Exists(pidFile))
+                pid = int.Parse(File.ReadAllText(pidFile));
+            if (pid is int alive && !HasExited(alive, TimeSpan.Zero))
+            {
+                try { System.Diagnostics.Process.GetProcessById(alive).Kill(); } catch { /* raced to exit */ }
+            }
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
     /// <summary>More than a pipe buffer on stderr before anything on stdout: reading stdout first deadlocked.</summary>
     [SkippableFact]
     public void ALargeStderr_DoesNotDeadlock()
