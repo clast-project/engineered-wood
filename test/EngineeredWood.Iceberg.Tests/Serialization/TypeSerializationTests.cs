@@ -39,7 +39,7 @@ public class TypeSerializationTests
     {
         var type = IcebergType.Decimal(10, 2);
         var json = Serialize(type);
-        Assert.Equal("\"decimal(10,2)\"", json);
+        Assert.Equal("\"decimal(10, 2)\"", json);
 
         var deserialized = Deserialize<IcebergType>(json);
         Assert.Equal(type, deserialized);

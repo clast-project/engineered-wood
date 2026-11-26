@@ -106,7 +106,7 @@ public sealed class ExpireSnapshots
             // manifests it still needs, and deleting on that basis could remove them.
             foreach (var snap in keptSnapshots)
             {
-                var entries = await ManifestIO.ReadSnapshotManifestListAsync(fs, snap, ct)
+                var entries = await ManifestIO.ReadSnapshotManifestListAsync(fs, metadata, snap, ct)
                     .ConfigureAwait(false);
                 foreach (var e in entries)
                     keptManifestPaths.Add(e.ManifestPath);
@@ -124,6 +124,7 @@ public sealed class ExpireSnapshots
 
                 if (fs is not null && await fs.ExistsAsync(snap.ManifestList, ct).ConfigureAwait(false))
                 {
+                    metadata.ThrowIfDataInaccessible(snap);
                     var entries = await ManifestIO.ReadManifestListAsync(fs, snap.ManifestList, ct)
                         .ConfigureAwait(false);
                     foreach (var e in entries)

@@ -59,3 +59,11 @@ public sealed record HourTransform : Transform;
 
 /// <summary>Always produces null, used to remove a partition field while preserving field IDs.</summary>
 public sealed record VoidTransform : Transform;
+
+/// <summary>
+/// A transform this library does not know, kept by name so that metadata naming it round-trips. A v3 reader
+/// must accept unknown transforms (including multi-argument ones, which have <c>source-ids</c>); such a field
+/// cannot be evaluated, so it must not be used to filter.
+/// </summary>
+/// <param name="Name">The transform string exactly as the metadata spells it.</param>
+public sealed record UnknownTransform(string Name) : Transform;

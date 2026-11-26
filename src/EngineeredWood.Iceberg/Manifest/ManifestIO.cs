@@ -93,11 +93,14 @@ public static class ManifestIO
     /// <summary>
     /// Reads a snapshot's manifest list, throwing <see cref="FileNotFoundException"/> when it is missing. A
     /// snapshot whose manifest list is gone cannot be read: treating it as empty would silently drop every
-    /// file the snapshot holds, from a scan or from the next commit's carried-forward state.
+    /// file the snapshot holds, from a scan or from the next commit's carried-forward state. Throws
+    /// <see cref="UnsupportedTableFeatureException"/> for an encrypted table or snapshot, whose manifest
+    /// list cannot be read as plaintext.
     /// </summary>
     internal static async ValueTask<List<ManifestListEntry>> ReadSnapshotManifestListAsync(
-        ITableFileSystem fs, Snapshot snapshot, CancellationToken ct)
+        ITableFileSystem fs, TableMetadata metadata, Snapshot snapshot, CancellationToken ct)
     {
+        metadata.ThrowIfDataInaccessible(snapshot);
         if (!await fs.ExistsAsync(snapshot.ManifestList, ct).ConfigureAwait(false))
             throw new FileNotFoundException(
                 $"Snapshot {snapshot.SnapshotId}'s manifest list '{snapshot.ManifestList}' does not exist; " +

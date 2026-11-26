@@ -8,6 +8,9 @@ namespace EngineeredWood.Iceberg.Serialization;
 
 internal sealed class SchemaConverter : JsonConverter<Schema>
 {
+    private static readonly HashSet<string> KnownProperties =
+        ["schema-id", "type", "fields", "identifier-field-ids"];
+
     public override Schema Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         using var doc = JsonDocument.ParseValue(ref reader);
@@ -20,7 +23,10 @@ internal sealed class SchemaConverter : JsonConverter<Schema>
         if (root.TryGetProperty("identifier-field-ids", out var idsElement))
             identifierFieldIds = idsElement.Deserialize(options.TypeInfo<List<int>>());
 
-        return new Schema(schemaId, fields, identifierFieldIds);
+        return new Schema(schemaId, fields, identifierFieldIds)
+        {
+            AdditionalProperties = UnknownProperties.Collect(root, KnownProperties),
+        };
     }
 
     public override void Write(Utf8JsonWriter writer, Schema value, JsonSerializerOptions options)
@@ -36,6 +42,8 @@ internal sealed class SchemaConverter : JsonConverter<Schema>
             writer.WritePropertyName("identifier-field-ids");
             JsonSerializer.Serialize(writer, value.IdentifierFieldIds, options.TypeInfo<IReadOnlyList<int>>());
         }
+
+        UnknownProperties.Write(writer, value.AdditionalProperties, KnownProperties);
 
         writer.WriteEndObject();
     }

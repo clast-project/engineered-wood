@@ -12,8 +12,15 @@ internal sealed class TransformConverter : JsonConverter<Transform>
         typeof(Transform).IsAssignableFrom(typeToConvert);
 
     public override Transform Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        => Parse(reader.GetString());
+
+    public override void Write(Utf8JsonWriter writer, Transform value, JsonSerializerOptions options)
+        => writer.WriteStringValue(Format(value));
+
+    internal static Transform Parse(string? value)
     {
-        var value = reader.GetString() ?? throw new JsonException("Transform cannot be null");
+        if (value is null)
+            throw new JsonException("Transform cannot be null");
 
         if (value.StartsWith("bucket[", StringComparison.Ordinal))
         {
@@ -35,13 +42,14 @@ internal sealed class TransformConverter : JsonConverter<Transform>
             "day" => Transform.Day,
             "hour" => Transform.Hour,
             "void" => Transform.Void,
-            _ => throw new JsonException($"Unknown transform: {value}")
+            // v3 readers must accept transforms they do not know; keep the name so it round-trips.
+            _ => new UnknownTransform(value),
         };
     }
 
-    public override void Write(Utf8JsonWriter writer, Transform value, JsonSerializerOptions options)
+    internal static string Format(Transform value)
     {
-        var str = value switch
+        return value switch
         {
             IdentityTransform => "identity",
             BucketTransform b => $"bucket[{b.NumBuckets}]",
@@ -51,9 +59,8 @@ internal sealed class TransformConverter : JsonConverter<Transform>
             DayTransform => "day",
             HourTransform => "hour",
             VoidTransform => "void",
+            UnknownTransform u => u.Name,
             _ => throw new JsonException($"Unknown transform: {value.GetType().Name}")
         };
-
-        writer.WriteStringValue(str);
     }
 }

@@ -37,7 +37,7 @@ public class V3TypeTests
     {
         var type = IcebergType.Geography("OGC:CRS84", "spherical");
         var json = IcebergJsonSerializer.Serialize(type);
-        Assert.Equal("\"geography(OGC:CRS84,spherical)\"", json);
+        Assert.Equal("\"geography(OGC:CRS84, spherical)\"", json);
 
         var deserialized = IcebergJsonSerializer.Deserialize<IcebergType>(json);
         Assert.IsType<GeographyType>(deserialized);
