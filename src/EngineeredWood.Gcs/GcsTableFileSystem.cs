@@ -79,6 +79,14 @@ public sealed class GcsTableFileSystem : ITableFileSystem, IReadConcurrencyHint
     }
 
     /// <summary>
+    /// The location this file system is rooted at, <c>gs://&lt;bucket&gt;/&lt;root&gt;</c>, for registering it with a
+    /// <see cref="StorageResolver"/>. Throws <see cref="NotSupportedException"/> when the root has a <c>.</c> or
+    /// <c>..</c> segment, which a storage location refuses.
+    /// </summary>
+    public StorageLocation Location =>
+        StorageLocation.Parse("gs://" + _bucket + (_rootPrefix.Length == 0 ? "" : "/" + _rootPrefix.TrimEnd('/')));
+
+    /// <summary>
     /// GCS's documented object-name rules: CR and LF are forbidden outright, and an object may not be
     /// named exactly <c>.</c> or <c>..</c>. Everything else GCS merely "strongly discourages"
     /// (<c># [ ] * ? : " &lt; &gt; |</c>) and accepts — MEASURED against fake-gcs-server with an

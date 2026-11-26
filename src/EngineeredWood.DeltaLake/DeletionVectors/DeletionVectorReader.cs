@@ -15,10 +15,17 @@ namespace EngineeredWood.DeltaLake.DeletionVectors;
 public sealed class DeletionVectorReader
 {
     private readonly ITableFileSystem _fs;
+    private readonly StorageResolver _resolver;
 
-    public DeletionVectorReader(ITableFileSystem fileSystem)
+    /// <summary>
+    /// Creates a reader for the table whose root <paramref name="fileSystem"/> is. Absolute-path (<c>p</c>) vectors
+    /// are read through <paramref name="resolver"/>; without one, every such vector is refused with
+    /// <see cref="UnregisteredStorageLocationException"/>.
+    /// </summary>
+    public DeletionVectorReader(ITableFileSystem fileSystem, StorageResolver? resolver = null)
     {
         _fs = fileSystem;
+        _resolver = resolver ?? new StorageResolver();
     }
 
     /// <summary>
@@ -70,17 +77,18 @@ public sealed class DeletionVectorReader
                 DeltaErrorCodes.InvalidDeletionVector,
                 $"Deletion vector storage type '{dv.StorageType}' has no table-relative path.");
 
-        return await ReadDvFileAsync(filePath, dv.Offset ?? 0, dv.SizeInBytes, cancellationToken)
+        return await ReadDvFileAsync(_fs, filePath, dv.Offset ?? 0, dv.SizeInBytes, cancellationToken)
             .ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Reads a file-based DV with an absolute path.
+    /// Reads a file-based DV with an absolute path, through the resolver: it may lie outside the table's root.
     /// </summary>
     private async ValueTask<DeletionVectorBitmap> ReadAbsoluteFileAsync(
         DeletionVector dv, CancellationToken cancellationToken)
     {
-        return await ReadDvFileAsync(dv.PathOrInlineDv, dv.Offset ?? 0, dv.SizeInBytes, cancellationToken)
+        var resolved = _resolver.Resolve(DeletionVectorPath.AbsoluteLocation(dv));
+        return await ReadDvFileAsync(resolved.FileSystem, resolved.Path, dv.Offset ?? 0, dv.SizeInBytes, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -101,8 +109,8 @@ public sealed class DeletionVectorReader
     /// descriptor and a checksum that disagrees with the bitmap are both refused. There is no fallback to a bare
     /// bitmap at the offset: no writer produces one, and accepting one would need a second read.</para>
     /// </summary>
-    private async ValueTask<DeletionVectorBitmap> ReadDvFileAsync(
-        string path, int offset, int size,
+    private static async ValueTask<DeletionVectorBitmap> ReadDvFileAsync(
+        ITableFileSystem fs, string path, int offset, int size,
         CancellationToken cancellationToken)
     {
         // The read covers the size field and checksum too, and every backend allocates it as one buffer:
@@ -114,7 +122,7 @@ public sealed class DeletionVectorReader
 
         var range = new FileRange(offset, (long)DataSizeLength + size + ChecksumLength);
 
-        IRandomAccessFile file = await _fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+        IRandomAccessFile file = await fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
         try
         {
             IMemoryOwner<byte> owner;

@@ -8,6 +8,7 @@ using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Table;
+using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 
@@ -136,7 +137,10 @@ public class DeletionVectorTests : IDisposable
             .Field(new Field("id", Int64Type.Default, false))
             .Build();
 
-        await using var table = await DeltaTable.CreateAsync(fs, schema);
+        // The absolute vector is reached through the file system registered for where it lies, not the table's.
+        var dvFs = new LocalTableFileSystem(Path.Combine(_tempDir, "elsewhere"));
+        await using var table = await DeltaTable.CreateAsync(fs, schema,
+            new DeltaTableOptions { StorageResolver = new StorageResolver().Register(dvFs) });
 
         // Write 4 rows
         var ids = new Int64Array.Builder()
@@ -156,7 +160,7 @@ public class DeletionVectorTests : IDisposable
         dvBlob.CopyTo(dvFile, 5);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
             dvFile.AsSpan(5 + dvBlob.Length), System.IO.Hashing.Crc32.HashToUInt32(dvBlob));
-        await fs.WriteAllBytesAsync(dvFilePath, dvFile);
+        await dvFs.WriteAllBytesAsync(dvFilePath, dvFile);
 
         // Commit with DV
         var log = new TransactionLog(fs);
@@ -178,7 +182,7 @@ public class DeletionVectorTests : IDisposable
                 DeletionVector = new DeletionVector
                 {
                     StorageType = "p",
-                    PathOrInlineDv = dvFilePath,
+                    PathOrInlineDv = dvFs.Location.Combine(dvFilePath).ToString(),
                     Offset = 1,
                     SizeInBytes = dvBlob.Length,
                     Cardinality = 2,

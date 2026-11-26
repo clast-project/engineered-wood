@@ -1,0 +1,285 @@
+// Copyright (c) clast-project. All rights reserved.
+// Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
+
+using EngineeredWood.IO;
+using EngineeredWood.IO.Local;
+
+namespace EngineeredWood.Core.Tests.IO;
+
+public class StorageLocationTests
+{
+    private static readonly bool IsWindows = Path.DirectorySeparatorChar == '\\';
+
+    [Theory]
+    [InlineData("s3://bucket/a/b", "s3a://bucket/a/b")]
+    [InlineData("s3://bucket/a/b", "s3n://bucket/a/b/")]
+    [InlineData("abfss://c@acct.dfs.core.windows.net/a/b", "https://acct.blob.core.windows.net/c/a/b")]
+    [InlineData("wasbs://c@acct.blob.core.windows.net/a/b", "https://ACCT.blob.core.windows.net/c/a/b")]
+    [InlineData("abfs://c@acct.dfs.core.windows.net/a", "http://acct.blob.core.windows.net/c/a")]
+    [InlineData("file:/tmp/wh/t", "file:///tmp/wh/t")]
+    [InlineData("file:/tmp/wh/t", "file://localhost/tmp/wh/t")]
+    [InlineData("file:/tmp/wh/t", "/tmp/wh/t")]
+    [InlineData("file:/tmp/wh/t", "/tmp/wh/x/../t/.")]
+    [InlineData("file:/C:/wh/t", "C:\\wh\\t")]
+    [InlineData("file:/C:/wh/t", "file:///C:/wh/t/")]
+    [InlineData("file://server/share/t", "\\\\server\\share\\t")]
+    public void SpellingsOfOneLocationAreEqual(string a, string b)
+    {
+        var left = StorageLocation.Parse(a);
+        var right = StorageLocation.Parse(b);
+        Assert.Equal(left, right);
+        Assert.Equal(left.GetHashCode(), right.GetHashCode());
+    }
+
+    [Theory]
+    [InlineData("s3://bucket/a/b", "s3://Bucket/a/b")]
+    [InlineData("s3://bucket/a/b", "s3://bucket/a/B")]
+    [InlineData("s3://bucket/a/b", "gs://bucket/a/b")]
+    [InlineData("s3://bucket/a//b", "s3://bucket/a/b")]
+    [InlineData("s3://bucket/a%2Fb", "s3://bucket/a/b")]
+    [InlineData("s3://bucket/a%20b", "s3://bucket/a b")]
+    [InlineData("abfss://c@acct.dfs.core.windows.net/a", "abfss://c@other.dfs.core.windows.net/a")]
+    [InlineData("abfss://c@acct.dfs.core.windows.net/a", "abfss://d@acct.dfs.core.windows.net/a")]
+    [InlineData("file:/tmp/a%20b", "file:/tmp/a b")]
+    public void DifferentObjectsAreNotEqual(string a, string b) =>
+        Assert.NotEqual(StorageLocation.Parse(a), StorageLocation.Parse(b));
+
+    [Fact]
+    public void FileLocationsCompareByCaseOnlyWhereTheFileSystemDoes()
+    {
+        var lower = StorageLocation.Parse("file:/C:/wh/table");
+        var upper = StorageLocation.Parse("file:/c:/WH/Table");
+        Assert.Equal(IsWindows, lower == upper);
+    }
+
+    [Theory]
+    [InlineData("s3://bucket/a/../b")]
+    [InlineData("s3://bucket/a/./b")]
+    [InlineData("s3://bucket/..")]
+    [InlineData("gs://bucket/t/../x")]
+    [InlineData("abfss://c@acct.dfs.core.windows.net/t/../x")]
+    [InlineData("https://acct.blob.core.windows.net/c/t/../x")]
+    [InlineData("hdfs://nn/t/../x")]
+    public void ObjectStoreDotSegmentsAreRefused(string location)
+    {
+        Assert.Throws<NotSupportedException>(() => StorageLocation.Parse(location));
+        Assert.False(StorageLocation.TryParse(location, out _));
+    }
+
+    [Fact]
+    public void PercentEncodedDotsAreLiteralSegments()
+    {
+        // Nothing is decoded, so %2E%2E is an ordinary segment rather than a way around the refusal.
+        var location = StorageLocation.Parse("s3://bucket/t/%2E%2E/x");
+        Assert.Equal("t/%2E%2E/x", location.RelativeTo(StorageLocation.Parse("s3://bucket")));
+        Assert.True(location.IsUnder(StorageLocation.Parse("s3://bucket/t")));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("relative/path")]
+    [InlineData("C:relative")]
+    [InlineData("s3:/bucket/x")]
+    [InlineData("s3:///x")]
+    [InlineData("file:relative")]
+    [InlineData("/tmp/../../x")]
+    [InlineData("C:/..")]
+    [InlineData("\\\\?\\C:\\x")]
+    [InlineData("s3://bucket/a\nb")]
+    public void NonLocationsAreRefused(string text)
+    {
+        Assert.False(StorageLocation.TryParse(text, out _));
+        Assert.Throws<FormatException>(() => StorageLocation.Parse(text));
+    }
+
+    [Theory]
+    [InlineData("s3://bucket/a/b", "s3://bucket/a/b")]
+    [InlineData("s3a://bucket/t/", "s3a://bucket/t")]
+    [InlineData("file:/C:/wh/t", "file:/C:/wh/t")]
+    [InlineData("file:///tmp/wh/t", "file:///tmp/wh/t")]
+    [InlineData("/tmp/wh/t", "file:///tmp/wh/t")]
+    [InlineData("C:\\wh\\t", "file:///C:/wh/t")]
+    [InlineData("\\\\server\\share\\t", "file://server/share/t")]
+    [InlineData("/", "file:///")]
+    public void ToStringKeepsTheSpellingOfAUri(string text, string expected) =>
+        Assert.Equal(expected, StorageLocation.Parse(text).ToString());
+
+    [Theory]
+    [InlineData("file:/C:/wh/t", "C:\\wh\\t", "C:/wh/t")]
+    [InlineData("file:///tmp/wh/t", "\\tmp\\wh\\t", "/tmp/wh/t")]
+    [InlineData("file://server/share/t", "\\\\server\\share\\t", "//server/share/t")]
+    [InlineData("C:\\", "C:\\", "C:/")]
+    public void LocalPathIsWhatTheOperatingSystemOpens(string text, string windows, string posix) =>
+        Assert.Equal(IsWindows ? windows : posix, StorageLocation.Parse(text).LocalPath);
+
+    [Fact]
+    public void ObjectStoreLocationsHaveNoLocalPath() =>
+        Assert.Null(StorageLocation.Parse("s3://bucket/t").LocalPath);
+
+    [Theory]
+    [InlineData("s3://bucket/table", "s3://bucket/table", true)]
+    [InlineData("s3://bucket/table/x", "s3://bucket/table", true)]
+    [InlineData("s3://bucket/table-other/x", "s3://bucket/table", false)]
+    [InlineData("s3://bucket/tab", "s3://bucket/table", false)]
+    [InlineData("s3://bucket/table/x", "s3://bucket", true)]
+    [InlineData("s3://other/table/x", "s3://bucket", false)]
+    [InlineData("s3a://bucket/table/x", "s3://bucket/table", true)]
+    [InlineData("abfss://c@acct.dfs.core.windows.net/t/x", "https://acct.blob.core.windows.net/c", true)]
+    [InlineData("https://acct.blob.core.windows.net/c2/t", "https://acct.blob.core.windows.net/c", false)]
+    [InlineData("file:/tmp/wh/t/x", "/tmp/wh", true)]
+    [InlineData("file:/tmp/wh-other/t", "/tmp/wh", false)]
+    public void IsUnderComparesWholeSegments(string location, string prefix, bool expected) =>
+        Assert.Equal(expected, StorageLocation.Parse(location).IsUnder(StorageLocation.Parse(prefix)));
+
+    [Fact]
+    public void RelativeToGivesThePathUnderThePrefix()
+    {
+        var table = StorageLocation.Parse("abfss://c@acct.dfs.core.windows.net/wh/t");
+        var container = StorageLocation.Parse("https://acct.blob.core.windows.net/c");
+        Assert.Equal("wh/t", table.RelativeTo(container));
+        Assert.Equal("", table.RelativeTo(table));
+        Assert.Throws<ArgumentException>(() => container.RelativeTo(table));
+    }
+
+    [Fact]
+    public void CombineAppendsSegmentsInTheBasesSpelling()
+    {
+        var table = StorageLocation.Parse("s3a://bucket/wh/t/");
+        var file = table.Combine("data/a=1/x.parquet");
+        Assert.Equal("s3a://bucket/wh/t/data/a=1/x.parquet", file.ToString());
+        Assert.Equal(StorageLocation.Parse("s3://bucket/wh/t/data/a=1/x.parquet"), file);
+        Assert.True(file.IsUnder(table));
+        Assert.Same(table, table.Combine(""));
+    }
+
+    [Fact]
+    public void CombineKeepsObjectStoreSegmentsVerbatim()
+    {
+        var file = StorageLocation.Parse("s3://bucket/t").Combine("a//b%2E/c");
+        Assert.Equal("s3://bucket/t/a//b%2E/c", file.ToString());
+        Assert.Equal("a//b%2E/c", file.RelativeTo(StorageLocation.Parse("s3://bucket/t")));
+    }
+
+    [Theory]
+    [InlineData("s3://bucket/t", "../x")]
+    [InlineData("s3://bucket/t", "a/../b")]
+    [InlineData("s3://bucket/t", "./b")]
+    [InlineData("gs://bucket/t", "a/..")]
+    public void CombineRefusesObjectStoreDotSegments(string baseLocation, string relative) =>
+        Assert.Throws<NotSupportedException>(() => StorageLocation.Parse(baseLocation).Combine(relative));
+
+    [Fact]
+    public void CombineNavigatesFileDotSegmentsButNotAboveTheBase()
+    {
+        var table = StorageLocation.Parse("file:///tmp/wh/t");
+        Assert.Equal(StorageLocation.Parse("/tmp/wh/t/b"), table.Combine("a/../b"));
+        Assert.Equal(StorageLocation.Parse("/tmp/wh/t/b"), table.Combine(".\\b"));
+        Assert.Throws<ArgumentException>(() => table.Combine("../x"));
+        Assert.Throws<ArgumentException>(() => table.Combine("a/../../x"));
+    }
+
+    [Theory]
+    [InlineData("/etc/passwd")]
+    [InlineData("\\x")]
+    [InlineData("C:\\x")]
+    [InlineData("s3://other/x")]
+    [InlineData("file:/x")]
+    public void CombineRefusesAbsolutePaths(string path) =>
+        Assert.Throws<ArgumentException>(() => StorageLocation.Parse("s3://bucket/t").Combine(path));
+
+    [Theory]
+    [InlineData("s3://b/x", true)]
+    [InlineData("file:/x", true)]
+    [InlineData("/x", true)]
+    [InlineData("\\\\s\\x", true)]
+    [InlineData("C:\\x", true)]
+    [InlineData("C:/x", true)]
+    [InlineData("x/y", false)]
+    [InlineData("a=1:2/x", false)]
+    [InlineData("", false)]
+    public void LooksAbsoluteSpotsSchemesAndRootedPaths(string text, bool expected) =>
+        Assert.Equal(expected, StorageLocation.LooksAbsolute(text));
+}
+
+public class StorageResolverTests
+{
+    private sealed class NamedFileSystem(string name) : ITableFileSystem
+    {
+        public string Name { get; } = name;
+        public PathNameConstraints PathConstraints => PathNameConstraints.None;
+        public IAsyncEnumerable<TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public ValueTask<ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+
+    [Fact]
+    public void TheLongestRegisteredPrefixWins()
+    {
+        var bucket = new NamedFileSystem("bucket");
+        var table = new NamedFileSystem("table");
+        var resolver = new StorageResolver()
+            .Register("s3://bucket", bucket)
+            .Register("s3://bucket/wh/t", table);
+
+        var inTable = resolver.Resolve("s3a://bucket/wh/t/data/x.parquet");
+        Assert.Same(table, inTable.FileSystem);
+        Assert.Equal("data/x.parquet", inTable.Path);
+
+        var sibling = resolver.Resolve("s3://bucket/wh/t-other/x");
+        Assert.Same(bucket, sibling.FileSystem);
+        Assert.Equal("wh/t-other/x", sibling.Path);
+
+        Assert.Equal("", resolver.Resolve("s3://bucket/wh/t").Path);
+    }
+
+    [Theory]
+    [InlineData("s3://other-bucket/x")]
+    [InlineData("gs://bucket/x")]
+    [InlineData("hdfs://nn/x")]
+    [InlineData("file:/tmp/x")]
+    public void AnUnregisteredLocationIsRefused(string location)
+    {
+        var resolver = new StorageResolver().Register("s3://bucket", new NamedFileSystem("bucket"));
+        var ex = Assert.Throws<UnregisteredStorageLocationException>(() => resolver.Resolve(location));
+        Assert.Equal(StorageLocation.Parse(location), ex.Location);
+        Assert.False(resolver.TryResolve(StorageLocation.Parse(location), out _));
+    }
+
+    [Fact]
+    public void APrefixRegistersOnce()
+    {
+        var resolver = new StorageResolver().Register("s3://bucket/t", new NamedFileSystem("a"));
+        Assert.Throws<ArgumentException>(() => resolver.Register("s3a://bucket/t/", new NamedFileSystem("b")));
+    }
+
+    [Fact]
+    public async Task ALocalFileSystemRegistersAtItsRoot()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "ew-resolver-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "t", "data"));
+        try
+        {
+            File.WriteAllText(Path.Combine(root, "t", "data", "x.txt"), "hello");
+            var fs = new LocalTableFileSystem(root);
+            var resolver = new StorageResolver().Register(fs);
+
+            string uri = "file:///" + root.Replace('\\', '/').TrimStart('/') + "/t/data/x.txt";
+            var resolved = resolver.Resolve(uri);
+            Assert.Same(fs, resolved.FileSystem);
+            Assert.Equal("t/data/x.txt", resolved.Path);
+            Assert.Equal("hello", System.Text.Encoding.UTF8.GetString(
+                await resolved.FileSystem.ReadAllBytesAsync(resolved.Path)));
+
+            Assert.Equal(fs.Location, resolver.Resolve(root).Prefix);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}

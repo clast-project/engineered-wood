@@ -3,6 +3,7 @@
 
 using System.Text;
 using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.IO;
 
 namespace EngineeredWood.DeltaLake.DeletionVectors;
 
@@ -35,6 +36,33 @@ internal static class DeletionVectorPath
     /// </summary>
     public static bool IsAbsolute(DeletionVector dv) =>
         string.Equals(dv.StorageType, "p", StringComparison.Ordinal);
+
+    /// <summary>
+    /// <para>The location of an absolute-path (<c>p</c>) vector's file. PROTOCOL.md makes it an absolute path, and
+    /// delta-spark reads it as a URI (<c>new Path(new URI(pathOrInlineDv))</c>, MEASURED against delta-spark 4.3.1):
+    /// a relative one is refused there with "Relative URIs are not supported for DVs", and percent-escapes are
+    /// decoded. Both are matched here.</para>
+    /// <para>A <c>.</c> or <c>..</c> segment in an object-store location, written or decoded, is refused, as
+    /// <see cref="StorageLocation"/> refuses it everywhere (#963).</para>
+    /// </summary>
+    public static StorageLocation AbsoluteLocation(DeletionVector dv)
+    {
+        string text = dv.PathOrInlineDv;
+        if (!StorageLocation.LooksAbsolute(text))
+            throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidDeletionVector,
+                $"Deletion vector storage type 'p' must hold an absolute path, but it holds '{text}'.");
+        try
+        {
+            return StorageLocation.Parse(Uri.UnescapeDataString(text));
+        }
+        catch (FormatException ex)
+        {
+            throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidDeletionVector,
+                $"Deletion vector path '{text}' is not a valid absolute location: {ex.Message}", ex);
+        }
+    }
 
     /// <summary>
     /// Spec: <c>pathOrInlineDv = "&lt;random prefix (optional)&gt;&lt;z85-encoded uuid&gt;"</c> (the uuid is

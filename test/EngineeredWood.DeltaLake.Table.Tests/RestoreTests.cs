@@ -822,13 +822,16 @@ public class RestoreTests : IDisposable
     }
 
     /// <summary>An absolute-path deletion vector (storage type <c>p</c>) is checked for existence too.</summary>
-    [Fact]
-    public async Task Restore_ToAVersionWhoseAbsoluteDeletionVectorIsGone_IsRefused()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Restore_ToAVersionWhoseAbsoluteDeletionVectorIsGone_IsRefused(bool registered)
     {
+        string dvLocation = Fs.Location.Combine("elsewhere/absolute_dv.bin").ToString();
         var dv = new DeletionVector
         {
             StorageType = "p",
-            PathOrInlineDv = "elsewhere/absolute_dv.bin",
+            PathOrInlineDv = dvLocation,
             Offset = 1,
             SizeInBytes = 34,
             Cardinality = 1,
@@ -859,10 +862,18 @@ public class RestoreTests : IDisposable
             DataChange = true,
             DeletionVector = dv,
         });
-        await using var table = await DeltaTable.OpenAsync(Fs);
+        await using var table = await DeltaTable.OpenAsync(Fs,
+            registered ? new DeltaTableOptions { StorageResolver = new StorageResolver().Register(Fs) } : DeltaTableOptions.Default);
+
+        if (!registered)
+        {
+            // Nothing reaches the vector, so the restore cannot tell whether it exists, and says so.
+            await Assert.ThrowsAsync<UnregisteredStorageLocationException>(async () => await table.RestoreAsync(1));
+            return;
+        }
 
         var ex = await RefusedAsync(DeltaTableErrorCodes.RestoreMissingFiles, async () => await table.RestoreAsync(1));
-        Assert.Contains("elsewhere/absolute_dv.bin", ex.Message);
+        Assert.Contains(dvLocation, ex.Message);
     }
 
     /// <summary>

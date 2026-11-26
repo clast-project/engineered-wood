@@ -1,0 +1,499 @@
+// Copyright (c) clast-project. All rights reserved.
+// Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
+
+using System.Text;
+
+namespace EngineeredWood.IO;
+
+/// <summary>
+/// <para>An absolute storage location: a local file or directory, or an object or prefix in an object store, named
+/// the way table formats name them (<c>s3://bucket/key</c>, <c>abfss://container@account.dfs.core.windows.net/path</c>,
+/// <c>file:/C:/wh/t</c>, <c>C:\wh\t</c>, <c>/tmp/wh/t</c>).</para>
+///
+/// <para>This is its own parser, not <see cref="System.Uri"/>, because <see cref="System.Uri"/> changes which object a
+/// path names (#963): it collapses <c>.</c> and <c>..</c> for every scheme, decodes <c>%2E%2E</c> before collapsing it
+/// on <c>https</c>, and lowercases hosts. Here the path is kept exactly as given, and only what a scheme defines is
+/// normalized:</para>
+/// <list type="bullet">
+/// <item><c>s3a</c> and <c>s3n</c> are <c>s3</c>.</item>
+/// <item><c>abfs[s]://container@account.dfs.core.windows.net/p</c>, <c>wasb[s]://container@account.blob.core.windows.net/p</c>
+/// and <c>https://account.blob.core.windows.net/container/p</c> are one Azure blob location.</item>
+/// <item>A <c>file</c> location uses <c>/</c> separators, collapses <c>.</c> and <c>..</c>, and compares
+/// case-insensitively on Windows.</item>
+/// <item>Nothing is percent-decoded. A <c>%</c> is a literal character of the name, as it is for Iceberg Java's file
+/// IO and for the Hive-escaped partition directories that Spark writes.</item>
+/// <item>A trailing <c>/</c> is not part of the location: <c>s3://b/t/</c> and <c>s3://b/t</c> are the same table
+/// location.</item>
+/// </list>
+///
+/// <para>A segment that is exactly <c>.</c> or <c>..</c> in any location other than <c>file</c> is REFUSED. In an
+/// object store such a segment is a legal, literal key segment (S3 permits <c>a/../b</c> as a key distinct from
+/// <c>b</c>), and whether a table format's path means it literally or as navigation has to match what the other
+/// engines do; until that is decided (#963), EW does not guess.</para>
+///
+/// <para>Equality and hashing use the normalized form, so one location has one identity however it was spelled.
+/// <see cref="ToString"/> keeps the spelling it was given, so a location EW derives from a table's own location is
+/// written back in that table's spelling.</para>
+/// </summary>
+public sealed class StorageLocation : IEquatable<StorageLocation>
+{
+    private static readonly bool IsWindows = Path.DirectorySeparatorChar == '\\';
+
+    private readonly string _text;
+
+    // The normalized identity: scheme, authority, and the path's segments (no leading or trailing empty segment).
+    private readonly string _keyScheme;
+    private readonly string _keyAuthority;
+    private readonly string[] _segments;
+
+    private StorageLocation(string text, string scheme, string keyScheme, string keyAuthority, string[] segments)
+    {
+        _text = text;
+        Scheme = scheme;
+        _keyScheme = keyScheme;
+        _keyAuthority = keyAuthority;
+        _segments = segments;
+    }
+
+    /// <summary>The scheme as given, lowercased (<c>s3a</c>, <c>abfss</c>, <c>file</c>).</summary>
+    public string Scheme { get; }
+
+    /// <summary>True for a location on the local file system (<c>file</c> URIs and bare local paths).</summary>
+    public bool IsFile => _keyScheme == "file";
+
+    /// <summary>
+    /// For a <see cref="IsFile">file</see> location, the path in the form the local operating system opens:
+    /// <c>C:\wh\t</c>, <c>\\server\share\x</c> or <c>/tmp/wh/t</c>. <see langword="null"/> for any other location.
+    /// </summary>
+    public string? LocalPath
+    {
+        get
+        {
+            if (!IsFile)
+                return null;
+            string joined = string.Join("/", _segments);
+            string path = _keyAuthority.Length > 0
+                ? "//" + _keyAuthority + "/" + joined
+                : IsDriveSegment(_segments) ? joined + (_segments.Length == 1 ? "/" : "") : "/" + joined;
+            return IsWindows ? path.Replace('/', '\\') : path;
+        }
+    }
+
+    /// <summary>
+    /// Parses an absolute location. Throws <see cref="FormatException"/> for text that is not one (a relative
+    /// path, an empty string, a malformed URI) and <see cref="NotSupportedException"/> for a <c>.</c> or <c>..</c>
+    /// segment outside a <c>file</c> location.
+    /// </summary>
+    public static StorageLocation Parse(string location)
+    {
+        if (location is null)
+            throw new ArgumentNullException(nameof(location));
+        return ParseCore(location, throwOnError: true)!;
+    }
+
+    /// <summary>
+    /// Parses an absolute location, returning <see langword="false"/> for anything <see cref="Parse"/> would refuse.
+    /// </summary>
+    public static bool TryParse(string? location, out StorageLocation? result)
+    {
+        result = location is null ? null : ParseCore(location, throwOnError: false);
+        return result is not null;
+    }
+
+    /// <summary>
+    /// True when <paramref name="text"/> names an absolute location (it has a URI scheme, or is a rooted local path)
+    /// rather than a path relative to some base. It says nothing about whether <see cref="Parse"/> accepts it.
+    /// </summary>
+    public static bool LooksAbsolute(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return false;
+        if (text[0] is '/' or '\\')
+            return true;
+        if (IsDriveLetterPath(text))
+            return true;
+        return SchemeLength(text) > 0;
+    }
+
+    /// <summary>
+    /// The location <paramref name="relativePath"/> names under this one. Segments are separated by <c>/</c> and
+    /// appended as given. In a <c>file</c> location <c>.</c> and <c>..</c> navigate, and climbing above this location
+    /// is refused; anywhere else they are refused (see the type's remarks). An absolute path or URI is refused too:
+    /// parse it instead.
+    /// </summary>
+    public StorageLocation Combine(string relativePath)
+    {
+        if (relativePath is null)
+            throw new ArgumentNullException(nameof(relativePath));
+        if (LooksAbsolute(relativePath))
+            throw new ArgumentException(
+                $"'{relativePath}' is absolute; parse it as a location rather than combining it with '{this}'.",
+                nameof(relativePath));
+
+        string rel = IsFile ? relativePath.Replace('\\', '/') : relativePath;
+        rel = rel.TrimEnd('/');
+        if (rel.Length == 0)
+            return this;
+
+        string[] parts = rel.Split('/');
+        var segments = new List<string>(_segments);
+        int floor = _segments.Length;
+        foreach (string part in parts)
+        {
+            if (part is "." or "..")
+            {
+                if (!IsFile)
+                    throw DotSegmentRefusal(relativePath);
+                if (part == ".")
+                    continue;
+                if (segments.Count <= floor)
+                    throw new ArgumentException(
+                        $"'{relativePath}' climbs above '{this}'.", nameof(relativePath));
+                segments.RemoveAt(segments.Count - 1);
+                continue;
+            }
+
+            if (IsFile && part.Length == 0)
+                continue;
+            segments.Add(part);
+        }
+
+        string text = _text + (_text.EndsWith("/", StringComparison.Ordinal) ? "" : "/") +
+            string.Join("/", segments.Skip(_segments.Length));
+        return new StorageLocation(text, Scheme, _keyScheme, _keyAuthority, segments.ToArray());
+    }
+
+    /// <summary>
+    /// True when this location is <paramref name="prefix"/> or lies under it. Segments are compared whole, so
+    /// <c>s3://b/table-other</c> is not under <c>s3://b/table</c>.
+    /// </summary>
+    public bool IsUnder(StorageLocation prefix) => RelativeSegmentsFrom(prefix) >= 0;
+
+    /// <summary>
+    /// The path of this location relative to <paramref name="prefix"/>, with <c>/</c> separators: <c>""</c> when the
+    /// two are the same location. Throws <see cref="ArgumentException"/> when this location is not under it.
+    /// </summary>
+    public string RelativeTo(StorageLocation prefix)
+    {
+        int start = RelativeSegmentsFrom(prefix);
+        if (start < 0)
+            throw new ArgumentException($"'{this}' is not under '{prefix}'.", nameof(prefix));
+        return string.Join("/", _segments, start, _segments.Length - start);
+    }
+
+    /// <summary>The number of path segments this location has after its authority.</summary>
+    internal int SegmentCount => _segments.Length;
+
+    private int RelativeSegmentsFrom(StorageLocation prefix)
+    {
+        if (prefix is null)
+            throw new ArgumentNullException(nameof(prefix));
+        if (_keyScheme != prefix._keyScheme || !AuthorityEquals(prefix) || prefix._segments.Length > _segments.Length)
+            return -1;
+        for (int i = 0; i < prefix._segments.Length; i++)
+        {
+            if (!string.Equals(_segments[i], prefix._segments[i], SegmentComparison))
+                return -1;
+        }
+
+        return prefix._segments.Length;
+    }
+
+    private StringComparison SegmentComparison =>
+        IsFile && IsWindows ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+    private bool AuthorityEquals(StorageLocation other) =>
+        string.Equals(_keyAuthority, other._keyAuthority, IsFile ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+
+    /// <summary>The location as it was given (without a trailing <c>/</c>), or as built by <see cref="Combine"/>.</summary>
+    public override string ToString() => _text;
+
+    /// <inheritdoc/>
+    public bool Equals(StorageLocation? other)
+    {
+        if (other is null)
+            return false;
+        if (ReferenceEquals(this, other))
+            return true;
+        return _segments.Length == other._segments.Length && RelativeSegmentsFrom(other) == _segments.Length;
+    }
+
+    /// <inheritdoc/>
+    public override bool Equals(object? obj) => Equals(obj as StorageLocation);
+
+    /// <inheritdoc/>
+    public override int GetHashCode()
+    {
+        StringComparer comparer = IsFile && IsWindows ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        int hash = StringComparer.Ordinal.GetHashCode(_keyScheme);
+        hash = unchecked(hash * 31 + StringComparer.OrdinalIgnoreCase.GetHashCode(_keyAuthority));
+        foreach (string segment in _segments)
+            hash = unchecked(hash * 31 + comparer.GetHashCode(segment));
+        return hash;
+    }
+
+    /// <summary>Compares two locations by their normalized form.</summary>
+    public static bool operator ==(StorageLocation? left, StorageLocation? right) =>
+        left is null ? right is null : left.Equals(right);
+
+    /// <summary>Compares two locations by their normalized form.</summary>
+    public static bool operator !=(StorageLocation? left, StorageLocation? right) => !(left == right);
+
+    // ---------------------------------------------------------------- parsing
+
+    private static StorageLocation? ParseCore(string location, bool throwOnError)
+    {
+        if (location.Length == 0)
+            return Fail(throwOnError, "A storage location cannot be empty.");
+        foreach (char c in location)
+        {
+            if (char.IsControl(c))
+                return Fail(throwOnError, $"Storage location '{location}' contains a control character.");
+        }
+
+        if (IsDriveLetterPath(location) || location[0] is '/' or '\\')
+            return ParseLocalPath(location, throwOnError);
+
+        int schemeLength = SchemeLength(location);
+        if (schemeLength == 0)
+            return Fail(throwOnError,
+                $"'{location}' is not an absolute storage location: it has no scheme and is not a rooted local path.");
+
+        string scheme = location.Substring(0, schemeLength).ToLowerInvariant();
+        string rest = location.Substring(schemeLength + 1);
+        if (scheme == "file")
+            return ParseFileUri(location, rest, throwOnError);
+
+        if (!rest.StartsWith("//", StringComparison.Ordinal))
+            return Fail(throwOnError, $"Storage location '{location}' has no authority ('{scheme}://<authority>/...').");
+        rest = rest.Substring(2);
+        int slash = rest.IndexOf('/');
+        string authority = slash < 0 ? rest : rest.Substring(0, slash);
+        string path = slash < 0 ? "" : rest.Substring(slash + 1);
+        if (authority.Length == 0)
+            return Fail(throwOnError, $"Storage location '{location}' has an empty authority.");
+        if (authority.IndexOfAny(['?', '#']) >= 0 || (scheme is "http" or "https" && path.IndexOfAny(['?', '#']) >= 0))
+            return Fail(throwOnError, $"Storage location '{location}' has a query or fragment, which a storage location cannot.");
+
+        string text = location.TrimEnd('/');
+        if (text.Length < schemeLength + 3 + authority.Length)
+            text = location.Substring(0, schemeLength + 3 + authority.Length);
+        string[] segments = SplitPath(path.TrimEnd('/'));
+        foreach (string segment in segments)
+        {
+            if (segment is "." or "..")
+            {
+                if (throwOnError)
+                    throw DotSegmentRefusal(location);
+                return null;
+            }
+        }
+
+        switch (scheme)
+        {
+            case "s3":
+            case "s3a":
+            case "s3n":
+                return new StorageLocation(text, scheme, "s3", authority, segments);
+
+            case "abfs":
+            case "abfss":
+            case "wasb":
+            case "wasbs":
+            {
+                int at = authority.IndexOf('@');
+                if (at <= 0 || at == authority.Length - 1)
+                    return Fail(throwOnError,
+                        $"Azure location '{location}' must name its container: '{scheme}://<container>@<account host>/...'.");
+                string container = authority.Substring(0, at);
+                string host = BlobHost(authority.Substring(at + 1));
+                return new StorageLocation(text, scheme, "azure", host, Prepend(container, segments));
+            }
+
+            case "http":
+            case "https":
+            {
+                string host = authority.ToLowerInvariant();
+                if (IsAzureStorageHost(host))
+                {
+                    // The blob endpoint names the container as the first segment.
+                    return new StorageLocation(text, scheme, "azure", BlobHost(host), segments);
+                }
+
+                return new StorageLocation(text, scheme, "https", host, segments);
+            }
+
+            default:
+                return new StorageLocation(text, scheme, scheme, authority, segments);
+        }
+    }
+
+    private static StorageLocation? ParseFileUri(string location, string rest, bool throwOnError)
+    {
+        // file:/C:/x and file:/tmp/x (Hadoop), file:///C:/x and file:///tmp/x (RFC 8089), file://localhost/x,
+        // file://server/share/x (UNC). A query or fragment cannot be part of a file location.
+        string authority = "";
+        string path;
+        if (rest.StartsWith("//", StringComparison.Ordinal))
+        {
+            string afterSlashes = rest.Substring(2);
+            int slash = afterSlashes.IndexOf('/');
+            authority = slash < 0 ? afterSlashes : afterSlashes.Substring(0, slash);
+            path = slash < 0 ? "/" : afterSlashes.Substring(slash);
+            if (string.Equals(authority, "localhost", StringComparison.OrdinalIgnoreCase))
+                authority = "";
+        }
+        else if (rest.StartsWith("/", StringComparison.Ordinal))
+        {
+            path = rest;
+        }
+        else
+        {
+            return Fail(throwOnError, $"File location '{location}' is not absolute.");
+        }
+
+        if (path.IndexOfAny(['?', '#']) >= 0)
+            return Fail(throwOnError, $"File location '{location}' has a query or fragment.");
+
+        // /C:/x is the drive path C:/x.
+        string localPath = path.Length >= 3 && path[0] == '/' && IsDriveLetterPath(path.Substring(1))
+            ? path.Substring(1)
+            : path;
+        if (authority.Length > 0)
+            localPath = "//" + authority + localPath;
+        return BuildFile(location, localPath, throwOnError);
+    }
+
+    private static StorageLocation? ParseLocalPath(string location, bool throwOnError)
+    {
+        string text = location.Replace('\\', '/');
+        if (text.StartsWith("//", StringComparison.Ordinal))
+        {
+            // \\?\ and \\.\ device paths name things a table format never points at.
+            if (text.StartsWith("//?/", StringComparison.Ordinal) || text.StartsWith("//./", StringComparison.Ordinal))
+                return Fail(throwOnError, $"Device path '{location}' is not a storage location.");
+        }
+
+        if (IsDriveLetterPath(text) && (text.Length == 2 || text[2] != '/'))
+            return Fail(throwOnError, $"'{location}' is relative to the current directory of drive {text[0]}:.");
+        return BuildFile(null, text, throwOnError);
+    }
+
+    /// <summary>Builds a file location from a <c>/</c>-separated local path: <c>C:/x</c>, <c>//server/share/x</c> or
+    /// <c>/x</c>. <paramref name="uriText"/> is the URI it was given as, or null for a bare path.</summary>
+    private static StorageLocation? BuildFile(string? uriText, string localPath, bool throwOnError)
+    {
+        string authority = "";
+        string path = localPath;
+        if (path.StartsWith("//", StringComparison.Ordinal))
+        {
+            int slash = path.IndexOf('/', 2);
+            authority = slash < 0 ? path.Substring(2) : path.Substring(2, slash - 2);
+            path = slash < 0 ? "" : path.Substring(slash);
+            if (authority.Length == 0)
+                return Fail(throwOnError, $"'{uriText ?? localPath}' names no UNC server.");
+        }
+
+        var segments = new List<string>();
+        int floor = 0;
+        string[] parts = path.Split('/');
+        for (int i = 0; i < parts.Length; i++)
+        {
+            string part = parts[i];
+            if (part.Length == 0 || part == ".")
+                continue;
+            if (part == "..")
+            {
+                if (segments.Count <= floor)
+                    return Fail(throwOnError, $"'{uriText ?? localPath}' climbs above its root.");
+                segments.RemoveAt(segments.Count - 1);
+                continue;
+            }
+
+            segments.Add(part);
+            // A drive (C:) or a UNC share is the root: nothing climbs above it.
+            if (segments.Count == 1 && (IsDriveSegment(part) || authority.Length > 0))
+                floor = 1;
+        }
+
+        string text;
+        if (uriText is not null)
+        {
+            text = uriText.TrimEnd('/');
+            if (text.EndsWith(":", StringComparison.Ordinal) || text.Length < "file:/".Length)
+                text = uriText;
+        }
+        else
+        {
+            // A bare path is formatted as the URI other engines read: file:///C:/x, file:///tmp/x, file://server/x.
+            var sb = new StringBuilder("file://");
+            if (authority.Length > 0)
+                sb.Append(authority);
+            foreach (string segment in segments)
+                sb.Append('/').Append(segment);
+            if (segments.Count == 0)
+                sb.Append('/');
+            text = sb.ToString();
+        }
+
+        return new StorageLocation(text, "file", "file", authority, segments.ToArray());
+    }
+
+    private static string[] SplitPath(string path) => path.Length == 0 ? [] : path.Split('/');
+
+    private static string[] Prepend(string first, string[] rest)
+    {
+        var all = new string[rest.Length + 1];
+        all[0] = first;
+        Array.Copy(rest, 0, all, 1, rest.Length);
+        return all;
+    }
+
+    private static bool IsAzureStorageHost(string host) =>
+        host.IndexOf(".blob.", StringComparison.Ordinal) > 0 || host.IndexOf(".dfs.", StringComparison.Ordinal) > 0;
+
+    /// <summary>The blob endpoint of an Azure storage host: <c>account.dfs.core.windows.net</c> becomes
+    /// <c>account.blob.core.windows.net</c>. Hosts are case-insensitive, so it is lowercased.</summary>
+    private static string BlobHost(string host)
+    {
+        host = host.ToLowerInvariant();
+        int dfs = host.IndexOf(".dfs.", StringComparison.Ordinal);
+        return dfs > 0 ? host.Substring(0, dfs) + ".blob." + host.Substring(dfs + ".dfs.".Length) : host;
+    }
+
+    /// <summary>The length of a URI scheme at the start of <paramref name="text"/> (before its <c>:</c>), or 0. A
+    /// single letter followed by <c>:</c> is a drive, not a scheme.</summary>
+    private static int SchemeLength(string text)
+    {
+        if (text.Length == 0 || !IsAsciiLetter(text[0]))
+            return 0;
+        for (int i = 1; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (c == ':')
+                return i >= 2 ? i : 0;
+            if (!(IsAsciiLetter(c) || c is >= '0' and <= '9' || c is '+' or '-' or '.'))
+                return 0;
+        }
+
+        return 0;
+    }
+
+    private static bool IsDriveLetterPath(string text) =>
+        text.Length >= 2 && IsAsciiLetter(text[0]) && text[1] == ':' && (text.Length == 2 || text[2] is '/' or '\\');
+
+    private static bool IsDriveSegment(string segment) =>
+        segment.Length == 2 && IsAsciiLetter(segment[0]) && segment[1] == ':';
+
+    private static bool IsDriveSegment(string[] segments) => segments.Length > 0 && IsDriveSegment(segments[0]);
+
+    private static bool IsAsciiLetter(char c) => c is >= 'a' and <= 'z' or >= 'A' and <= 'Z';
+
+    private static StorageLocation? Fail(bool throwOnError, string message) =>
+        throwOnError ? throw new FormatException(message) : null;
+
+    private static NotSupportedException DotSegmentRefusal(string path) =>
+        new($"'{path}' has a '.' or '..' segment in an object-store location. In an object store such a segment " +
+            "is a literal part of the key, and whether a table format means it literally or as navigation is not " +
+            "decided yet (#963), so EW refuses it rather than guess.");
+}
