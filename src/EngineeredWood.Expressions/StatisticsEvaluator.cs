@@ -785,11 +785,11 @@ public static partial class StatisticsEvaluator
         if (a.IsNull || b.IsNull)
             return true;
 
-        // Not a Guid or a TimeOnly either: a Spark-configured evaluator cannot type one and throws, which a
-        // fold would replace with an answer.
+        // Not a Guid, a TimeOnly or a nanosecond timestamp either: a Spark-configured evaluator cannot type
+        // one and throws, which a fold would replace with an answer.
         if (a.Type == b.Type)
             return a.Type is not (LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal
-                or LiteralValue.Kind.Guid or LiteralValue.Kind.TimeOnly);
+                or LiteralValue.Kind.Guid or LiteralValue.Kind.TimeOnly or LiteralValue.Kind.TimestampNanos);
 
         bool aIntegral = IsIntegral(a.Type), bIntegral = IsIntegral(b.Type);
         return (aIntegral && bIntegral)

@@ -55,6 +55,13 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         TimeOnly,
         DateTimeOffset,
         Guid,
+
+        /// <summary>
+        /// An instant with nanosecond precision, held as nanoseconds since 1970-01-01T00:00:00Z
+        /// (a signed 64-bit count, so 1677-09-21 to 2262-04-11). See
+        /// <see cref="TimestampNanosOf(long)"/>.
+        /// </summary>
+        TimestampNanos,
     }
 
     private readonly Kind _kind;
@@ -143,6 +150,21 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     /// </summary>
     public static LiteralValue HighPrecisionDecimalOf(BigInteger unscaledValue, int scale) =>
         new(Kind.HighPrecisionDecimal, new InlineStorage { Int32 = scale }, unscaledValue);
+
+    /// <summary>
+    /// Creates a timestamp with nanosecond precision from nanoseconds since the Unix epoch.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="DateTimeOffset"/> resolves only 100 ns ticks, so a nanosecond timestamp held as one
+    /// rounds, and a rounded bound can prune a file that holds a match. This kind keeps every
+    /// nanosecond. It compares exactly against <see cref="Kind.DateTimeOffset"/> and
+    /// <see cref="Kind.DateOnly"/> values, and against another of its kind by the count. Like the
+    /// <see cref="Kind.DateTimeOffset"/> kind, it does not say whether the column it came from is
+    /// adjusted to UTC: a timestamp without a zone is held as its wall-clock reading in UTC.
+    /// </remarks>
+    /// <param name="nanosSinceEpoch">Nanoseconds since 1970-01-01T00:00:00Z.</param>
+    public static LiteralValue TimestampNanosOf(long nanosSinceEpoch) =>
+        new(Kind.TimestampNanos, new InlineStorage { Int64 = nanosSinceEpoch }, null);
 
     // ── Implicit conversions ──
 
@@ -233,6 +255,11 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         ? ((BigInteger)_ref!, _inline.Int32)
         : throw InvalidAccess(Kind.HighPrecisionDecimal);
 
+    /// <summary>Nanoseconds since the Unix epoch, for a <see cref="Kind.TimestampNanos"/> value.</summary>
+    public long AsTimestampNanos => _kind == Kind.TimestampNanos
+        ? _inline.Int64
+        : throw InvalidAccess(Kind.TimestampNanos);
+
     /// <summary>
     /// Returns the underlying value boxed as <c>object</c>. Avoid in hot paths;
     /// prefer the typed accessors.
@@ -258,6 +285,7 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         Kind.TimeOnly => _inline.TimeOnly,
 #endif
         Kind.HighPrecisionDecimal => AsHighPrecisionDecimal,
+        Kind.TimestampNanos => new NanosecondTimestamp(_inline.Int64),
         _ => throw new InvalidOperationException($"Unknown LiteralValue kind: {_kind}"),
     };
 
@@ -314,6 +342,7 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
             Kind.HighPrecisionDecimal =>
                 _inline.Int32 == other._inline.Int32 &&
                 Equals(_ref, other._ref),
+            Kind.TimestampNanos => _inline.Int64 == other._inline.Int64,
             _ => false,
         };
     }
@@ -352,6 +381,7 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
 #endif
             Kind.Binary => BinaryHashCode((byte[]?)_ref),
             Kind.HighPrecisionDecimal => CombineHash(_inline.Int32.GetHashCode(), _ref?.GetHashCode() ?? 0),
+            Kind.TimestampNanos => _inline.Int64.GetHashCode(),
             _ => _ref?.GetHashCode() ?? 0,
         };
 
@@ -417,6 +447,7 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
                 Kind.TimeOnly => _inline.TimeOnly.CompareTo(other._inline.TimeOnly),
 #endif
                 Kind.HighPrecisionDecimal => CompareHighPrecisionDecimal(this, other),
+                Kind.TimestampNanos => _inline.Int64.CompareTo(other._inline.Int64),
                 _ => throw new InvalidOperationException($"Cannot compare {_kind} values."),
             };
         }
@@ -456,6 +487,14 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
             // The one branch that can lose information, so the one that reports it.
             exact = ExactAsDouble(a) && ExactAsDouble(b);
             return CompareFloating(ad, bd);
+        }
+
+        // A nanosecond timestamp against any other instant compares exactly, in nanoseconds, so it never
+        // passes through the 100 ns ticks the other kinds hold.
+        if (a._kind == Kind.TimestampNanos || b._kind == Kind.TimestampNanos)
+        {
+            if (TryAsEpochNanos(a, out var an) && TryAsEpochNanos(b, out var bn))
+                return an.CompareTo(bn);
         }
 
 #if NET6_0_OR_GREATER
@@ -553,6 +592,36 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         instant = default;
         return false;
     }
+#endif
+
+    private static readonly long UnixEpochTicks = new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero).UtcTicks;
+
+    /// <summary>
+    /// Views an instant as nanoseconds since the Unix epoch. In a <see cref="BigInteger"/>, because a
+    /// <see cref="DateTimeOffset"/> spans years 1 to 9999 and a signed 64-bit nanosecond count does not.
+    /// </summary>
+    private static bool TryAsEpochNanos(LiteralValue v, out BigInteger nanos)
+    {
+        switch (v._kind)
+        {
+            case Kind.TimestampNanos:
+                nanos = v._inline.Int64;
+                return true;
+            case Kind.DateTimeOffset:
+                nanos = new BigInteger(v.AsDateTimeOffset.UtcTicks - UnixEpochTicks) * 100;
+                return true;
+#if NET6_0_OR_GREATER
+            case Kind.DateOnly:
+                nanos = new BigInteger((long)(v._inline.DateOnly.DayNumber - UnixEpochDayNumber) * TimeSpan.TicksPerDay) * 100;
+                return true;
+#endif
+        }
+        nanos = default;
+        return false;
+    }
+
+#if NET6_0_OR_GREATER
+    private static readonly int UnixEpochDayNumber = new DateOnly(1970, 1, 1).DayNumber;
 #endif
 
     internal static bool TryAsInt64(LiteralValue v, out long result)

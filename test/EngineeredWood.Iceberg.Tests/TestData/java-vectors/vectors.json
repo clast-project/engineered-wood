@@ -1,0 +1,25 @@
+{
+ "source": "https://github.com/apache/iceberg/tree/apache-iceberg-1.12.0/core/src/test/resources/org/apache/iceberg",
+ "files": {
+  "deletes/64map32bitvals.bin": {"sha256": "3e767bc7ca1016f1f1f757da3d650adb997d7ecff9195ee7306dc7029ef739a7", "kind": "roaring64", "java": "reads"},
+  "deletes/64mapempty.bin": {"sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc", "kind": "roaring64", "java": "reads", "positions": []},
+  "deletes/64maphighvals.bin": {"sha256": "11ec16f5fe8ce50181d7c22e9409bb89445af61b927928c3a145420b454316c6", "kind": "roaring64-mangled", "java": "refuses: Invalid unsigned key",
+   "note": "Mangled upstream, byte-identical to apache/iceberg at 1.12.0: every byte >= 0x80 of CRoaring's original was replaced by U+FFFD (EF BF BD), as a text conversion does. Java's refusal holds only because the first key it reads is that replacement text, 0xEFBDBFEF. Not a valid bitmap; do not use as a positive case."},
+  "deletes/64mapspreadvals.bin": {"sha256": "1d40bfe6531faa13217d3df4301a1e6a6392416ee91628520d63ded1f3babc0e", "kind": "roaring64", "java": "reads"},
+  "deletes/empty-position-index.bin": {"sha256": "934731946f34f526bfa6b0d19c5144c189773a5f3f783f79891a8e990e9fe2ed", "kind": "dv", "positions": []},
+  "deletes/small-alternating-values-position-index.bin": {"sha256": "c8237ab02ae9715deaf351114962ffc73fdfea63d8e74b7815de4e6f40993112", "kind": "dv", "positions": [1, 3, 5, 7, 9]},
+  "deletes/small-and-large-values-position-index.bin": {"sha256": "45561868f486e4ebdba263e6ab5478f3eb52d372998883939fd64d385a68bf0e", "kind": "dv", "positions": [100, 101, 2147483747, 2147483748]},
+  "deletes/all-container-types-position-index.bin": {"sha256": "98f569f1e0dfe39d38b83c8b3c852d3ba1e7fd8179bb4da19dc94f5318ec70ae", "kind": "dv",
+   "positions_note": "position(bitmap, container, value) = bitmap << 32 | container << 16 | value; a four-element entry is a range [from, to), as Java's delete(start, end)",
+   "positions": [[0, 0, 5], [0, 0, 7], [0, 1, 1, 1000], [0, 2, 1, 65535], [1, 0, 10], [1, 0, 20], [1, 1, 10, 500], [1, 2, 1, 65535]]},
+  "puffin/v1/empty-puffin-uncompressed.bin": {"sha256": "e11725030fcc6bd11a2d7249d87fd1717c9b8c7df55d070418b4cc00a4da953e", "kind": "puffin", "footer_size": 28, "blobs": [], "properties": {}},
+  "puffin/v1/sample-metric-data-uncompressed.bin": {"sha256": "23bd3eab427835f39c769867952699bbde99a6589081c52c670704801af0bea9", "kind": "puffin", "codec": null,
+   "properties": {"created-by": "Test 1234"},
+   "blobs": [{"type": "some-blob", "fields": [1], "offset": 4, "data": "abcdefghi"},
+             {"type": "some-other-blob", "fields": [2], "data": "some blob \u0000 binary data 🤯 that is not very very very very very very long, is it?"}]},
+  "puffin/v1/sample-metric-data-compressed-zstd.bin": {"sha256": "5854d108cb01169e3951b14463e5ec0fb7cd2845d17bf2a4b338308ccceb26a3", "kind": "puffin", "codec": "zstd", "footer_size": 314,
+   "properties": {"created-by": "Test 1234"},
+   "blobs": [{"type": "some-blob", "fields": [1], "offset": 4, "data": "abcdefghi"},
+             {"type": "some-other-blob", "fields": [2], "data": "some blob \u0000 binary data 🤯 that is not very very very very very very long, is it?"}]}
+ }
+}

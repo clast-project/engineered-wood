@@ -1,0 +1,13 @@
+{
+ "generator": "test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go/generate_corpus.py",
+ "iceberg_go_version": "v0.8.0-rc0",
+ "go_version": "go1.27.4",
+ "warehouse_uri": "file:///C:/tmp/ew-iceberg-corpus/iceberg-go/warehouse",
+ "tables": [
+  "v3_dv",
+  "v3_part",
+  "v2_upgrade",
+  "v3_cow",
+  "v3_eqdel"
+ ]
+}
