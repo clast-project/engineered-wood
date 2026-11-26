@@ -216,6 +216,16 @@ jobs:
           datafusion==54.0.0
           fastavro==1.12.2 lz4==4.4.5
 
+      # The iceberg-go tier (test/EngineeredWood.Iceberg.Tests/Interop/IcebergGo.cs) builds its Go driver
+      # on first use. go.mod pins iceberg-go (>= 0.8.0: 0.7.0 resurrects deleted rows after a v2->v3
+      # upgrade) and names the Go version; the module cache is keyed on go.sum.
+      - name: Setup Go
+        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go/go.mod
+          cache-dependency-path: test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go/go.sum
+
       - name: Restore
         if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
         run: dotnet restore "${{ steps.select.outputs.target }}"
@@ -247,6 +257,7 @@ jobs:
           EW_REQUIRE_DELTA_INTEROP: '1'
           EW_REQUIRE_DUCKDB_INTEROP: '1'
           EW_REQUIRE_PARQUET_READERS_INTEROP: '1'
+          EW_REQUIRE_ICEBERG_GO_INTEROP: '1'
         # LogFilePrefix, not LogFileName: most test projects target three frameworks, and a
         # fixed file name made each framework's results overwrite the last, so the uploaded
         # artifact held one framework per project. The prefix gets the framework and a

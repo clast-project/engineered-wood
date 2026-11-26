@@ -13,6 +13,8 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
+    <!-- The interop tiers decide at RUNTIME whether their toolchain exists; see InteropDriver.Require. -->
+    <PackageReference Include="Xunit.SkippableFact" />
   </ItemGroup>
 
   <ItemGroup>
@@ -23,6 +25,14 @@
     <ProjectReference Include="..\..\src\EngineeredWood.Core\EngineeredWood.Core.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Iceberg\EngineeredWood.Iceberg.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Expressions\EngineeredWood.Expressions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The iceberg-go driver's source travels to the test output and is built there on first use
+         (Interop/IcebergGo.cs). -->
+    <None Update="Interop\iceberg-go\*.go;Interop\iceberg-go\go.mod;Interop\iceberg-go\go.sum" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Shared with the Delta and Parquet suites' tiers; see test/Shared/InteropDriver.cs. -->
+    <Compile Include="..\Shared\InteropDriver.cs" Link="Interop\InteropDriver.cs" />
   </ItemGroup>
 
 </Project>
