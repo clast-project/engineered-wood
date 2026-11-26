@@ -53,8 +53,8 @@ public sealed class AvroReader : IEnumerable<RecordBatch>, IDisposable
             if (readerSchema.Parsed is not AvroRecordSchema readerRecord)
                 throw new InvalidOperationException("Reader schema must be a record type.");
 
-            // Only the reader's empty records are left out: a writer's empty field is then skipped (zero bytes),
-            // and one the reader gives fields to resolves to their defaults.
+            // Only the reader's empty records are left out. A writer field of an empty record type is then skipped
+            // (it takes zero bytes), or, when the reader's record adds fields, those fields take their defaults.
             var resolution = SchemaResolver.Resolve(writerRecord, EmptyRecords.Strip(readerRecord));
             Schema = resolution.ArrowSchema;
             _assembler = new RecordBatchAssembler(writerRecord, resolution);
