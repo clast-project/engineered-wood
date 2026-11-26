@@ -13,6 +13,7 @@ namespace EngineeredWood.Iceberg;
 /// </summary>
 /// <param name="SpecId">The unique identifier for this partition spec.</param>
 /// <param name="Fields">The ordered list of partition fields.</param>
+[JsonConverter(typeof(PartitionSpecConverter))]
 public sealed record PartitionSpec(int SpecId, IReadOnlyList<PartitionField> Fields)
 {
     /// <summary>A partition spec with no fields, representing an unpartitioned table.</summary>

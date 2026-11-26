@@ -180,21 +180,40 @@ public sealed record TableMetadata : IJsonOnDeserialized
         EncryptionKeys is { Count: > 0 } || Snapshots.Any(s => s.KeyId is not null);
 
     /// <summary>
-    /// Throws <see cref="UnsupportedTableFeatureException"/> when the table's data cannot be read or
-    /// written safely by this library: the table, or <paramref name="snapshot"/>, is encrypted. Reading an
-    /// encrypted manifest list as plaintext would misread it, and writing plaintext files into an encrypted
-    /// table would leave its data unprotected.
+    /// Throws <see cref="UnsupportedTableFeatureException"/> when <paramref name="snapshot"/>'s data cannot be
+    /// read safely by this library: the table, or the snapshot, is encrypted. Reading an encrypted manifest
+    /// list as plaintext would misread it.
     /// </summary>
-    internal void ThrowIfDataInaccessible(Snapshot? snapshot = null)
+    internal void ThrowIfDataInaccessible(Snapshot snapshot)
+    {
+        ThrowIfTableKeys("read");
+        if (snapshot.KeyId is { } keyId)
+            throw new UnsupportedTableFeatureException(
+                $"Snapshot {snapshot.SnapshotId} of table {TableUuid} is encrypted (key-id '{keyId}'); " +
+                "table encryption is not supported, so its data cannot be read.");
+    }
+
+    /// <summary>
+    /// Throws <see cref="UnsupportedTableFeatureException"/> when the table is encrypted in any way: it has
+    /// <see cref="EncryptionKeys"/>, or any snapshot has a <see cref="Snapshot.KeyId"/>. Writing plaintext
+    /// manifests into an encrypted table would leave its data unprotected, so every write checks this before
+    /// it writes anything.
+    /// </summary>
+    internal void ThrowIfNotWritable()
+    {
+        ThrowIfTableKeys("written");
+        if (Snapshots.FirstOrDefault(s => s.KeyId is not null) is { } keyed)
+            throw new UnsupportedTableFeatureException(
+                $"Table {TableUuid} is encrypted (snapshot {keyed.SnapshotId} has key-id '{keyed.KeyId}'); " +
+                "table encryption is not supported, so the table cannot be written.");
+    }
+
+    private void ThrowIfTableKeys(string verb)
     {
         if (EncryptionKeys is { Count: > 0 })
             throw new UnsupportedTableFeatureException(
                 $"Table {TableUuid} is encrypted (its metadata lists encryption-keys); " +
-                "table encryption is not supported, so its data cannot be read or written.");
-        if (snapshot?.KeyId is { } keyId)
-            throw new UnsupportedTableFeatureException(
-                $"Snapshot {snapshot.SnapshotId} of table {TableUuid} is encrypted (key-id '{keyId}'); " +
-                "table encryption is not supported, so its data cannot be read.");
+                $"table encryption is not supported, so its data cannot be {verb}.");
     }
 
     void IJsonOnDeserialized.OnDeserialized()

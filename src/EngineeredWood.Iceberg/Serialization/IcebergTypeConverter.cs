@@ -96,6 +96,9 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
     /// <summary>The CRS a geometry or geography type has when its type string names none.</summary>
     internal const string DefaultCrs = "OGC:CRS84";
 
+    /// <summary>The widest decimal precision Iceberg allows.</summary>
+    internal const int MaxDecimalPrecision = 38;
+
     /// <summary>The edge algorithm a geography type has when its type string names none.</summary>
     internal const string DefaultEdgeAlgorithm = "spherical";
 
@@ -108,7 +111,12 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
             var m = DecimalPattern.Match(trimmed);
             if (!m.Success)
                 throw new JsonException($"Invalid decimal type: {typeString}");
-            return new DecimalType(ParseInt(m.Groups[1].Value, typeString), ParseInt(m.Groups[2].Value, typeString));
+            int precision = ParseInt(m.Groups[1].Value, typeString);
+            // Iceberg decimals hold at most 38 digits; Java refuses anything wider.
+            if (precision > MaxDecimalPrecision)
+                throw new JsonException(
+                    $"Invalid decimal type: {typeString}; precision is at most {MaxDecimalPrecision}.");
+            return new DecimalType(precision, ParseInt(m.Groups[2].Value, typeString));
         }
 
         if (trimmed.StartsWith("fixed", StringComparison.Ordinal))

@@ -66,7 +66,9 @@ public sealed class TableOperations
     {
         if (filesToDelete.Count == 0 && filesToAdd.Count == 0)
             throw new ArgumentException("Must delete or add at least one file");
-        current.ThrowIfDataInaccessible();
+        current.ThrowIfNotWritable();
+        if (filesToAdd.Count > 0)
+            ThrowIfSpecNotWritable(current);
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var snapshotId = GenerateSnapshotId();
@@ -253,8 +255,10 @@ public sealed class TableOperations
         string operation,
         CancellationToken ct)
     {
-        // Refuse before writing anything: these manifests would be plaintext files in an encrypted table.
-        current.ThrowIfDataInaccessible();
+        // Refuse before writing anything: these manifests would be plaintext files in an encrypted table, or
+        // files under a partition spec this library cannot apply.
+        current.ThrowIfNotWritable();
+        ThrowIfSpecNotWritable(current);
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var snapshotId = GenerateSnapshotId();
@@ -400,4 +404,22 @@ public sealed class TableOperations
     }
 
     private static long GenerateSnapshotId() => SnapshotIdFactory.Generate();
+
+    /// <summary>
+    /// A reader must accept a partition spec with a transform it does not know, but the spec forbids
+    /// committing new files under one: their partition values cannot be derived or checked.
+    /// </summary>
+    private static void ThrowIfSpecNotWritable(TableMetadata table)
+    {
+        var spec = table.PartitionSpecs.FirstOrDefault(s => s.SpecId == table.DefaultSpecId);
+        var unknown = spec?.Fields.FirstOrDefault(f => f.Transform is UnknownTransform || f.SourceIds is { Count: > 1 });
+        if (unknown is not null)
+            throw new UnsupportedTableFeatureException(
+                $"Cannot add files to table {table.TableUuid}: its default partition spec {table.DefaultSpecId} has " +
+                $"field '{unknown.Name}' with transform '{TransformName(unknown.Transform)}', which this " +
+                "library does not know.");
+    }
+
+    private static string TransformName(Transform transform) =>
+        transform is UnknownTransform u ? u.Name : transform.GetType().Name;
 }

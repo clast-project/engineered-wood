@@ -1,7 +1,9 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Globalization;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Text.Json.Serialization;
 
 namespace EngineeredWood.Iceberg.Serialization;
@@ -17,21 +19,24 @@ internal sealed class TransformConverter : JsonConverter<Transform>
     public override void Write(Utf8JsonWriter writer, Transform value, JsonSerializerOptions options)
         => writer.WriteStringValue(Format(value));
 
+    private static readonly Regex WidthPattern =
+        new(@"^(bucket|truncate)\[([0-9]+)\]\z", RegexOptions.CultureInvariant);
+
     internal static Transform Parse(string? value)
     {
         if (value is null)
             throw new JsonException("Transform cannot be null");
 
-        if (value.StartsWith("bucket[", StringComparison.Ordinal))
+        // Only an exact "bucket[N]" / "truncate[W]" is the known transform, as in Java's parser. Anything
+        // else with the same prefix ("bucket[16,2]") is a transform this library does not know.
+        var m = WidthPattern.Match(value);
+        if (m.Success && int.TryParse(m.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var width))
         {
-            var n = int.Parse(value[7..^1]);
-            return new BucketTransform(n);
-        }
-
-        if (value.StartsWith("truncate[", StringComparison.Ordinal))
-        {
-            var w = int.Parse(value[9..^1]);
-            return new TruncateTransform(w);
+            switch (m.Groups[1].Value)
+            {
+                case "bucket": return new BucketTransform(width);
+                case "truncate": return new TruncateTransform(width);
+            }
         }
 
         return value switch
