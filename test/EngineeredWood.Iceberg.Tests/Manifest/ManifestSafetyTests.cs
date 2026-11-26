@@ -133,6 +133,60 @@ public class ManifestSafetyTests : IDisposable
     }
 
     [Fact]
+    public async Task OverwriteRemovingDeleteFiles_CountsOnlyDataFilesAsRows()
+    {
+        var md = TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]),
+            location: Path.Combine(_dir, "sum"), formatVersion: 3);
+        md = await _ops.AppendFilesAsync(md, [File("data/a.parquet"), File("data/b.parquet")]);   // 20 rows
+        var dv = new DataFile
+        {
+            Content = FileContent.PositionDeletes, FilePath = "data/dvs.puffin", FileFormat = FileFormat.Puffin,
+            RecordCount = 3, FileSizeInBytes = 200, ReferencedDataFile = "data/a.parquet", ContentOffset = 4, ContentSizeInBytes = 30,
+        };
+        var posDelete = new DataFile { Content = FileContent.PositionDeletes, FilePath = "data/pos.parquet", RecordCount = 2, FileSizeInBytes = 50 };
+        var eqDelete = new DataFile { Content = FileContent.EqualityDeletes, FilePath = "data/eq.parquet", RecordCount = 1, FileSizeInBytes = 50, EqualityIds = [1] };
+        md = await _ops.AppendDeleteFilesAsync(md, [dv, posDelete, eqDelete]);
+        // Delete files leave the row count where it was.
+        Assert.Equal("20", md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId).Summary["total-records"]);
+
+        // The caller's record count is not what is counted: the table's own entry is.
+        md = await _ops.OverwriteFilesAsync(md, [File("data/a.parquet") with { RecordCount = 999 }, dv, posDelete, eqDelete], []);
+
+        var summary = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId).Summary;
+        Assert.Equal("1", summary["deleted-data-files"]);
+        Assert.Equal("10", summary["deleted-records"]);
+        Assert.Equal("10", summary["total-records"]);
+        Assert.Equal("3", summary["removed-delete-files"]);
+        Assert.Equal("1", summary["removed-dvs"]);
+        Assert.Equal("1", summary["removed-position-delete-files"]);
+        Assert.Equal("1", summary["removed-equality-delete-files"]);
+        Assert.Equal("5", summary["removed-position-deletes"]);
+        Assert.Equal("1", summary["removed-equality-deletes"]);
+
+        // A data-only overwrite writes none of the delete-file keys.
+        md = await _ops.OverwriteFilesAsync(md, [File("data/b.parquet")], []);
+        var plain = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId).Summary;
+        Assert.Equal("0", plain["total-records"]);
+        Assert.DoesNotContain(plain.Keys, k => k.StartsWith("removed-", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task UnknownPreviousTotal_IsNotTreatedAsZero()
+    {
+        var md = await _ops.AppendFilesAsync(
+            TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]), location: Path.Combine(_dir, "tot")),
+            [File("data/a.parquet")]);
+        // Another writer's snapshot without a total-records.
+        var snap = md.Snapshots.Single();
+        md = md with { Snapshots = [snap with { Summary = new Dictionary<string, string> { ["operation"] = "append" } }] };
+
+        md = await _ops.AppendFilesAsync(md, [File("data/b.parquet")]);
+        Assert.False(md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId).Summary.ContainsKey("total-records"));
+        md = await _ops.OverwriteFilesAsync(md, [File("data/a.parquet")], []);
+        Assert.False(md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId).Summary.ContainsKey("total-records"));
+    }
+
+    [Fact]
     public void RewriteOfAnOldSpec_GetsAHeaderSchemaThatBindsIt()
     {
         // The spec's source column (2, cat) was dropped in schema 1.

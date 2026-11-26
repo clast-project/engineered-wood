@@ -79,6 +79,7 @@ public sealed class TableOperations
         var manifestListEntries = new List<ManifestListEntry>();
         var deletedPaths = new HashSet<string>(filesToDelete.Select(FileKey));
         var foundPaths = new HashSet<string>();
+        var removed = new List<DataFile>();
 
         // Read the current manifests and mark the entries of the files being deleted. Nothing is written
         // until the deletes are known to be valid.
@@ -117,6 +118,7 @@ public sealed class TableOperations
                     if (deletedPaths.Contains(FileKey(entry.DataFile)))
                     {
                         foundPaths.Add(FileKey(entry.DataFile));
+                        removed.Add(entry.DataFile);
                         filtered.Add(entry with { Status = ManifestEntryStatus.Deleted, SnapshotId = snapshotId });
                     }
                     else
@@ -184,9 +186,25 @@ public sealed class TableOperations
         await WriteManifestListAsync(current, manifestListPath, manifestListEntries, snapshotId, sequenceNumber, ct)
             .ConfigureAwait(false);
 
-        var deletedRecords = filesToDelete.Sum(f => f.RecordCount);
+        // The summary counts what the table's manifests held for the removed files, data files and delete
+        // files apart: a delete file's record count is the rows it deletes, not rows of the table, so it must
+        // not reach deleted-records or total-records.
+        var removedData = removed.Where(f => f.Content == FileContent.Data).ToList();
+        var deletedRecords = removedData.Sum(f => f.RecordCount);
         var addedRecords = filesToAdd.Sum(f => f.RecordCount);
         var prevTotal = CurrentTotalRecords(current);
+
+        var summary = new Dictionary<string, string>
+        {
+            ["operation"] = "overwrite",
+            ["added-data-files"] = filesToAdd.Count.ToString(),
+            ["deleted-data-files"] = removedData.Count.ToString(),
+            ["added-records"] = addedRecords.ToString(),
+            ["deleted-records"] = deletedRecords.ToString(),
+        };
+        if (prevTotal is { } previous)
+            summary["total-records"] = (previous - deletedRecords + addedRecords).ToString();
+        AddRemovedDeleteFileMetrics(summary, removed.Where(f => f.Content != FileContent.Data).ToList());
 
         var snapshot = new Snapshot(
             SnapshotId: snapshotId,
@@ -194,15 +212,7 @@ public sealed class TableOperations
             SequenceNumber: sequenceNumber,
             TimestampMs: now,
             ManifestList: manifestListPath,
-            Summary: new Dictionary<string, string>
-            {
-                ["operation"] = "overwrite",
-                ["added-data-files"] = filesToAdd.Count.ToString(),
-                ["deleted-data-files"] = filesToDelete.Count.ToString(),
-                ["added-records"] = addedRecords.ToString(),
-                ["deleted-records"] = deletedRecords.ToString(),
-                ["total-records"] = (prevTotal - deletedRecords + addedRecords).ToString(),
-            },
+            Summary: summary,
             SchemaId: current.CurrentSchemaId);
 
         var snapshots = current.Snapshots.ToList();
@@ -304,10 +314,16 @@ public sealed class TableOperations
         {
             summary["added-data-files"] = files.Count.ToString();
             summary["added-records"] = totalRows.ToString();
-            summary["total-records"] = (CurrentTotalRecords(current) + totalRows).ToString();
+            if (CurrentTotalRecords(current) is { } total)
+                summary["total-records"] = (total + totalRows).ToString();
         }
         else
         {
+            // Delete files remove no data rows from the count (total-records is "before applying ...
+            // deletes"), so it carries forward unchanged. Leaving it out would make the next commit restart
+            // the count from nothing.
+            if (CurrentTotalRecords(current) is { } total)
+                summary["total-records"] = total.ToString();
             summary["added-delete-files"] = files.Count.ToString();
             summary["added-position-deletes"] = files
                 .Where(f => f.Content == FileContent.PositionDeletes)
@@ -429,7 +445,12 @@ public sealed class TableOperations
         await ManifestIO.WriteManifestListAsync(_fs, path, entries, options, ct).ConfigureAwait(false);
     }
 
-    private static long CurrentTotalRecords(TableMetadata metadata)
+    /// <summary>
+    /// The current snapshot's <c>total-records</c>: 0 for a table with no snapshot, and null when the
+    /// snapshot's summary leaves it out (another writer may). A total built on an unknown one would be wrong,
+    /// so a commit then leaves its own out too, as Java does.
+    /// </summary>
+    private static long? CurrentTotalRecords(TableMetadata metadata)
     {
         if (metadata.CurrentSnapshotId is null)
             return 0;
@@ -438,11 +459,38 @@ public sealed class TableOperations
             s => s.SnapshotId == metadata.CurrentSnapshotId);
 
         return snapshot.Summary.TryGetValue("total-records", out var val)
-            ? long.Parse(val)
-            : 0;
+            && long.TryParse(val, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var total)
+            ? total
+            : null;
     }
 
     private static long GenerateSnapshotId() => SnapshotIdFactory.Generate();
+
+    /// <summary>
+    /// The spec's optional summary metrics for removed delete files, written only when non-zero, as Java
+    /// writes them. A DV counts as a delete file and its rows as position deletes, but not as a
+    /// position-delete file.
+    /// </summary>
+    private static void AddRemovedDeleteFileMetrics(Dictionary<string, string> summary, IReadOnlyList<DataFile> deletes)
+    {
+        static bool IsDv(DataFile f) => f.Content == FileContent.PositionDeletes && f.FileFormat == FileFormat.Puffin;
+        var dvs = deletes.Where(IsDv).ToList();
+        var positionFiles = deletes.Where(f => f.Content == FileContent.PositionDeletes && !IsDv(f)).ToList();
+        var equalityFiles = deletes.Where(f => f.Content == FileContent.EqualityDeletes).ToList();
+
+        void Put(string key, long value)
+        {
+            if (value > 0)
+                summary[key] = value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        Put("removed-delete-files", deletes.Count);
+        Put("removed-dvs", dvs.Count);
+        Put("removed-position-delete-files", positionFiles.Count);
+        Put("removed-equality-delete-files", equalityFiles.Count);
+        Put("removed-position-deletes", dvs.Concat(positionFiles).Sum(f => f.RecordCount));
+        Put("removed-equality-deletes", equalityFiles.Sum(f => f.RecordCount));
+    }
 
     private const string DvKeySeparator = "\u0000";
 
