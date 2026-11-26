@@ -74,60 +74,68 @@ public sealed class TableOperations
 
         var manifestListEntries = new List<ManifestListEntry>();
         var deletedPaths = new HashSet<string>(filesToDelete.Select(f => f.FilePath));
+        var foundPaths = new HashSet<string>();
 
-        // Carry forward existing manifests, rewriting entries that reference deleted files
+        // Read the current manifests and mark the entries of the files being deleted. Nothing is written
+        // until the deletes are known to be valid.
+        var carried = new List<(ManifestListEntry Manifest, List<ManifestEntry>? Rewritten)>();
         if (current.CurrentSnapshotId is not null)
         {
             var currentSnapshot = current.Snapshots.First(
                 s => s.SnapshotId == current.CurrentSnapshotId);
 
-            if (await _fs.ExistsAsync(currentSnapshot.ManifestList, ct).ConfigureAwait(false))
+            foreach (var mle in await ReadManifestListAsync(currentSnapshot, ct).ConfigureAwait(false))
             {
-                var existing = await ManifestIO.ReadManifestListAsync(_fs, currentSnapshot.ManifestList, ct)
-                    .ConfigureAwait(false);
+                var entries = await ReadManifestAsync(currentSnapshot, mle, ct).ConfigureAwait(false);
+                var rewritten = false;
+                var filtered = new List<ManifestEntry>(entries.Count);
 
-                foreach (var mle in existing)
+                foreach (var entry in entries)
                 {
-                    if (!await _fs.ExistsAsync(mle.ManifestPath, ct).ConfigureAwait(false))
-                        continue;
-
-                    var entries = await ManifestIO.ReadManifestAsync(_fs, mle.ManifestPath, ct)
-                        .ConfigureAwait(false);
-                    var rewritten = false;
-                    var filtered = new List<ManifestEntry>();
-
-                    foreach (var entry in entries)
+                    if (entry.Status != ManifestEntryStatus.Deleted &&
+                        deletedPaths.Contains(entry.DataFile.FilePath))
                     {
-                        if (entry.Status != ManifestEntryStatus.Deleted &&
-                            deletedPaths.Contains(entry.DataFile.FilePath))
-                        {
-                            filtered.Add(entry with { Status = ManifestEntryStatus.Deleted, SnapshotId = snapshotId });
-                            rewritten = true;
-                        }
-                        else
-                        {
-                            filtered.Add(entry);
-                        }
-                    }
-
-                    if (rewritten)
-                    {
-                        var rewrittenPath = $"{metadataDir}/{Guid.NewGuid():N}.avro";
-                        var length = await ManifestIO.WriteManifestAsync(_fs, rewrittenPath, filtered, ct)
-                            .ConfigureAwait(false);
-                        manifestListEntries.Add(mle with
-                        {
-                            ManifestPath = rewrittenPath,
-                            ManifestLength = length,
-                            DeletedDataFilesCount = mle.DeletedDataFilesCount + filtered.Count(e => e.Status == ManifestEntryStatus.Deleted),
-                        });
+                        foundPaths.Add(entry.DataFile.FilePath);
+                        filtered.Add(entry with { Status = ManifestEntryStatus.Deleted, SnapshotId = snapshotId });
+                        rewritten = true;
                     }
                     else
                     {
-                        manifestListEntries.Add(mle);
+                        filtered.Add(entry);
                     }
                 }
+
+                carried.Add((mle, rewritten ? filtered : null));
             }
+        }
+
+        // A file to delete that the table no longer holds means the overwrite was planned against a state
+        // that has since changed (another writer removed or rewrote it). Committing anyway would record a
+        // replacement for rows that are already gone, so refuse; retrying cannot help.
+        var missing = deletedPaths.Where(p => !foundPaths.Contains(p)).ToList();
+        if (missing.Count > 0)
+            throw new CommitValidationException(
+                $"Cannot delete files the table does not contain: {string.Join(", ", missing.Take(5))}" +
+                (missing.Count > 5 ? $" and {missing.Count - 5} more" : "") + ".");
+
+        // Carry the manifests forward, rewriting those that held a deleted file.
+        foreach (var (mle, rewritten) in carried)
+        {
+            if (rewritten is null)
+            {
+                manifestListEntries.Add(mle);
+                continue;
+            }
+
+            var rewrittenPath = $"{metadataDir}/{Guid.NewGuid():N}.avro";
+            var length = await ManifestIO.WriteManifestAsync(_fs, rewrittenPath, rewritten, ct)
+                .ConfigureAwait(false);
+            manifestListEntries.Add(mle with
+            {
+                ManifestPath = rewrittenPath,
+                ManifestLength = length,
+                DeletedDataFilesCount = mle.DeletedDataFilesCount + rewritten.Count(e => e.Status == ManifestEntryStatus.Deleted),
+            });
         }
 
         // Write new files manifest
@@ -273,12 +281,7 @@ public sealed class TableOperations
             var currentSnapshot = current.Snapshots.First(
                 s => s.SnapshotId == current.CurrentSnapshotId);
 
-            if (await _fs.ExistsAsync(currentSnapshot.ManifestList, ct).ConfigureAwait(false))
-            {
-                var existing = await ManifestIO.ReadManifestListAsync(_fs, currentSnapshot.ManifestList, ct)
-                    .ConfigureAwait(false);
-                manifestListEntries.AddRange(existing);
-            }
+            manifestListEntries.AddRange(await ReadManifestListAsync(currentSnapshot, ct).ConfigureAwait(false));
         }
 
         manifestListEntries.Add(new ManifestListEntry
@@ -354,20 +357,12 @@ public sealed class TableOperations
         var snapshot = metadata.Snapshots.First(
             s => s.SnapshotId == metadata.CurrentSnapshotId);
 
-        if (!await _fs.ExistsAsync(snapshot.ManifestList, ct).ConfigureAwait(false))
-            return [];
-
-        var manifestList = await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList, ct)
-            .ConfigureAwait(false);
+        var manifestList = await ReadManifestListAsync(snapshot, ct).ConfigureAwait(false);
         var result = new List<DataFile>();
 
         foreach (var mle in manifestList)
         {
-            if (!await _fs.ExistsAsync(mle.ManifestPath, ct).ConfigureAwait(false))
-                continue;
-
-            var entries = await ManifestIO.ReadManifestAsync(_fs, mle.ManifestPath, ct)
-                .ConfigureAwait(false);
+            var entries = await ReadManifestAsync(snapshot, mle, ct).ConfigureAwait(false);
             foreach (var entry in entries)
             {
                 if (entry.Status != ManifestEntryStatus.Deleted && entry.DataFile.Content == contentType)
@@ -377,6 +372,13 @@ public sealed class TableOperations
 
         return result;
     }
+
+    private ValueTask<List<ManifestListEntry>> ReadManifestListAsync(Snapshot snapshot, CancellationToken ct) =>
+        ManifestIO.ReadSnapshotManifestListAsync(_fs, snapshot, ct);
+
+    private ValueTask<List<ManifestEntry>> ReadManifestAsync(
+        Snapshot snapshot, ManifestListEntry manifest, CancellationToken ct) =>
+        ManifestIO.ReadSnapshotManifestAsync(_fs, snapshot, manifest, ct);
 
     private static long CurrentTotalRecords(TableMetadata metadata)
     {

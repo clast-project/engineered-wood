@@ -122,12 +122,23 @@ public interface ICatalog
     Task<bool> TableExistsAsync(
         TableIdentifier identifier, CancellationToken ct = default);
 
-    /// <summary>Commits new metadata for an existing table, creating a new metadata version.</summary>
-    /// <param name="identifier">The table to update.</param>
-    /// <param name="newMetadata">The replacement <see cref="TableMetadata"/>.</param>
+    /// <summary>
+    /// <para>Commits <paramref name="newMetadata"/> as the next version of the table that
+    /// <paramref name="baseTable"/> was loaded from.</para>
+    /// <para>The commit is optimistic: it succeeds only if the table is still at the version
+    /// <paramref name="baseTable"/> was loaded at, and the check and the write are one atomic step. When
+    /// another writer committed first, nothing is written and <see cref="CommitFailedException"/> is thrown;
+    /// reload the table, re-apply the change and commit again, or use
+    /// <see cref="CatalogCommitExtensions.CommitWithRetryAsync"/>.</para>
+    /// </summary>
+    /// <param name="baseTable">The table as loaded (or last committed) from this catalog.</param>
+    /// <param name="newMetadata">The metadata to commit, derived from <paramref name="baseTable"/>'s.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns>The updated <see cref="Table"/>.</returns>
+    /// <returns>The committed <see cref="Table"/>, which a further commit can be based on.</returns>
     /// <exception cref="NoSuchTableException">The table does not exist.</exception>
-    Task<Table> UpdateTableAsync(
-        TableIdentifier identifier, TableMetadata newMetadata, CancellationToken ct = default);
+    /// <exception cref="CommitFailedException">The table changed after <paramref name="baseTable"/> was loaded.</exception>
+    /// <exception cref="ArgumentException"><paramref name="baseTable"/> was not loaded from this catalog, or
+    /// <paramref name="newMetadata"/> belongs to a different table.</exception>
+    Task<Table> CommitTableAsync(
+        Table baseTable, TableMetadata newMetadata, CancellationToken ct = default);
 }

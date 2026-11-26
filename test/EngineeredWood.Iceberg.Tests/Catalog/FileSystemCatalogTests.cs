@@ -168,7 +168,7 @@ public class FileSystemCatalogTests : IDisposable
             Properties = new Dictionary<string, string> { ["updated"] = "true" }
         };
 
-        await _catalog.UpdateTableAsync(id, updated);
+        await _catalog.CommitTableAsync(table, updated);
 
         var loaded = await _catalog.LoadTableAsync(id);
         Assert.Equal("true", loaded.Metadata.Properties["updated"]);

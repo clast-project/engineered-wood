@@ -712,6 +712,32 @@ reorder, nested add, or `FIRST`/`AFTER`. No format-version upgrade.
 **Table encryption.** `key_metadata` is always written null; no KMS
 plumbing.
 
+### Commits
+
+`ICatalog.CommitTableAsync(baseTable, newMetadata)` commits optimistically:
+it fails with `CommitFailedException` when the table moved on after
+`baseTable` was loaded. `CatalogCommitExtensions.CommitWithRetryAsync`
+reloads and re-applies the change, with Iceberg Java's `commit.retry.*`
+limits. `FileSystemCatalog` commits by creating `v<N+1>.metadata.json` with
+an atomic create-if-absent. `version-hint.text` is only a hint: loads walk
+past a stale one and fall back to listing when it is missing or
+unreadable. Gaps:
+
+- Conflict validation is limited to an overwrite refusing to delete a file
+  the table no longer holds (`CommitValidationException`). An overwrite or
+  delete therefore commits over a concurrent append that added rows its
+  filter would have matched. There is no isolation-level choice.
+- Manifests and manifest lists written by an abandoned attempt are left
+  behind; there is no orphan-file removal.
+- A commit is checked against the base's metadata version and table UUID.
+  A drop and re-create that lands between that check and the
+  create-if-absent is not detected.
+- Only uncompressed `v<N>.metadata.json` is recognised, not
+  `v<N>.gz.metadata.json`, and not the `<NNNNN>-<uuid>.metadata.json` names
+  of catalogs that don't use the Hadoop layout.
+- `DropTableAsync` without `purge` deletes the table's metadata directory and
+  keeps its data files.
+
 ### Correctness / interop issues
 
 **The manifest codec is truncated.** `ManifestIO` omits `partition`
