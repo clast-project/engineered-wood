@@ -44,7 +44,11 @@ internal sealed class OcfWriter : IDisposable
 #endif
     }
 
-    public void WriteHeader(AvroRecordSchema schema)
+    /// <summary>
+    /// Writes the magic, the header metadata and the sync marker. <paramref name="metadata"/> holds
+    /// user metadata; <c>avro.schema</c> and <c>avro.codec</c> are written from the schema and codec.
+    /// </summary>
+    public void WriteHeader(AvroRecordSchema schema, IReadOnlyDictionary<string, byte[]>? metadata = null)
     {
         if (_headerWritten) throw new InvalidOperationException("Header already written.");
         _headerWritten = true;
@@ -61,6 +65,15 @@ internal sealed class OcfWriter : IDisposable
 
         if (_codec != AvroCodec.Null)
             entries["avro.codec"] = System.Text.Encoding.UTF8.GetBytes(AvroCompression.CodecName(_codec));
+
+        if (metadata != null)
+        {
+            foreach (var pair in metadata)
+            {
+                OcfMetadata.ValidateUserKey(pair.Key);
+                entries[pair.Key] = pair.Value;
+            }
+        }
 
         WriteMetadataMap(_stream, entries);
 

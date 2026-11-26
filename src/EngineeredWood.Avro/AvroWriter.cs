@@ -25,14 +25,16 @@ public sealed class AvroWriter : IDisposable
     /// <summary>The Avro schema used for encoding.</summary>
     public AvroSchema AvroSchema { get; }
 
-    internal AvroWriter(OcfWriter ocf, Apache.Arrow.Schema arrowSchema, AvroRecordSchema avroRecord)
+    internal AvroWriter(
+        OcfWriter ocf, Apache.Arrow.Schema arrowSchema, AvroRecordSchema avroRecord,
+        IReadOnlyDictionary<string, byte[]>? metadata = null)
     {
         _ocf = ocf;
         _encoder = new RecordBatchEncoder(avroRecord);
         Schema = arrowSchema;
         AvroSchema = new AvroSchema(AvroSchemaWriter.ToJson(avroRecord));
 
-        _ocf.WriteHeader(avroRecord);
+        _ocf.WriteHeader(avroRecord, metadata);
     }
 
     /// <summary>Write all rows from a RecordBatch as one OCF data block.</summary>

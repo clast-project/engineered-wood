@@ -39,6 +39,9 @@ internal static class AvroSchemaWriter
                 writer.WriteString("type", "array");
                 writer.WritePropertyName("items");
                 WriteNode(writer, a.Items, namedTypes);
+                if (a.LogicalType != null)
+                    writer.WriteString("logicalType", a.LogicalType);
+                WriteProperties(writer, a.Properties);
                 writer.WriteEndObject();
                 break;
             case AvroMapSchema m:
@@ -46,6 +49,9 @@ internal static class AvroSchemaWriter
                 writer.WriteString("type", "map");
                 writer.WritePropertyName("values");
                 WriteNode(writer, m.Values, namedTypes);
+                if (m.LogicalType != null)
+                    writer.WriteString("logicalType", m.LogicalType);
+                WriteProperties(writer, m.Properties);
                 writer.WriteEndObject();
                 break;
             case AvroFixedSchema f:
@@ -62,15 +68,17 @@ internal static class AvroSchemaWriter
 
     private static void WritePrimitive(Utf8JsonWriter writer, AvroPrimitiveSchema p)
     {
-        if (p.LogicalType != null)
+        if (p.LogicalType != null || p.Properties.Count > 0)
         {
             writer.WriteStartObject();
             writer.WriteString("type", PrimitiveTypeName(p.Type));
-            writer.WriteString("logicalType", p.LogicalType);
+            if (p.LogicalType != null)
+                writer.WriteString("logicalType", p.LogicalType);
             if (p.Precision.HasValue)
                 writer.WriteNumber("precision", p.Precision.Value);
             if (p.Scale.HasValue)
                 writer.WriteNumber("scale", p.Scale.Value);
+            WriteProperties(writer, p.Properties);
             writer.WriteEndObject();
         }
         else
@@ -93,6 +101,9 @@ internal static class AvroSchemaWriter
         writer.WriteString("name", r.Name);
         if (r.Namespace != null)
             writer.WriteString("namespace", r.Namespace);
+        if (r.Doc != null)
+            writer.WriteString("doc", r.Doc);
+        WriteAliases(writer, r.Aliases);
 
         writer.WriteStartArray("fields");
         foreach (var field in r.Fields)
@@ -106,9 +117,14 @@ internal static class AvroSchemaWriter
                 writer.WritePropertyName("default");
                 field.Default.Value.WriteTo(writer);
             }
+            if (field.Doc != null)
+                writer.WriteString("doc", field.Doc);
+            WriteAliases(writer, field.Aliases);
+            WriteProperties(writer, field.Properties);
             writer.WriteEndObject();
         }
         writer.WriteEndArray();
+        WriteProperties(writer, r.Properties);
         writer.WriteEndObject();
     }
 
@@ -131,6 +147,10 @@ internal static class AvroSchemaWriter
         writer.WriteEndArray();
         if (e.Default != null)
             writer.WriteString("default", e.Default);
+        if (e.Doc != null)
+            writer.WriteString("doc", e.Doc);
+        WriteAliases(writer, e.Aliases);
+        WriteProperties(writer, e.Properties);
         writer.WriteEndObject();
     }
 
@@ -148,6 +168,7 @@ internal static class AvroSchemaWriter
         if (f.Namespace != null)
             writer.WriteString("namespace", f.Namespace);
         writer.WriteNumber("size", f.Size);
+        WriteAliases(writer, f.Aliases);
         if (f.LogicalType != null)
         {
             writer.WriteString("logicalType", f.LogicalType);
@@ -156,7 +177,27 @@ internal static class AvroSchemaWriter
             if (f.Scale.HasValue)
                 writer.WriteNumber("scale", f.Scale.Value);
         }
+        WriteProperties(writer, f.Properties);
         writer.WriteEndObject();
+    }
+
+    private static void WriteAliases(Utf8JsonWriter writer, IReadOnlyList<string> aliases)
+    {
+        if (aliases.Count == 0)
+            return;
+        writer.WriteStartArray("aliases");
+        foreach (var alias in aliases)
+            writer.WriteStringValue(alias);
+        writer.WriteEndArray();
+    }
+
+    private static void WriteProperties(Utf8JsonWriter writer, IReadOnlyDictionary<string, JsonElement> properties)
+    {
+        foreach (var pair in properties)
+        {
+            writer.WritePropertyName(pair.Key);
+            pair.Value.WriteTo(writer);
+        }
     }
 
     private static string PrimitiveTypeName(AvroType type) => type switch

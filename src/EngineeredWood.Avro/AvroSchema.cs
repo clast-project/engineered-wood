@@ -70,7 +70,12 @@ public sealed class AvroSchema
             projectedFields.Add(record.Fields[idx]);
         }
 
-        var projectedRecord = new AvroRecordSchema(record.Name, record.Namespace, projectedFields);
+        var projectedRecord = new AvroRecordSchema(record.Name, record.Namespace, projectedFields)
+        {
+            Doc = record.Doc,
+            Aliases = record.Aliases,
+            Properties = record.Properties,
+        };
         return new AvroSchema(AvroSchemaWriter.ToJson(projectedRecord));
     }
 

@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Text.Json;
+
 namespace EngineeredWood.Avro.Schema;
 
 /// <summary>
@@ -33,6 +35,26 @@ internal abstract class AvroSchemaNode
 
     /// <summary>Optional logical type annotation (e.g. "decimal", "date", "timestamp-millis").</summary>
     public string? LogicalType { get; init; }
+
+    /// <summary>
+    /// Attributes the Avro specification does not define for this type, such as Iceberg's
+    /// <c>element-id</c>, <c>key-id</c>/<c>value-id</c> and <c>adjust-to-utc</c>. Avro allows any extra
+    /// attribute; they are kept so that writing the schema back does not drop them.
+    /// </summary>
+    public IReadOnlyDictionary<string, JsonElement> Properties { get; init; } = AvroSchemaProperties.Empty;
+}
+
+internal static class AvroSchemaProperties
+{
+    public static readonly IReadOnlyDictionary<string, JsonElement> Empty =
+        new Dictionary<string, JsonElement>(0, StringComparer.Ordinal);
+
+    /// <summary>The value of an integer attribute (such as an Iceberg id), or null when absent or not an int.</summary>
+    public static int? GetInt32(this IReadOnlyDictionary<string, JsonElement> properties, string name) =>
+        properties.TryGetValue(name, out var value) && value.ValueKind == JsonValueKind.Number &&
+        value.TryGetInt32(out var id)
+            ? id
+            : null;
 }
 
 internal sealed class AvroPrimitiveSchema : AvroSchemaNode
@@ -92,6 +114,15 @@ internal sealed class AvroFieldNode
     /// </summary>
     public System.Text.Json.JsonElement? Default { get; init; }
 
+    /// <summary>
+    /// Attributes the Avro specification does not define for a field, such as Iceberg's <c>field-id</c>, and
+    /// the sort <c>order</c>. They are kept so that writing the schema back does not drop them.
+    /// </summary>
+    public IReadOnlyDictionary<string, JsonElement> Properties { get; init; } = AvroSchemaProperties.Empty;
+
+    /// <summary>The Iceberg <c>field-id</c> attribute, or null when the field has none.</summary>
+    public int? FieldId => Properties.GetInt32("field-id");
+
     public AvroFieldNode(string name, AvroSchemaNode schema)
     {
         Name = name;
@@ -123,6 +154,9 @@ internal sealed class AvroArraySchema : AvroSchemaNode
     public override AvroType Type => AvroType.Array;
     public AvroSchemaNode Items { get; }
 
+    /// <summary>The Iceberg <c>element-id</c> attribute, or null when the array has none.</summary>
+    public int? ElementId => Properties.GetInt32("element-id");
+
     public AvroArraySchema(AvroSchemaNode items)
     {
         Items = items;
@@ -133,6 +167,12 @@ internal sealed class AvroMapSchema : AvroSchemaNode
 {
     public override AvroType Type => AvroType.Map;
     public AvroSchemaNode Values { get; }
+
+    /// <summary>The Iceberg <c>key-id</c> attribute, or null when the map has none.</summary>
+    public int? KeyId => Properties.GetInt32("key-id");
+
+    /// <summary>The Iceberg <c>value-id</c> attribute, or null when the map has none.</summary>
+    public int? ValueId => Properties.GetInt32("value-id");
 
     public AvroMapSchema(AvroSchemaNode values)
     {
