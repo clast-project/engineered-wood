@@ -32,6 +32,7 @@ but are not kept up to date as the code changes. Check the code before relying o
 | [parquet-fsst.md](parquet-fsst.md) | design | Experimental FSST / FSST_16: the spec versus the proofs of concept, validation |
 | [parquet-extended-precision-timestamps.md](parquet-extended-precision-timestamps.md) | design | Experimental `TIMESTAMP` on `FIXED_LEN_BYTE_ARRAY(12)`: decisions, risks, limits |
 | [encryption-design.md](encryption-design.md) | design | Plan for Parquet Modular Encryption (not started) |
+| [iceberg-v3-plan.md](iceberg-v3-plan.md) | design | Iceberg v2/v3 production support: inventory, prioritized gaps, phased plan, shared table-format code (not started). Research notes in [iceberg-v3-research/](iceberg-v3-research/) |
 | [ree-constant-column-encoding.md](ree-constant-column-encoding.md) | design | Run-end encoding for constant columns: what landed and what was measured |
 | [constant-array-and-widening-resume.md](constant-array-and-widening-resume.md) | design | Outcome of the Arrow-builder audit (`ArrowCompute` Repeat / MakeNullArray / Widen) |
 | [codec-seam-investigation.md](codec-seam-investigation.md) | investigation | Why `IDataFileReader` / `IDataFileWriter` stay a codec seam, and its open contract gaps |
