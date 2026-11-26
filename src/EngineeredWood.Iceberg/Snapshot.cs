@@ -1,6 +1,9 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
 namespace EngineeredWood.Iceberg;
 
 /// <summary>
@@ -16,6 +19,10 @@ namespace EngineeredWood.Iceberg;
 /// <param name="SchemaId">Identifier of the table schema at the time the snapshot was created.</param>
 /// <param name="FirstRowId">First row ID assigned to rows added in this snapshot (v3).</param>
 /// <param name="AddedRows">Number of rows added in this snapshot (v3).</param>
+/// <param name="KeyId">
+/// The id of the encryption key that encrypts the manifest list's key metadata (v3), or
+/// <see langword="null"/> when the snapshot is not encrypted.
+/// </param>
 public sealed record Snapshot(
     long SnapshotId,
     long? ParentSnapshotId,
@@ -26,7 +33,16 @@ public sealed record Snapshot(
     int? SchemaId = null,
     // v3 row lineage
     long? FirstRowId = null,
-    long? AddedRows = null);
+    long? AddedRows = null,
+    string? KeyId = null)
+{
+    /// <summary>
+    /// Snapshot properties this library does not model, kept so that rewriting another engine's metadata
+    /// does not drop them. <see langword="null"/> when there are none.
+    /// </summary>
+    [JsonExtensionData, JsonInclude]
+    public IDictionary<string, JsonElement>? AdditionalProperties { get; internal set; }
+}
 
 /// <summary>
 /// Entry in the snapshot log recording when a snapshot became the current snapshot.

@@ -101,7 +101,12 @@ public static class TimeTravel
             TimestampMs: now,
             ManifestList: snapshot.ManifestList,
             Summary: CherryPickSummary(snapshot.Summary, snapshotId),
-            SchemaId: snapshot.SchemaId);
+            SchemaId: snapshot.SchemaId,
+            // The new snapshot reuses the source's manifest list, so its rows keep the row ids that list
+            // gives them, and it is encrypted exactly as that list is.
+            FirstRowId: snapshot.FirstRowId,
+            AddedRows: snapshot.AddedRows,
+            KeyId: snapshot.KeyId);
 
         var snapshots = metadata.Snapshots.ToList();
         snapshots.Add(cherryPicked);

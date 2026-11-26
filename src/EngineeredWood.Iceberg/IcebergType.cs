@@ -117,7 +117,7 @@ public sealed record GeometryType(string Crs) : PrimitiveType;
 
 /// <summary>Iceberg v3 geography type with a coordinate reference system and edge algorithm.</summary>
 /// <param name="Crs">The coordinate reference system identifier.</param>
-/// <param name="Algorithm">The edge interpolation algorithm (e.g., spherical or planar).</param>
+/// <param name="Algorithm">The edge interpolation algorithm (spherical, vincenty, thomas, andoyer or karney).</param>
 public sealed record GeographyType(string Crs, string Algorithm) : PrimitiveType;
 
 // Nested types

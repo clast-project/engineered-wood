@@ -232,4 +232,32 @@ public class ExpireSnapshotsTests : IDisposable
         // But files still exist
         Assert.True(await _fs.ExistsAsync(expiredSnap.ManifestList));
     }
+
+    [Fact]
+    public async Task ExpiredSnapshotsStatistics_AreDroppedFromTheMetadata()
+    {
+        var metadata = await CreateTableWithSnapshotsAsync(3);
+        var ids = metadata.Snapshots.Select(s => s.SnapshotId).ToList();
+        metadata = metadata with
+        {
+            Statistics = ids.Select(id => new StatisticsFile(id, $"stats-{id}.puffin", 100, 20, [])).ToList(),
+            PartitionStatistics = ids.Select(id => new PartitionStatisticsFile(id, $"pstats-{id}.parquet", 50)).ToList(),
+        };
+
+        var result = await new ExpireSnapshots().ExpireSnapshotId(ids[0]).ApplyAsync(metadata, _fs);
+
+        Assert.Equal(ids.Skip(1), result.Metadata.Statistics!.Select(s => s.SnapshotId));
+        Assert.Equal(ids.Skip(1), result.Metadata.PartitionStatistics!.Select(s => s.SnapshotId));
+        // Deleting the statistics files themselves is Phase 4 (#957).
+        Assert.DoesNotContain(result.DeletedFiles, f => f.Contains("stats-"));
+    }
+
+    [Fact]
+    public async Task TableWithoutStatistics_StillHasNone()
+    {
+        var metadata = await CreateTableWithSnapshotsAsync(2);
+        var result = await new ExpireSnapshots().ExpireSnapshotId(metadata.Snapshots[0].SnapshotId).ApplyAsync(metadata, _fs);
+        Assert.Null(result.Metadata.Statistics);
+        Assert.Null(result.Metadata.PartitionStatistics);
+    }
 }

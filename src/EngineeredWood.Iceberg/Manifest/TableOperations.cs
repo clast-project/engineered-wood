@@ -66,6 +66,9 @@ public sealed class TableOperations
     {
         if (filesToDelete.Count == 0 && filesToAdd.Count == 0)
             throw new ArgumentException("Must delete or add at least one file");
+        current.ThrowIfNotWritable();
+        if (filesToAdd.Count > 0)
+            ThrowIfSpecNotWritable(current);
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var snapshotId = GenerateSnapshotId();
@@ -84,7 +87,7 @@ public sealed class TableOperations
             var currentSnapshot = current.Snapshots.First(
                 s => s.SnapshotId == current.CurrentSnapshotId);
 
-            foreach (var mle in await ReadManifestListAsync(currentSnapshot, ct).ConfigureAwait(false))
+            foreach (var mle in await ReadManifestListAsync(current, currentSnapshot, ct).ConfigureAwait(false))
             {
                 var entries = await ReadManifestAsync(currentSnapshot, mle, ct).ConfigureAwait(false);
                 var rewritten = false;
@@ -252,6 +255,11 @@ public sealed class TableOperations
         string operation,
         CancellationToken ct)
     {
+        // Refuse before writing anything: these manifests would be plaintext files in an encrypted table, or
+        // files under a partition spec this library cannot apply.
+        current.ThrowIfNotWritable();
+        ThrowIfSpecNotWritable(current);
+
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var snapshotId = GenerateSnapshotId();
         var sequenceNumber = current.LastSequenceNumber + 1;
@@ -281,7 +289,8 @@ public sealed class TableOperations
             var currentSnapshot = current.Snapshots.First(
                 s => s.SnapshotId == current.CurrentSnapshotId);
 
-            manifestListEntries.AddRange(await ReadManifestListAsync(currentSnapshot, ct).ConfigureAwait(false));
+            manifestListEntries.AddRange(
+                await ReadManifestListAsync(current, currentSnapshot, ct).ConfigureAwait(false));
         }
 
         manifestListEntries.Add(new ManifestListEntry
@@ -351,13 +360,12 @@ public sealed class TableOperations
     private async ValueTask<IReadOnlyList<DataFile>> ListFilesByContentAsync(
         TableMetadata metadata, FileContent contentType, CancellationToken ct)
     {
-        if (metadata.CurrentSnapshotId is null)
+        var snapshot = metadata.CurrentSnapshotOrNull();
+        metadata.ThrowIfDataInaccessible(snapshot);
+        if (snapshot is null)
             return [];
 
-        var snapshot = metadata.Snapshots.First(
-            s => s.SnapshotId == metadata.CurrentSnapshotId);
-
-        var manifestList = await ReadManifestListAsync(snapshot, ct).ConfigureAwait(false);
+        var manifestList = await ReadManifestListAsync(metadata, snapshot, ct).ConfigureAwait(false);
         var result = new List<DataFile>();
 
         foreach (var mle in manifestList)
@@ -373,8 +381,9 @@ public sealed class TableOperations
         return result;
     }
 
-    private ValueTask<List<ManifestListEntry>> ReadManifestListAsync(Snapshot snapshot, CancellationToken ct) =>
-        ManifestIO.ReadSnapshotManifestListAsync(_fs, snapshot, ct);
+    private ValueTask<List<ManifestListEntry>> ReadManifestListAsync(
+        TableMetadata metadata, Snapshot snapshot, CancellationToken ct) =>
+        ManifestIO.ReadSnapshotManifestListAsync(_fs, metadata, snapshot, ct);
 
     private ValueTask<List<ManifestEntry>> ReadManifestAsync(
         Snapshot snapshot, ManifestListEntry manifest, CancellationToken ct) =>
@@ -394,4 +403,22 @@ public sealed class TableOperations
     }
 
     private static long GenerateSnapshotId() => SnapshotIdFactory.Generate();
+
+    /// <summary>
+    /// A reader must accept a partition spec with a transform it does not know, but the spec forbids
+    /// committing new files under one: their partition values cannot be derived or checked.
+    /// </summary>
+    private static void ThrowIfSpecNotWritable(TableMetadata table)
+    {
+        var spec = table.PartitionSpecs.FirstOrDefault(s => s.SpecId == table.DefaultSpecId);
+        var unknown = spec?.Fields.FirstOrDefault(f => f.Transform is UnknownTransform || f.SourceIds is { Count: > 1 });
+        if (unknown is not null)
+            throw new UnsupportedTableFeatureException(
+                $"Cannot add files to table {table.TableUuid}: its default partition spec {table.DefaultSpecId} has " +
+                $"field '{unknown.Name}' with transform '{TransformName(unknown.Transform)}', which this " +
+                "library does not know.");
+    }
+
+    private static string TransformName(Transform transform) =>
+        transform is UnknownTransform u ? u.Name : transform.GetType().Name;
 }

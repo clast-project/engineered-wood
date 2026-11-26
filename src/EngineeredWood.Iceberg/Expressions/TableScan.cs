@@ -57,17 +57,16 @@ public sealed class TableScan
             ? TimeTravel.AtSnapshot(_metadata, _snapshotId.Value)
             : _metadata;
 
-        if (effectiveMetadata.CurrentSnapshotId is null)
+        var snapshot = effectiveMetadata.CurrentSnapshotOrNull();
+        effectiveMetadata.ThrowIfDataInaccessible(snapshot);
+        if (snapshot is null)
             return new ScanResult([], [], 0, 0);
-
-        var snapshot = effectiveMetadata.Snapshots.First(
-            s => s.SnapshotId == effectiveMetadata.CurrentSnapshotId);
 
         var schema = effectiveMetadata.Schemas.First(
             s => s.SchemaId == effectiveMetadata.CurrentSchemaId);
         var (boundFilter, accessor) = BindFilter(_filter, schema);
 
-        var manifestList = await ManifestIO.ReadSnapshotManifestListAsync(_fs, snapshot, ct)
+        var manifestList = await ManifestIO.ReadSnapshotManifestListAsync(_fs, effectiveMetadata, snapshot, ct)
             .ConfigureAwait(false);
 
         var dataFiles = new List<DataFile>();
@@ -112,6 +111,10 @@ public sealed class TableScan
     /// </summary>
     public ScanResult PlanFiles(IReadOnlyList<DataFile> candidateFiles)
     {
+        // The files come from the caller, but planning them is still reading the table.
+        var effective = _snapshotId is not null ? TimeTravel.AtSnapshot(_metadata, _snapshotId.Value) : _metadata;
+        effective.ThrowIfDataInaccessible(effective.CurrentSnapshotOrNull());
+
         var schema = _metadata.Schemas.First(
             s => s.SchemaId == _metadata.CurrentSchemaId);
         var (boundFilter, accessor) = BindFilter(_filter, schema);

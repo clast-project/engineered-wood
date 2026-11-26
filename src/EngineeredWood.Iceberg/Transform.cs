@@ -28,10 +28,14 @@ public abstract record Transform
     public static readonly Transform Void = new VoidTransform();
 
     /// <summary>Creates a bucket transform that hashes values into the specified number of buckets.</summary>
-    public static BucketTransform Bucket(int numBuckets) => new(numBuckets);
+    public static BucketTransform Bucket(int numBuckets) => numBuckets > 0
+        ? new(numBuckets)
+        : throw new ArgumentOutOfRangeException(nameof(numBuckets), numBuckets, "The number of buckets must be positive.");
 
     /// <summary>Creates a truncate transform that truncates values to the specified width.</summary>
-    public static TruncateTransform Truncate(int width) => new(width);
+    public static TruncateTransform Truncate(int width) => width > 0
+        ? new(width)
+        : throw new ArgumentOutOfRangeException(nameof(width), width, "The truncate width must be positive.");
 }
 
 /// <summary>Returns the source value unchanged.</summary>
@@ -59,3 +63,11 @@ public sealed record HourTransform : Transform;
 
 /// <summary>Always produces null, used to remove a partition field while preserving field IDs.</summary>
 public sealed record VoidTransform : Transform;
+
+/// <summary>
+/// A transform this library does not know, kept by name so that metadata naming it round-trips. A v3 reader
+/// must accept unknown transforms (including multi-argument ones, which have <c>source-ids</c>); such a field
+/// cannot be evaluated, so it must not be used to filter.
+/// </summary>
+/// <param name="Name">The transform string exactly as the metadata spells it.</param>
+public sealed record UnknownTransform(string Name) : Transform;

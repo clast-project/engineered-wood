@@ -51,6 +51,10 @@ public sealed class ExpireSnapshots
         TableMetadata metadata, ITableFileSystem? fs = null,
         CancellationToken ct = default)
     {
+        // Expiry rewrites the table's metadata and deletes its files, so it is a write: refuse an encrypted
+        // table up front, whatever would be expired and whether or not a file system is given.
+        metadata.ThrowIfNotWritable();
+
         var allSnapshots = metadata.Snapshots.ToList();
 
         // Determine snapshots that must be retained
@@ -106,7 +110,7 @@ public sealed class ExpireSnapshots
             // manifests it still needs, and deleting on that basis could remove them.
             foreach (var snap in keptSnapshots)
             {
-                var entries = await ManifestIO.ReadSnapshotManifestListAsync(fs, snap, ct)
+                var entries = await ManifestIO.ReadSnapshotManifestListAsync(fs, metadata, snap, ct)
                     .ConfigureAwait(false);
                 foreach (var e in entries)
                     keptManifestPaths.Add(e.ManifestPath);
@@ -124,6 +128,7 @@ public sealed class ExpireSnapshots
 
                 if (fs is not null && await fs.ExistsAsync(snap.ManifestList, ct).ConfigureAwait(false))
                 {
+                    metadata.ThrowIfDataInaccessible(snap);
                     var entries = await ManifestIO.ReadManifestListAsync(fs, snap.ManifestList, ct)
                         .ConfigureAwait(false);
                     foreach (var e in entries)
@@ -156,10 +161,15 @@ public sealed class ExpireSnapshots
             .Where(e => keptIds.Contains(e.SnapshotId))
             .ToList();
 
+        // Statistics computed for an expired snapshot describe a snapshot that no longer exists, so their
+        // entries go with it, as Java's RemoveSnapshots drops them. Their files are not deleted yet: the
+        // Puffin- and statistics-aware cleanup is Phase 4 (doc/iceberg-v3-plan.md, #957).
         var updatedMetadata = metadata with
         {
             Snapshots = keptSnapshots,
             SnapshotLog = keptSnapshotLog,
+            Statistics = metadata.Statistics?.Where(s => keptIds.Contains(s.SnapshotId)).ToList(),
+            PartitionStatistics = metadata.PartitionStatistics?.Where(s => keptIds.Contains(s.SnapshotId)).ToList(),
             LastUpdatedMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         };
 
