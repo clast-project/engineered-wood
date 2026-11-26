@@ -72,6 +72,8 @@ internal static class IcebergAvroTypes
         }
     }
 
+    private const long MicrosPerDay = 86_400_000_000L;
+
     /// <summary>The fewest bytes whose two's complement holds every unscaled value of precision <paramref name="precision"/>.</summary>
     internal static int DecimalBytes(int precision)
     {
@@ -135,8 +137,11 @@ internal static class IcebergAvroTypes
             (UuidType, byte[] b) when b.Length == 16 => GuidFromBigEndian(b),
             (UuidType, string s) => Guid.Parse(s),
             (DecimalType, byte[] b) => UnscaledFromBigEndian(b),
-            // A promoted column's older manifests hold the narrower type.
-            (LongType or TimeType or TimestampType or TimestamptzType or TimestampNsType or TimestamptzNsType, int i) => (long)i,
+            // A promoted column's older manifests hold the narrower type: int -> long widens the value, and
+            // date -> timestamp / timestamp_ns (v3) turns days into midnight of that day in the new unit.
+            (LongType, int i) => (long)i,
+            (TimestampType or TimestamptzType, int days) => checked(days * MicrosPerDay),
+            (TimestampNsType or TimestamptzNsType, int days) => checked(days * MicrosPerDay * 1000L),
             (DoubleType, float f) => (double)f,
             (BooleanType, bool) or (IntegerType or DateType, int) or
                 (LongType or TimeType or TimestampType or TimestamptzType or TimestampNsType or TimestamptzNsType, long) or
@@ -156,7 +161,10 @@ internal static class IcebergAvroTypes
         return (type, value) switch
         {
             (UuidType, Guid g) => GuidToBigEndian(g),
-            (DecimalType d, BigInteger unscaled) => UnscaledToBigEndian(unscaled, DecimalBytes(d.Precision)),
+            (DecimalType d, BigInteger unscaled) when Values.IcebergLiterals.FitsPrecision(unscaled, d.Precision) =>
+                UnscaledToBigEndian(unscaled, DecimalBytes(d.Precision)),
+            (DecimalType d, BigInteger unscaled) => throw new ArgumentException(
+                $"Unscaled decimal {unscaled} has more digits than {type} holds."),
             (FixedType f, byte[] b) when b.Length == f.Length => b,
             (BooleanType, bool) or (IntegerType or DateType, int) or
                 (LongType or TimeType or TimestampType or TimestamptzType or TimestampNsType or TimestamptzNsType, long) or

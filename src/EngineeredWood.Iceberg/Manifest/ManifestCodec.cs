@@ -83,27 +83,38 @@ internal static class ManifestCodec
         // Iceberg Java (1.8 on) writes a bare fixed partition value with a length prefix, though the schema it
         // writes says fixed (apache/iceberg#17501), and reads it back the same way. Decode as the schema says;
         // only if that does not decode cleanly, and the partition has a bare fixed field, decode as Java writes.
+        //
+        // A wrong reading need not fail: a value's last byte can join the next varint and leave the rest
+        // aligned. So when the partition has a bare fixed field, try both readings, take the one that decodes,
+        // and refuse the manifest if both decode to different files: nothing in the file says which writer
+        // made it.
         var javaFixed = BareFixedPartitionFields(schema);
-        List<ManifestEntry> entries;
-        try
+        if (javaFixed.Count == 0)
         {
-            entries = DecodeEntries(lengthPrefixed: null);
-        }
-        catch (Exception strictError) when (javaFixed.Count > 0 && IsDecodeFailure(strictError))
-        {
-            try
-            {
-                entries = DecodeEntries(javaFixed);
-            }
-            catch (Exception javaError) when (IsDecodeFailure(javaError))
-            {
-                throw strictError;
-            }
+            var (plain, plainLost) = DecodeEntries(lengthPrefixed: null);
+            return new DecodedManifest(plain, reader.Metadata, hasSequenceNumbers, plainLost);
         }
 
-        return new DecodedManifest(entries, reader.Metadata, hasSequenceNumbers, lost.ToList());
+        (List<ManifestEntry> Entries, IReadOnlyList<string> Lost)? strict = null, java = null;
+        Exception? strictError = null;
+        try { strict = DecodeEntries(lengthPrefixed: null); }
+        catch (Exception e) when (IsDecodeFailure(e)) { strictError = e; }
+        try { java = DecodeEntries(javaFixed); }
+        catch (Exception e) when (IsDecodeFailure(e)) { }
 
-        List<ManifestEntry> DecodeEntries(HashSet<AvroFixedSchema>? lengthPrefixed)
+        var chosen = (strict, java) switch
+        {
+            (null, null) => throw strictError!,
+            ({ } s, null) => s,
+            (null, { } j) => j,
+            ({ } s, { } j) when SameFiles(s.Entries, j.Entries) => s,
+            _ => throw Invalid(path,
+                "decodes both as its schema says and as Iceberg Java writes fixed partition values " +
+                "(apache/iceberg#17501), to different files, and nothing in it says which is right"),
+        };
+        return new DecodedManifest(chosen.Entries, reader.Metadata, hasSequenceNumbers, chosen.Lost);
+
+        (List<ManifestEntry> Entries, IReadOnlyList<string> Lost) DecodeEntries(HashSet<AvroFixedSchema>? lengthPrefixed)
         {
             lost.Clear();
             using var stream = new MemoryStream(data);
@@ -127,8 +138,23 @@ internal static class ManifestCodec
                 if (!br.IsEmpty)
                     throw Invalid(path, $"has a block with {br.Remaining} bytes left after its {block.objectCount} records");
             }
-            return result;
+            return (result, lost.ToList());
         }
+    }
+
+    /// <summary>Whether two readings of a manifest describe the same files with the same partition values.</summary>
+    private static bool SameFiles(List<ManifestEntry> a, List<ManifestEntry> b)
+    {
+        if (a.Count != b.Count)
+            return false;
+        for (int i = 0; i < a.Count; i++)
+        {
+            DataFile x = a[i].DataFile, y = b[i].DataFile;
+            if (a[i].Status != b[i].Status || x.FilePath != y.FilePath || x.RecordCount != y.RecordCount
+                || x.FileSizeInBytes != y.FileSizeInBytes || !Equals(x.Partition, y.Partition))
+                return false;
+        }
+        return true;
     }
 
     /// <summary>
@@ -430,6 +456,12 @@ internal static class ManifestCodec
             var t = partitionType[i];
             if (!partition.TryGetValue(t.FieldId, out var value))
                 throw new ArgumentException($"Data file '{df.FilePath}' has no value for partition field {t.FieldId} ({t.Name}).");
+            // The physical value means something only in its own type: unscaled 123 is 1.23 as decimal(9, 2) and
+            // 0.123 as decimal(9, 3), and a long is micros or nanos by its type. Refuse a value typed otherwise.
+            var declared = partition.Values.First(v => v.FieldId == t.FieldId).Type;
+            if (!declared.Equals(t.Type))
+                throw new ArgumentException(
+                    $"Data file '{df.FilePath}' has partition field {t.FieldId} ({t.Name}) typed {declared}; its spec types it {t.Type}.");
             // Iceberg Java (1.8 on) reads a fixed partition value with a length prefix, though the spec and the
             // schema say fixed has none (apache/iceberg#17501). Either encoding would be misread by one group of
             // readers, so refuse to write one until that is settled. A null value is encoded the same either way.
@@ -570,9 +602,10 @@ internal static class ManifestCodec
     /// <summary>
     /// Fills in what a manifest's entries inherit from their manifest-list entry (spec "Manifest Entry
     /// Inheritance"): a null snapshot id is the manifest's added snapshot; a null sequence number of an ADDED
-    /// entry is the manifest's; a v1 manifest has sequence number 0 throughout; and a data file's null
-    /// <c>first_row_id</c> is the manifest's <c>first_row_id</c> plus the record counts of the data files before
-    /// it that also had none.
+    /// entry is the manifest's; a v1 manifest has sequence number 0 throughout; and a live data file's null
+    /// <c>first_row_id</c> is the manifest's <c>first_row_id</c> plus the record counts of the live data files
+    /// before it that also had none. DELETED entries neither take a row id nor use one up, as Iceberg Java's
+    /// <c>ManifestReader</c> assigns them.
     /// </summary>
     public static List<ManifestEntry> Inherit(DecodedManifest manifest, ManifestListEntry from)
     {
@@ -593,7 +626,8 @@ internal static class ManifestCodec
             }
 
             var df = entry.DataFile;
-            if (df.Content == FileContent.Data && df.FirstRowId is null && nextRowId is { } rowId)
+            if (df.Content == FileContent.Data && entry.Status != ManifestEntryStatus.Deleted
+                && df.FirstRowId is null && nextRowId is { } rowId)
             {
                 df = df with { FirstRowId = rowId };
                 nextRowId = rowId + entry.DataFile.RecordCount;

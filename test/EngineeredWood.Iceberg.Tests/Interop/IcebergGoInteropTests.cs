@@ -276,6 +276,9 @@ public sealed class IcebergGoInteropTests : IDisposable
             .Where(e => e.GetProperty("status").GetString() != "DELETED")
             .ToDictionary(e => e.GetProperty("file_path").GetString()!, e => e.GetProperty("data_sequence_number").GetInt64());
 
+        var lineageBefore = Scan(metadataLocation, rowLineage: true)
+            .ToDictionary(r => r["id"].GetInt64(), r => r["_row_id"].ToString());
+
         var updated = await ops.OverwriteFilesAsync(md, [victim, .. victimDeletes], []);
         string updatedLocation = $"{md.Location}/metadata/ew-{Guid.NewGuid():N}.metadata.json";
         await fs.WriteAllBytesAsync(updatedLocation,
@@ -309,6 +312,10 @@ public sealed class IcebergGoInteropTests : IDisposable
         // Every row iceberg-go still reads was there before. Unless a delete without a referenced data file
         // (an equality delete, or a v2 position delete) might have removed some of the victim's rows, exactly
         // the victim's rows are gone.
+        // Row lineage survives the rewrite: every remaining row keeps the _row_id it had.
+        foreach (var row in Scan(updatedLocation, rowLineage: true))
+            Assert.True(lineageBefore[row["id"].GetInt64()] == row["_row_id"].ToString(), $"{scenario}: _row_id of id {row["id"]}");
+
         var ids = Scan(updatedLocation, rowLineage: false).Select(r => r["id"].GetInt64()).ToList();
         Assert.All(ids, id => Assert.Contains(id, expectedIds));
         bool victimRowsKnown = deletes.All(d => d.ReferencedDataFile is not null) && victimDeletes.Count == 0;

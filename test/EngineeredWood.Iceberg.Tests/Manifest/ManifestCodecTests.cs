@@ -470,6 +470,80 @@ public class ManifestCodecTests : IDisposable
     }
 
     [Fact]
+    public void ReadingsThatBothDecode_ToDifferentFiles_AreRefused()
+    {
+        // Java's 02 | 08 00 01 02 80 | record_count 02 also reads, as the schema says, as fixed 08 00 01 02 and
+        // record_count 80 02 (= 128), with everything after it aligned.
+        const string fixedNode = "{\"type\": \"fixed\", \"name\": \"fixed_4\", \"size\": 4}";
+        string onlyFixed(string type)
+        {
+            string schema = FixedPartitionSchema(type);
+            int s = schema.IndexOf(", {\"name\": \"s\"", StringComparison.Ordinal);
+            int e = schema.IndexOf("\"field-id\": 1001}", s, StringComparison.Ordinal) + "\"field-id\": 1001}".Length;
+            return schema.Substring(0, s) + schema.Substring(e);
+        }
+        var asBytes = (AvroRecordSchema)AvroSchemaParser.Parse(onlyFixed("\"bytes\""));
+        var header = (AvroRecordSchema)AvroSchemaParser.Parse(onlyFixed(fixedNode));
+        var w = new AvroBinaryWriter(new GrowableBuffer());
+        AvroDatum.Write(w, asBytes, Entry(asBytes, new()
+        {
+            ["status"] = 1, ["snapshot_id"] = 1L,
+            ["data_file"] = (Func<AvroRecordSchema, AvroRecordValue>)(df => Rec(df, new()
+            {
+                ["content"] = 0, ["file_path"] = "a.parquet", ["file_format"] = "PARQUET",
+                ["partition"] = (Func<AvroRecordSchema, AvroRecordValue>)(p => Rec(p, new() { ["fx"] = new byte[] { 0, 1, 2, 0x80 } })),
+                ["record_count"] = 1L, ["file_size_in_bytes"] = 1L,
+            })),
+        }));
+        var ms = new MemoryStream();
+        using (var ocf = new OcfWriter(ms, AvroCodec.Null))
+        {
+            ocf.WriteHeader(header);
+            ocf.WriteBlock(w.WrittenSpan, 1);
+        }
+
+        var ex = Assert.Throws<InvalidDataException>(() => ManifestCodec.DecodeManifest(ms.ToArray(), "ambiguous.avro",
+            [new PartitionValueType(1000, "fx", new FixedType(4))]));
+        Assert.Contains("apache/iceberg#17501", ex.Message);
+    }
+
+    [Fact]
+    public void PartitionValueTypedOtherwiseThanItsSpec_IsRefused()
+    {
+        var spec = new List<PartitionValueType> { new(1000, "amount", IcebergType.Decimal(9, 3)) };
+        var entry = new ManifestEntry
+        {
+            Status = ManifestEntryStatus.Added, SnapshotId = 1,
+            DataFile = new DataFile
+            {
+                FilePath = "a.parquet", RecordCount = 1, FileSizeInBytes = 1,
+                // 1.23 as decimal(9, 2); written as decimal(9, 3) it would read back as 0.123.
+                Partition = new PartitionData([new PartitionValue(1000, "amount", IcebergType.Decimal(9, 2), new BigInteger(123))]),
+            },
+        };
+        Assert.Throws<ArgumentException>(() =>
+            ManifestCodec.EncodeManifest([entry], 2, ManifestContent.Data, spec, new Dictionary<string, byte[]>()));
+    }
+
+    [Fact]
+    public void DecimalWiderThanItsPrecision_IsRefused()
+    {
+        Assert.Equal(new byte[] { 99 }, IcebergAvroTypes.ToAvro(new BigInteger(99), IcebergType.Decimal(2, 0)));
+        // 100 fits decimal(2, 0)'s one byte, but not its two digits.
+        Assert.Throws<ArgumentException>(() => IcebergAvroTypes.ToAvro(new BigInteger(100), IcebergType.Decimal(2, 0)));
+    }
+
+    [Fact]
+    public void DateUnderAPromotedTimestamp_IsMidnightOfThatDay()
+    {
+        // An identity partition on a date column, read after the column became a timestamp (a v3 promotion).
+        Assert.Equal(86_400_000_000L, IcebergAvroTypes.ToPhysical(1, IcebergType.Timestamp));
+        Assert.Equal(-86_400_000_000L, IcebergAvroTypes.ToPhysical(-1, IcebergType.Timestamptz));
+        Assert.Equal(86_400_000_000_000L, IcebergAvroTypes.ToPhysical(1, IcebergType.TimestampNs));
+        Assert.Equal(1L, IcebergAvroTypes.ToPhysical(1, IcebergType.Long));
+    }
+
+    [Fact]
     public void NonNullFixedPartitionValue_IsNotWritten()
     {
         var type = new List<PartitionValueType> { new(1000, "fx", new FixedType(4)) };
@@ -599,6 +673,16 @@ public class ManifestCodecTests : IDisposable
         };
 
         var inherited = ManifestCodec.Inherit(manifest, mle);
+
+        // A DELETED entry neither takes a row id nor uses one up, as Iceberg Java reads it.
+        var withDeleted = manifest with
+        {
+            Entries = [new() { Status = ManifestEntryStatus.Deleted, SnapshotId = 3, SequenceNumber = 1, FileSequenceNumber = 1, DataFile = File("gone", 99) },
+                       .. manifest.Entries],
+        };
+        var afterDeleted = ManifestCodec.Inherit(withDeleted, mle);
+        Assert.Null(afterDeleted[0].DataFile.FirstRowId);
+        Assert.Equal([1000L, 500, 1010], afterDeleted.Skip(1).Select(e => e.DataFile.FirstRowId!.Value));
         Assert.Equal([8L, 3, 8], inherited.Select(e => e.SnapshotId!.Value));
         Assert.Equal([6L, 2, 6], inherited.Select(e => e.SequenceNumber!.Value));
         Assert.Equal([6L, 2, 6], inherited.Select(e => e.FileSequenceNumber!.Value));

@@ -111,6 +111,27 @@ public class ManifestRewriteTests : IDisposable
     }
 
     [Fact]
+    public async Task Rewrite_KeepsTheManifestsFirstRowId()
+    {
+        var md = await _ops.AppendFilesAsync(NewTable(formatVersion: 3), [File("a"), File("b")]);
+        var snapshot = md.Snapshots.Single();
+        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList));
+        // As a v3 writer assigns it: this manifest's files take row ids from 100.
+        await ManifestIO.WriteManifestListAsync(_fs, snapshot.ManifestList, [mle with { FirstRowId = 100 }],
+            new ManifestListWriteOptions { FormatVersion = 3 });
+
+        md = await _ops.OverwriteFilesAsync(md, [File("a")], []);
+
+        var current = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
+        var rewritten = Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, current.ManifestList));
+        // Iceberg Java clears every file's row id in a committed manifest without one, so it is kept.
+        Assert.Equal(100, rewritten.FirstRowId);
+        var b = Assert.Single(await ManifestIO.ReadManifestAsync(_fs, rewritten.ManifestPath),
+            e => e.Status != ManifestEntryStatus.Deleted);
+        Assert.Equal(110, b.DataFile.FirstRowId);
+    }
+
+    [Fact]
     public async Task Rewrite_OfAManifestWithFieldsItCannotHold_IsRefused()
     {
         var md = await _ops.AppendFilesAsync(NewTable(), [File("a")]);

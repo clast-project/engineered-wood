@@ -168,9 +168,10 @@ public sealed class TableOperations
                 AddedRowsCount = 0,
                 ExistingRowsCount = live.Sum(e => e.DataFile.RecordCount),
                 DeletedRowsCount = gone.Sum(e => e.DataFile.RecordCount),
-                // Every entry now carries its first_row_id, so nothing inherits one. The partition summaries
-                // still bound what is left, so they are kept.
-                FirstRowId = null,
+                // Every entry now carries its first_row_id, so nothing inherits one, but the manifest keeps its
+                // own: Iceberg Java reads a committed manifest whose first_row_id is null as one from before a v3
+                // upgrade, and clears every file's row id, explicit ones included. The partition summaries
+                // still bound what is left, so they are kept too.
             });
         }
 
