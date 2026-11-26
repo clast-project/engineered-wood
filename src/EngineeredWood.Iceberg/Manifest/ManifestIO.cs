@@ -206,7 +206,11 @@ public static class ManifestIO
         ITableFileSystem fs, TableMetadata metadata, Snapshot snapshot, ManifestListEntry manifest, CancellationToken ct)
     {
         var decoded = await ReadSnapshotManifestDecodedAsync(fs, metadata, snapshot, manifest, ct).ConfigureAwait(false);
-        return ManifestCodec.Inherit(decoded, manifest);
+        // Bounds are decoded against the current schema, which planning binds filters to.
+        var schema = metadata.Schemas.First(s => s.SchemaId == metadata.CurrentSchemaId);
+        return ManifestCodec.Inherit(decoded, manifest)
+            .Select(e => e with { DataFile = ManifestValues.WithDecodedBounds(e.DataFile, schema) })
+            .ToList();
     }
 
     /// <summary>As <see cref="ReadSnapshotManifestAsync"/>, but before inheritance and with what a rewrite needs to know.</summary>

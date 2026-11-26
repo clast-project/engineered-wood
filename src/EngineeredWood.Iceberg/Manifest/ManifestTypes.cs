@@ -127,8 +127,9 @@ public sealed record DataFile
     public int? SortOrderId { get; init; }
 
     /// <summary>
-    /// Per-column lower bounds for scan planning, keyed by field ID. Not serialized: a manifest's bounds are
-    /// in <see cref="LowerBounds"/>.
+    /// Per-column lower bounds for scan planning, keyed by field ID: <see cref="LowerBounds"/> decoded against
+    /// the table's current schema when a manifest is read through a snapshot, leaving out any bound that
+    /// cannot be used safely. Not serialized; the manifest keeps the raw bytes.
     /// </summary>
     [JsonIgnore] public IReadOnlyDictionary<int, LiteralValue>? ColumnLowerBounds { get; init; }
     /// <summary>Per-column upper bounds for scan planning, keyed by field ID. Not serialized.</summary>
