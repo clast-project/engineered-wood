@@ -243,48 +243,96 @@ jobs:
           datafusion==54.0.0
           fastavro==1.12.2 lz4==4.4.5
 
-      # The iceberg-go tier (test/EngineeredWood.Iceberg.Tests/Interop/IcebergGo.cs) builds its Go driver
-      # on first use. go.mod pins iceberg-go (>= 0.8.0: 0.7.0 resurrects deleted rows after a v2->v3
-      # upgrade) and names the Go version; the module cache is keyed on go.sum.
-      - name: Setup Go
+      # The iceberg-go tier (test/EngineeredWood.Iceberg.Tests/Interop/IcebergGo.cs) needs its Go
+      # driver. Every leg gets a ready-built binary through EW_ICEBERG_GO_DRIVER rather than leaving the
+      # tests to build it: on the first run of #961, each TFM's own cold `go build` made its first
+      # iceberg-go test take 205-646 s.
+      #
+      # The BINARY is cached, keyed on the driver's sources (go.mod pins iceberg-go >= 0.8.0 and the
+      # Go version, go.sum the modules, *.go the code), so a cache hit needs no Go at all. Caching Go's
+      # module and build caches instead (setup-go's default) cost ~45 s a leg: measured on #966, a
+      # 713 MB restore to rebuild one binary in 5 s. On a miss, the steps below build it and the cache
+      # saves it at the end of the job.
+      - name: Is the iceberg-go driver needed?
+        id: icego
         if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
+        shell: bash
+        run: |
+          target="${{ steps.select.outputs.target }}"
+          needed=true
+          case "$target" in
+            *.slnf) grep -q 'EngineeredWood.Iceberg.Tests' "$target" || needed=false ;;
+          esac
+          echo "Iceberg tests selected: $needed"
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+
+      - name: Restore iceberg-go driver from cache
+        id: icego-cache
+        if: steps.icego.outputs.needed == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\iceberg-go-driver.exe
+          key: iceberg-go-driver-${{ runner.os }}-${{ hashFiles('test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go/go.mod', 'test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go/go.sum', 'test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go/*.go') }}
+
+      - name: Setup Go
+        if: steps.icego.outputs.needed == 'true' && steps.icego-cache.outputs.cache-hit != 'true'
         uses: actions/setup-go@v5
         with:
           go-version-file: test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go/go.mod
           cache-dependency-path: test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go/go.sum
 
-      # Build the driver ONCE per leg and hand it to the test run through EW_ICEBERG_GO_DRIVER.
-      # Left to the tests, each TFM ran its own cold `go build` concurrently, competing with the other
-      # suites for the runner. Measured on the first run of #961: the first iceberg-go test took 205 s on
-      # net10.0/net11.0 and 646 s on net472, while every other test took under 3 s. A failed build now
-      # fails here, by name, instead of inside whichever test needed the driver first.
       - name: Build iceberg-go driver
-        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
+        if: steps.icego.outputs.needed == 'true' && steps.icego-cache.outputs.cache-hit != 'true'
         shell: bash
         working-directory: test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go
+        run: go build -mod=readonly -o "$RUNNER_TEMP/iceberg-go-driver.exe" .
+
+      # Whether built or restored, the binary must answer before the tests are pointed at it.
+      - name: Use iceberg-go driver
+        if: steps.icego.outputs.needed == 'true'
+        shell: bash
         run: |
-          target="${{ steps.select.outputs.target }}"
-          case "$target" in
-            *.slnf) grep -q 'EngineeredWood.Iceberg.Tests' "$GITHUB_WORKSPACE/$target" \
-                      || { echo "Iceberg tests not selected; skipping."; exit 0; } ;;
-          esac
           exe="$RUNNER_TEMP/iceberg-go-driver.exe"
-          go build -mod=readonly -o "$exe" .
           "$exe" version
           echo "EW_ICEBERG_GO_DRIVER=$exe" >> "$GITHUB_ENV"
+
+      # What this leg builds and tests. The primary leg takes the whole target: it packs, and it is
+      # where every project (libraries on every framework, benchmarks, tools) is proven to compile.
+      # The other legs take only the target's TEST projects, so each library builds only for the
+      # framework those tests use, and benchmarks and tools are skipped: measured locally under
+      # -p:EwTestTargetFrameworks=net472, a full rebuild of the solution took 32 s and of its test
+      # projects 9 s.
+      - name: Choose what this leg builds
+        id: target
+        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
+        shell: bash
+        run: |
+          target="${{ steps.select.outputs.target }}"
+          if [ "${{ matrix.primary }}" != "true" ]; then
+            python .github/scripts/tests_only_slnf.py "$target" ci-tests.slnf
+            target=ci-tests.slnf
+            # A change to a benchmark or tool alone selects no tests: nothing to do in this leg (the
+            # primary leg still builds the change).
+            if ! grep -q 'csproj' ci-tests.slnf; then
+              echo "No test projects selected; this leg has nothing to build or test."
+              target=none
+            fi
+          fi
+          echo "Building and testing $target"
+          echo "path=$target" >> "$GITHUB_OUTPUT"
 
       # Restore, Build and Test all narrow the TEST projects to this leg's framework. Restore must
       # see the same frameworks as the build, or the assets file would lack this leg's target.
       - name: Restore
-        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
-        run: dotnet restore "${{ steps.select.outputs.target }}" -p:EwTestTargetFrameworks=${{ matrix.tfm }}
+        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none' && steps.target.outputs.path != 'none'
+        run: dotnet restore "${{ steps.target.outputs.path }}" -p:EwTestTargetFrameworks=${{ matrix.tfm }}
 
       - name: Build
-        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
-        run: dotnet build "${{ steps.select.outputs.target }}" --no-restore --configuration Release -p:EwTestTargetFrameworks=${{ matrix.tfm }}
+        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none' && steps.target.outputs.path != 'none'
+        run: dotnet build "${{ steps.target.outputs.path }}" --no-restore --configuration Release -p:EwTestTargetFrameworks=${{ matrix.tfm }}
 
       - name: Test
-        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
+        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none' && steps.target.outputs.path != 'none'
         # EW_REQUIRE_* turns an unavailable tier into a hard FAILURE instead of a skip,
         # which is the whole point of setting them here.
         #
@@ -311,7 +359,7 @@ jobs:
         # fixed file name made each framework's results overwrite the last, so the uploaded
         # artifact held one framework per project. The prefix gets the framework and a
         # timestamp appended.
-        run: dotnet test "${{ steps.select.outputs.target }}" --no-build --configuration Release -p:EwTestTargetFrameworks=${{ matrix.tfm }} --logger "trx;LogFilePrefix=test-results"
+        run: dotnet test "${{ steps.target.outputs.path }}" --no-build --configuration Release -p:EwTestTargetFrameworks=${{ matrix.tfm }} --logger "trx;LogFilePrefix=test-results"
 
       - name: Pack
         if: matrix.primary && steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
