@@ -15,7 +15,8 @@ where the `netstandard2.0` gaps show up (`System.Index`/`System.Range`, `ToListA
 similar), and some results, such as floating-point formatting, differ between frameworks.
 
 ```
-dotnet build engineered-wood.slnx      # every project, every TFM it declares (what CI does)
+dotnet build engineered-wood.slnx      # every project, every TFM it declares
+dotnet test engineered-wood.slnx -p:EwTestTargetFrameworks=net472   # tests on one framework (one CI leg)
 ```
 
 ⚠ **Do not run `dotnet build -f net472` on the solution.** It forces `net472` onto the `src/`
@@ -316,7 +317,8 @@ reads files outside its own project at run time (for example, `EngineeredWood.Pa
 
 | Workflow / job | Runs on | What it tests |
 |---|---|---|
-| `ci.yml` / `build` (required) | windows-latest | Affected projects, all TFMs, with delta-rs, DuckDB, DataFusion, pyarrow, fastavro and Go (for iceberg-go) installed. No JDK, so Spark cases skip. |
+| `ci.yml` / `test (net11.0)`, `test (net10.0)`, `test (net472)` | windows-latest, one job per framework, in parallel | Affected projects' tests on that framework (`-p:EwTestTargetFrameworks=<tfm>`), with delta-rs, DuckDB, DataFusion, pyarrow, fastavro and Go (for iceberg-go) installed. No JDK, so Spark cases skip. The net11.0 leg also checks for BOMs and packs. |
+| `ci.yml` / `build` (required) | ubuntu-latest | Passes only if every `test (…)` leg passed. It exists so the required check keeps its name. |
 | `ci.yml` / `cloud-io` (required) | ubuntu-latest | Cloud backends against the emulators, net10.0. |
 | `ci.yml` / `vortex-interop` | ubuntu-latest | Vortex against upstream (Rust 1.96.0). |
 | `ci.yml` / `parquet-alp-interop` | ubuntu-latest | ALP against arrow-rs (Rust 1.96.0). |
@@ -338,7 +340,7 @@ A green run with skips has not validated the skipped tier, so read the `Skipped:
 every tool installed and the `spark-4.2` or `spark-4.1` pairing, `DeltaLake.Table` should report
 0 skipped. On `spark-4.0`, the cases that need Spark 4.1 or delta-spark 4.3 (GA variant, shredded
 tables, `add.stats_parsed`, variant statistics) skip. Without a JDK, every Spark case skips. The
-`build` job is in that state, so its Spark skips are expected.
+`test (…)` jobs are in that state, so their Spark skips are expected.
 
 ### Test counts
 

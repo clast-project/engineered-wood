@@ -26,10 +26,36 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  # One job per test framework, in parallel. `build` below is the required check that gathers them.
+  #
+  # WHY SPLIT. As one job, the Test step ran all three frameworks' test processes on one 4-vCPU
+  # runner, and the runner was the bottleneck, not the tests. Measured on #964: CPU at 100% for
+  # most of the step, a run queue of 18 (peak 73), free memory down to 2.3 GB with paging bursts of
+  # 42k pages/s. Test times swung wildly with whatever ran alongside (Expressions.Arrow.Tests on
+  # net472: 40 s in one run, 532 s in another). The work is CPU-bound, so the step took about
+  # total work / 4 cores, and reordering it could not help (simulated: at most 1.5 min).
+  #
+  # Each leg builds the libraries in full (Pack needs every library framework) but the test
+  # projects for its own framework only, through EwTestTargetFrameworks (test/Directory.Build.props).
+  # Parquet.Bridge.Tests is net10.0-only and runs in the net10.0 leg alone.
+  test:
+    name: test (${{ matrix.tfm }})
     # windows-latest is required because several test projects target net472,
     # which exercises the netstandard2.0 build of the libraries.
     runs-on: windows-latest
+    strategy:
+      # Every framework reports, whatever another one does: a net472-only failure must not hide a
+      # net11.0 one behind a cancelled leg.
+      fail-fast: false
+      matrix:
+        include:
+          # The net11.0 leg also checks for BOMs and packs; once is enough for both.
+          - tfm: net11.0
+            primary: true
+          - tfm: net10.0
+            primary: false
+          - tfm: net472
+            primary: false
 
     steps:
       - name: Checkout
@@ -90,6 +116,7 @@ jobs:
       # exit 1 and name the file. A check only ever observed passing is indistinguishable
       # from one that inspects nothing — see the interop-tier note on the Test step below.
       - name: Check for UTF-8 BOMs
+        if: matrix.primary
         shell: bash
         run: |
           found="$(git ls-files -- '*.cs' | perl -ne '
@@ -226,7 +253,7 @@ jobs:
           go-version-file: test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go/go.mod
           cache-dependency-path: test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go/go.sum
 
-      # Build the driver ONCE and hand it to every TFM's test run through EW_ICEBERG_GO_DRIVER.
+      # Build the driver ONCE per leg and hand it to the test run through EW_ICEBERG_GO_DRIVER.
       # Left to the tests, each TFM ran its own cold `go build` concurrently, competing with the other
       # suites for the runner. Measured on the first run of #961: the first iceberg-go test took 205 s on
       # net10.0/net11.0 and 646 s on net472, while every other test took under 3 s. A failed build now
@@ -246,13 +273,15 @@ jobs:
           "$exe" version
           echo "EW_ICEBERG_GO_DRIVER=$exe" >> "$GITHUB_ENV"
 
+      # Restore, Build and Test all narrow the TEST projects to this leg's framework. Restore must
+      # see the same frameworks as the build, or the assets file would lack this leg's target.
       - name: Restore
         if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
-        run: dotnet restore "${{ steps.select.outputs.target }}"
+        run: dotnet restore "${{ steps.select.outputs.target }}" -p:EwTestTargetFrameworks=${{ matrix.tfm }}
 
       - name: Build
         if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
-        run: dotnet build "${{ steps.select.outputs.target }}" --no-restore --configuration Release
+        run: dotnet build "${{ steps.select.outputs.target }}" --no-restore --configuration Release -p:EwTestTargetFrameworks=${{ matrix.tfm }}
 
       - name: Test
         if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
@@ -282,10 +311,10 @@ jobs:
         # fixed file name made each framework's results overwrite the last, so the uploaded
         # artifact held one framework per project. The prefix gets the framework and a
         # timestamp appended.
-        run: dotnet test "${{ steps.select.outputs.target }}" --no-build --configuration Release --logger "trx;LogFilePrefix=test-results"
+        run: dotnet test "${{ steps.select.outputs.target }}" --no-build --configuration Release -p:EwTestTargetFrameworks=${{ matrix.tfm }} --logger "trx;LogFilePrefix=test-results"
 
       - name: Pack
-        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
+        if: matrix.primary && steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
         # test/ and benchmark projects opt out of packing (test/Directory.Build.props),
         # so this produces only the src/ libraries: all 15 of them on a full run, and on a
         # selective one just those that were selected.
@@ -295,11 +324,11 @@ jobs:
         if: always() && steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
         uses: actions/upload-artifact@v4
         with:
-          name: test-results
+          name: test-results-${{ matrix.tfm }}
           path: '**/*.trx'
 
       - name: Upload packages
-        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
+        if: matrix.primary && steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
         uses: actions/upload-artifact@v4
         with:
           name: packages
@@ -307,9 +336,23 @@ jobs:
             artifacts/*.nupkg
             artifacts/*.snupkg
 
+  # The REQUIRED status check (branch protection names `build`), kept under that name so splitting
+  # the tests changed nothing there. It passes only if every `test (<framework>)` leg did. It must run
+  # even when a leg fails (always()), or a failure would leave it skipped, and a skipped required
+  # check blocks the PR without saying why.
+  build:
+    if: always()
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every framework's tests passed
+        run: |
+          echo "test legs: ${{ needs.test.result }}"
+          test "${{ needs.test.result }}" = success
+
   # The cloud-backend tests, against real emulators. This is step 2 of issue #79.
   #
-  # WHY A SECOND JOB, ON LINUX. The `build` job above must be windows-latest because several
+  # WHY A SEPARATE JOB, ON LINUX. The `test` jobs above must be windows-latest because several
   # test projects target net472. None of the three emulators here is usable as an oracle on
   # Windows: MinIO stores each object as a file and so rejects `region=a?d` with NTFS's rules
   # rather than S3's, which fails two of the path-conformance cases for a reason that has
@@ -537,8 +580,8 @@ jobs:
   # WHY A SEPARATE JOB. Until this job existed nothing in CI built the validator, and its tests
   # returned early without it — a PASS — so all of them reported green on every run having
   # validated nothing. Building vortex needs a Rust toolchain and several minutes of compilation
-  # that the Windows `build` job should not pay for every change; on Linux, cached, it is cheap
-  # after the first run. The `build` job still covers the upstream fixtures through the few samples
+  # that the Windows `test` jobs should not pay for every change; on Linux, cached, it is cheap
+  # after the first run. The `test` jobs still cover the upstream fixtures through the few samples
   # committed under TestData/upstream-compat, which need neither Rust nor the network.
   #
   # ONLY WHEN IT CAN MATTER. It runs when the project selection includes the Vortex tests, which
@@ -663,7 +706,7 @@ jobs:
   # release is built on arrow-rs 60 or later (55.0.0 is on 59). When one is, ALP moves into that
   # tier and this job and the crate are deleted (#550).
   #
-  # Like vortex-interop: a separate Linux job so the Windows `build` job never pays for a Rust
+  # Like vortex-interop: a separate Linux job so the Windows `test` jobs never pay for a Rust
   # toolchain, the tests skip rather than fail where the binary is not built, and
   # EW_REQUIRE_PARQUET_ALP_ORACLE=1 here turns that skip into a failure so green means checked.
   # It runs when the project selection includes the Parquet tests. It is not a required check.

@@ -7,6 +7,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
+    <!-- Every other test project runs on $(EwTestTargetFrameworks); this one is fixed at net10.0. When the
+         test frameworks are narrowed to a set without net10.0 (CI runs one framework per job, e.g.
+         -p:EwTestTargetFrameworks=net472), it must not run there too, or each job would repeat it. It still
+         builds everywhere. -->
+    <IsTestProject Condition="!$([System.String]::Copy(';$(EwTestTargetFrameworks);').Contains(';net10.0;'))">false</IsTestProject>
   </PropertyGroup>
 
   <ItemGroup>
