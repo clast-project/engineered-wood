@@ -243,7 +243,8 @@ public static class SingleValueBinary
             case DecimalType:
                 return UnscaledBigEndian(v.AsHighPrecisionDecimal.UnscaledValue);
             case StringType:
-                return Encoding.UTF8.GetBytes(v.AsString);
+                // Strict, so a string that slipped past Coerce fails rather than encoding U+FFFD in its place.
+                return StrictUtf8.GetBytes(v.AsString);
             case UuidType:
                 return UuidBytes(v.AsGuid);
             case FixedType or BinaryType or GeometryType or GeographyType:

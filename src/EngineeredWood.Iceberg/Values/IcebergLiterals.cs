@@ -102,9 +102,12 @@ public static class IcebergLiterals
             case LongType when value.Type == LiteralValue.Kind.Int64:
             case FloatType when value.Type == LiteralValue.Kind.Float:
             case DoubleType when value.Type == LiteralValue.Kind.Double:
-            case StringType when value.Type == LiteralValue.Kind.String:
             case UuidType when value.Type == LiteralValue.Kind.Guid:
             case BinaryType or GeometryType or GeographyType when value.Type == LiteralValue.Kind.Binary:
+                return value;
+            case StringType when value.Type == LiteralValue.Kind.String:
+                if (!IsWellFormedUtf16(value.AsString))
+                    throw Mismatch(type, value, "it holds an unpaired UTF-16 surrogate, which UTF-8 cannot encode");
                 return value;
             case LongType when value.Type == LiteralValue.Kind.Int32:
                 return LiteralValue.Of((long)value.AsInt32);
@@ -128,6 +131,27 @@ public static class IcebergLiterals
 
         _ = KindOf(type); // throws for a type with no single value
         throw Mismatch(type, value, null);
+    }
+
+    /// <summary>Whether every surrogate in <paramref name="s"/> is half of a pair.</summary>
+    private static bool IsWellFormedUtf16(string s)
+    {
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (char.IsHighSurrogate(c))
+            {
+                if (i + 1 >= s.Length || !char.IsLowSurrogate(s[i + 1]))
+                    return false;
+                i++;
+            }
+            else if (char.IsLowSurrogate(c))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     // ── The Iceberg-internal representation of each temporal type ──
@@ -304,15 +328,23 @@ public static class IcebergLiterals
                 throw Mismatch(type, value, null);
         }
 
+        // Zero is zero at every scale, however far apart the scales are.
+        if (unscaled.IsZero)
+            return LiteralValue.HighPrecisionDecimalOf(BigInteger.Zero, type.Scale);
+
+        // Every power below is bounded by the value itself, so a scale from a file's metadata cannot ask for a
+        // number millions of digits long (#760): scaling up must stay within the precision, and scaling down
+        // is exact only if the value has at least as many digits as the scales are apart.
+        long digits = DigitCount(unscaled);
         if (scale < type.Scale)
         {
-            if (type.Scale - scale > 2 * MaxDecimalDigits)
+            if (digits + ((long)type.Scale - scale) > type.Precision)
                 throw Mismatch(type, value, $"it has more digits than precision {type.Precision}");
             unscaled *= BigInteger.Pow(10, type.Scale - scale);
         }
         else if (scale > type.Scale)
         {
-            if (scale - type.Scale > 2 * MaxDecimalDigits)
+            if ((long)scale - type.Scale > digits)
                 throw Mismatch(type, value, $"it does not reach scale {type.Scale} exactly");
             var divisor = BigInteger.Pow(10, scale - type.Scale);
             var quotient = BigInteger.DivRem(unscaled, divisor, out var remainder);
@@ -328,6 +360,19 @@ public static class IcebergLiterals
     }
 
     private const int MaxDecimalDigits = 38;
+
+    /// <summary>The number of decimal digits in a non-zero value's magnitude, without formatting it.</summary>
+    private static long DigitCount(BigInteger value)
+    {
+        var magnitude = BigInteger.Abs(value);
+        // log10 estimates the count to within one; settle it against the power it implies.
+        long estimate = (long)Math.Floor(BigInteger.Log10(magnitude)) + 1;
+        if (estimate > 1 && magnitude < BigInteger.Pow(10, (int)estimate - 1))
+            return estimate - 1;
+        if (magnitude >= BigInteger.Pow(10, (int)estimate))
+            return estimate + 1;
+        return estimate;
+    }
 
     private static readonly BigInteger[] s_powersOfTen = BuildPowersOfTen();
 

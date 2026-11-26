@@ -57,10 +57,30 @@ internal static class ExactFloatText
         negative = text.StartsWith("-", StringComparison.Ordinal);
         num = den = BigInteger.One;
         if (!SingleValueJson.TryParseDecimalText(negative ? text.Substring(1) : text, out var unscaled, out int scale)
-            || unscaled.Sign < 0 || Math.Abs((long)scale) > 10_000)
+            || unscaled.Sign < 0)
             return false;
 
-        // A long exponent is a magnitude far past either type's range; bounding it keeps the powers small.
+        // Zero, and magnitudes far past either type's range, are settled without building their powers: a value
+        // below 1e-400 rounds to zero and one of 1e400 or more to an infinity, for a double and a float alike.
+        if (unscaled.IsZero)
+        {
+            num = BigInteger.Zero;
+            return true;
+        }
+
+        long leadingExponent = unscaled.ToString(CultureInfo.InvariantCulture).Length - (long)scale; // value < 10^this
+        if (leadingExponent < -400)
+        {
+            num = BigInteger.Zero;
+            return true;
+        }
+
+        if (leadingExponent > 401)
+        {
+            num = BigInteger.Pow(10, 400);
+            return true;
+        }
+
         if (scale >= 0)
         {
             num = unscaled;
