@@ -174,12 +174,13 @@ public sealed class AvroDecoder : IDisposable
         {
             var readerRecord = _readerSchema.Parsed as AvroRecordSchema
                 ?? throw new InvalidOperationException("Reader schema must be a record type.");
-            var resolution = SchemaResolver.Resolve(writerRecord, readerRecord);
+            var resolution = SchemaResolver.Resolve(writerRecord, EmptyRecords.Strip(readerRecord));
             _assembler = new RecordBatchAssembler(writerRecord, resolution);
             _currentArrowSchema = resolution.ArrowSchema;
         }
         else
         {
+            writerRecord = EmptyRecords.Strip(writerRecord);
             var arrowSchema = ArrowSchemaConverter.ToArrow(writerRecord);
             _assembler = new RecordBatchAssembler(writerRecord, arrowSchema);
             _currentArrowSchema = arrowSchema;

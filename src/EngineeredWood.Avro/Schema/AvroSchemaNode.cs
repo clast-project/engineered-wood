@@ -93,6 +93,19 @@ internal sealed class AvroRecordSchema : AvroSchemaNode
     public IReadOnlyList<string> Aliases { get; init; } = [];
     public IReadOnlyList<AvroFieldNode> Fields { get; }
 
+    /// <summary>
+    /// Set on the stand-in the parser puts where a record refers to itself from inside its own definition: the
+    /// stand-in has no fields of its own, and this is the record it stands for. Null on every other record.
+    /// </summary>
+    /// <remarks>
+    /// A reference has no fields, but its values are whole records on the wire: treating it as a record with no
+    /// fields skipped nothing and misaligned every value after it.
+    /// </remarks>
+    public AvroRecordSchema? Definition { get; internal set; }
+
+    /// <summary>Whether this is a recursive reference (see <see cref="Definition"/>).</summary>
+    public bool IsRecursiveReference => Definition != null;
+
     public AvroRecordSchema(string name, string? ns, IReadOnlyList<AvroFieldNode> fields)
     {
         Name = name;
