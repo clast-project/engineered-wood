@@ -360,6 +360,8 @@ public sealed class TableOperations
     private async ValueTask<IReadOnlyList<DataFile>> ListFilesByContentAsync(
         TableMetadata metadata, FileContent contentType, CancellationToken ct)
     {
+        var current = metadata.Snapshots.FirstOrDefault(s => s.SnapshotId == metadata.CurrentSnapshotId);
+        metadata.ThrowIfDataInaccessible(current);
         if (metadata.CurrentSnapshotId is null)
             return [];
 

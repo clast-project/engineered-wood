@@ -112,11 +112,16 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
             if (!m.Success)
                 throw new JsonException($"Invalid decimal type: {typeString}");
             int precision = ParseInt(m.Groups[1].Value, typeString);
-            // Iceberg decimals hold at most 38 digits; Java refuses anything wider.
-            if (precision > MaxDecimalPrecision)
+            int scale = ParseInt(m.Groups[2].Value, typeString);
+            // Iceberg decimals hold at most 38 digits; Java refuses anything wider. Precision 0, or a scale
+            // above the precision, is no decimal Avro or Parquet can store either (both require
+            // 0 <= scale <= precision and precision >= 1), so such metadata could not be written back.
+            if (precision is < 1 or > MaxDecimalPrecision)
                 throw new JsonException(
-                    $"Invalid decimal type: {typeString}; precision is at most {MaxDecimalPrecision}.");
-            return new DecimalType(precision, ParseInt(m.Groups[2].Value, typeString));
+                    $"Invalid decimal type: {typeString}; precision must be 1 to {MaxDecimalPrecision}.");
+            if (scale > precision)
+                throw new JsonException($"Invalid decimal type: {typeString}; scale exceeds precision.");
+            return new DecimalType(precision, scale);
         }
 
         if (trimmed.StartsWith("fixed", StringComparison.Ordinal))
@@ -132,7 +137,8 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
             var m = GeometryPattern.Match(trimmed);
             if (!m.Success)
                 throw new JsonException($"Invalid geometry type: {typeString}");
-            var crs = m.Groups[1].Success && m.Groups[1].Value.Length > 0 ? m.Groups[1].Value : DefaultCrs;
+            // Bare "geometry" takes the default CRS; "geometry()" names an empty one, which Java refuses.
+            var crs = m.Groups[1].Success ? NonEmpty(m.Groups[1].Value, "CRS", typeString) : DefaultCrs;
             return new GeometryType(crs);
         }
 
@@ -141,9 +147,11 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
             var m = GeographyPattern.Match(trimmed);
             if (!m.Success)
                 throw new JsonException($"Invalid geography type: {typeString}");
-            var crs = m.Groups[1].Success && m.Groups[1].Value.Length > 0 ? m.Groups[1].Value : DefaultCrs;
-            var algorithm = m.Groups[2].Success && m.Groups[2].Value.Length > 0
-                ? m.Groups[2].Value
+            // Omitted parameters take the defaults; present but empty ones ("geography()", "geography(c, )")
+            // are refused.
+            var crs = m.Groups[1].Success ? NonEmpty(m.Groups[1].Value, "CRS", typeString) : DefaultCrs;
+            var algorithm = m.Groups[2].Success
+                ? NonEmpty(m.Groups[2].Value, "edge algorithm", typeString)
                 : DefaultEdgeAlgorithm;
             return new GeographyType(crs, algorithm);
         }
@@ -170,6 +178,9 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
             _ => throw new JsonException($"Unknown primitive type: {typeString}")
         };
     }
+
+    private static string NonEmpty(string value, string what, string typeString) =>
+        value.Length > 0 ? value : throw new JsonException($"Invalid type {typeString}: empty {what}.");
 
     private static int ParseInt(string digits, string typeString) =>
         int.TryParse(digits, NumberStyles.None, CultureInfo.InvariantCulture, out var value)

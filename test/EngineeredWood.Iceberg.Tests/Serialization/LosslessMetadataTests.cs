@@ -267,6 +267,13 @@ public class LosslessMetadataTests
     [InlineData("decimal(a, 2)")]
     [InlineData("decimal(99999999999, 2)")]
     [InlineData("fixed[]")]
+    [InlineData("decimal(0, 0)")]
+    [InlineData("decimal(9, 10)")]
+    [InlineData("geometry()")]
+    [InlineData("geometry( )")]
+    [InlineData("geography()")]
+    [InlineData("geography(, spherical)")]
+    [InlineData("geography(srid:4326, )")]
     public void MalformedParameterizedTypes_AreRefused(string spelling)
     {
         Assert.Throws<JsonException>(() =>
