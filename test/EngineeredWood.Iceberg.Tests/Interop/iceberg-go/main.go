@@ -707,7 +707,37 @@ func entryJSON(e iceberg.ManifestEntry) map[string]any {
 		"content_size_in_bytes": df.ContentSizeInBytes(),
 		"equality_ids":          df.EqualityFieldIDs(),
 		"partition":             partition,
+		"column_sizes":          counts(df.ColumnSizes()),
+		"value_counts":          counts(df.ValueCounts()),
+		"null_value_counts":     counts(df.NullValueCounts()),
+		"nan_value_counts":      counts(df.NaNValueCounts()),
+		"lower_bound_ids":       boundIDs(df.LowerBoundValues()),
+		"upper_bound_ids":       boundIDs(df.UpperBoundValues()),
+		"split_offsets":         df.SplitOffsets(),
+		"sort_order_id":         df.SortOrderID(),
+		"has_key_metadata":      len(df.KeyMetadata()) > 0,
 	}
+}
+
+// counts renders a per-field-id statistic with string keys, as JSON objects require. Absent and empty
+// both become {}: the manifest schema makes these maps optional, and no reader distinguishes the two.
+func counts(m map[int]int64) map[string]int64 {
+	out := map[string]int64{}
+	for k, v := range m {
+		out[fmt.Sprint(k)] = v
+	}
+	return out
+}
+
+// boundIDs lists the field ids that have a bound, sorted. The bound VALUES are Appendix D single-value
+// binary, which EW cannot yet decode into comparable form (#953 item 5), so only coverage is compared.
+func boundIDs(m map[int][]byte) []int {
+	out := []int{}
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Ints(out)
+	return out
 }
 
 func paths(files []iceberg.DataFile) []string {

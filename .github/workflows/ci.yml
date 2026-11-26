@@ -226,6 +226,26 @@ jobs:
           go-version-file: test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go/go.mod
           cache-dependency-path: test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go/go.sum
 
+      # Build the driver ONCE and hand it to every TFM's test run through EW_ICEBERG_GO_DRIVER.
+      # Left to the tests, each TFM ran its own cold `go build` concurrently, competing with the other
+      # suites for the runner. Measured on the first run of #961: the first iceberg-go test took 205 s on
+      # net10.0/net11.0 and 646 s on net472, while every other test took under 3 s. A failed build now
+      # fails here, by name, instead of inside whichever test needed the driver first.
+      - name: Build iceberg-go driver
+        if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
+        shell: bash
+        working-directory: test/EngineeredWood.Iceberg.Tests/Interop/iceberg-go
+        run: |
+          target="${{ steps.select.outputs.target }}"
+          case "$target" in
+            *.slnf) grep -q 'EngineeredWood.Iceberg.Tests' "$GITHUB_WORKSPACE/$target" \
+                      || { echo "Iceberg tests not selected; skipping."; exit 0; } ;;
+          esac
+          exe="$RUNNER_TEMP/iceberg-go-driver.exe"
+          go build -mod=readonly -o "$exe" .
+          "$exe" version
+          echo "EW_ICEBERG_GO_DRIVER=$exe" >> "$GITHUB_ENV"
+
       - name: Restore
         if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
         run: dotnet restore "${{ steps.select.outputs.target }}"

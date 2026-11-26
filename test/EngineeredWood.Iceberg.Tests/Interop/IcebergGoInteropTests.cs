@@ -177,6 +177,34 @@ public sealed class IcebergGoInteropTests : IDisposable
                 AssertInherited(ge.GetProperty("data_sequence_number"), e.SequenceNumber, where + " sequence_number");
                 AssertInherited(ge.GetProperty("file_sequence_number"), e.FileSequenceNumber, where + " file_sequence_number");
                 AssertInherited(ge.GetProperty("first_row_id"), e.DataFile.FirstRowId, where + " first_row_id");
+
+                // Statistics EW models.
+                AssertCounts(ge.GetProperty("column_sizes"), e.DataFile.ColumnSizes, where + " column_sizes");
+                AssertCounts(ge.GetProperty("value_counts"), e.DataFile.ValueCounts, where + " value_counts");
+                AssertCounts(ge.GetProperty("null_value_counts"), e.DataFile.NullValueCounts, where + " null_value_counts");
+                // Bound values are Appendix D binary, comparable only once EW has those codecs (#953 item 5);
+                // until then, check that the same fields carry bounds.
+                Assert.True(
+                    Ids(ge.GetProperty("lower_bound_ids")).SequenceEqual(SortedKeys(e.DataFile.ColumnLowerBounds)),
+                    where + " lower_bounds field ids");
+                Assert.True(
+                    Ids(ge.GetProperty("upper_bound_ids")).SequenceEqual(SortedKeys(e.DataFile.ColumnUpperBounds)),
+                    where + " upper_bounds field ids");
+                Assert.True(
+                    NullableInt64List(ge.GetProperty("split_offsets")).SequenceEqual(e.DataFile.SplitOffsets ?? []),
+                    where + " split_offsets");
+                Assert.True(NullableInt64(ge.GetProperty("sort_order_id")) == e.DataFile.SortOrderId, where + " sort_order_id");
+
+                // A data file's spec id is its manifest's; EW keeps it only on the manifest.
+                Assert.True(ge.GetProperty("spec_id").GetInt32() == m.PartitionSpecId, where + " spec_id");
+
+                // Fields EW's DataFile cannot hold yet. Losing them is what #586 is about, so the comparison
+                // fails here, naming the field, as soon as the codec stops refusing foreign manifests.
+                RequireUnmodelled(ge.GetProperty("partition").EnumerateObject().Any(), "the partition tuple", where);
+                RequireUnmodelled(ge.GetProperty("equality_ids").ValueKind == JsonValueKind.Array
+                    && ge.GetProperty("equality_ids").GetArrayLength() > 0, "equality_ids", where);
+                RequireUnmodelled(ge.GetProperty("nan_value_counts").EnumerateObject().Any(), "nan_value_counts", where);
+                RequireUnmodelled(ge.GetProperty("has_key_metadata").GetBoolean(), "key_metadata", where);
             }
         }
     }
@@ -321,6 +349,31 @@ public sealed class IcebergGoInteropTests : IDisposable
         if (ewValue is not null)
             Assert.True(NullableInt64(goValue) == ewValue, $"{what}: iceberg-go {goValue}, EW {ewValue}");
     }
+
+    /// <summary>A per-field-id statistic. iceberg-go reports absent and empty alike as <c>{}</c>, so EW's
+    /// null compares equal to an empty map.</summary>
+    private static void AssertCounts(JsonElement goCounts, IReadOnlyDictionary<int, long>? ew, string what)
+    {
+        var expected = goCounts.EnumerateObject()
+            .ToDictionary(p => int.Parse(p.Name, System.Globalization.CultureInfo.InvariantCulture), p => p.Value.GetInt64());
+        var actual = ew ?? new Dictionary<int, long>();
+        Assert.True(
+            expected.Count == actual.Count && expected.All(kv => actual.TryGetValue(kv.Key, out var v) && v == kv.Value),
+            $"{what}: iceberg-go {{{string.Join(", ", expected.OrderBy(kv => kv.Key))}}}, "
+            + $"EW {{{string.Join(", ", actual.OrderBy(kv => kv.Key))}}}");
+    }
+
+    /// <summary>Fails when iceberg-go reports a value for a field EW's model has nowhere to put.</summary>
+    private static void RequireUnmodelled(bool goHasValue, string field, string where) =>
+        Assert.False(goHasValue, $"{where}: iceberg-go reports {field}, which EW's DataFile does not model yet, so EW drops it.");
+
+    private static IEnumerable<int> Ids(JsonElement e) => e.EnumerateArray().Select(x => x.GetInt32());
+
+    private static IEnumerable<int> SortedKeys<T>(IReadOnlyDictionary<int, T>? d) =>
+        d is null ? [] : d.Keys.OrderBy(k => k);
+
+    private static IEnumerable<long> NullableInt64List(JsonElement e) =>
+        e.ValueKind == JsonValueKind.Null ? [] : e.EnumerateArray().Select(x => x.GetInt64());
 
     private static long? NullableInt64(JsonElement e) => e.ValueKind == JsonValueKind.Null ? null : e.GetInt64();
 
