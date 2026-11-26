@@ -41,6 +41,12 @@ internal static class ArrowSchemaConverter
                 return (ToArrowPrimitive(p, extensionRegistry), false);
 
             case AvroRecordSchema r:
+                if (r.Fields.Count == 0)
+                    throw new NotSupportedException(
+                        $"The Avro record '{r.FullName}' has no fields, and Arrow has no struct of no fields. A " +
+                        "record field of that type is left out of the Arrow schema, but as an array's items, a " +
+                        "map's values or a union's branch it cannot be; a reader schema that leaves out the field " +
+                        "holding it reads the rest.");
                 var fields = new List<Field>();
                 foreach (var f in r.Fields)
                 {

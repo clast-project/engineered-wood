@@ -24,10 +24,14 @@ public sealed class AvroSchema
     internal AvroSchemaNode Parsed => _parsed ??= AvroSchemaParser.Parse(_json);
 
     /// <summary>Convert this Avro schema to an equivalent Arrow schema.</summary>
+    /// <remarks>
+    /// A field whose type is a record with no fields is left out: Apache.Arrow has no struct of no fields, and
+    /// such a record is encoded as zero bytes, so nothing else is lost.
+    /// </remarks>
     public Apache.Arrow.Schema ToArrowSchema()
     {
         if (Parsed is AvroRecordSchema record)
-            return ArrowSchemaConverter.ToArrow(record);
+            return ArrowSchemaConverter.ToArrow(EmptyRecords.Strip(record));
         throw new InvalidOperationException("Only record schemas can be converted to Arrow schemas.");
     }
 
