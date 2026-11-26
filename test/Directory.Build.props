@@ -34,4 +34,9 @@
     <EwTestTargetFrameworks Condition="'$(EwTestNet8)' == 'true'">$(EwTestTargetFrameworks);net8.0</EwTestTargetFrameworks>
   </PropertyGroup>
 
+  <!-- MEASUREMENT ONLY: thread-pool sampler, inert unless EW_THREADPOOL_SAMPLE_DIR is set. -->
+  <ItemGroup Condition="'$(IsTestProject)' == 'true'">
+    <Compile Include="$(MSBuildThisFileDirectory)Shared\ThreadPoolSampler.cs" Link="Diagnostics\ThreadPoolSampler.cs" />
+  </ItemGroup>
+
 </Project>

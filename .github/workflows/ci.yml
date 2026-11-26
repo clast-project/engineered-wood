@@ -278,11 +278,37 @@ jobs:
           EW_REQUIRE_DUCKDB_INTEROP: '1'
           EW_REQUIRE_PARQUET_READERS_INTEROP: '1'
           EW_REQUIRE_ICEBERG_GO_INTEROP: '1'
+          # MEASUREMENT ONLY: per-process thread-pool samples (test/Shared/ThreadPoolSampler.cs).
+          EW_THREADPOOL_SAMPLE_DIR: ${{ github.workspace }}\perf-samples
         # LogFilePrefix, not LogFileName: most test projects target three frameworks, and a
         # fixed file name made each framework's results overwrite the last, so the uploaded
         # artifact held one framework per project. The prefix gets the framework and a
         # timestamp appended.
-        run: dotnet test "${{ steps.select.outputs.target }}" --no-build --configuration Release --logger "trx;LogFilePrefix=test-results"
+        #
+        # MEASUREMENT ONLY: typeperf samples the whole runner every 2 s for the length of the run.
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force $env:EW_THREADPOOL_SAMPLE_DIR | Out-Null
+          $counters = @(
+            '\Processor(_Total)\% Processor Time',
+            '\System\Processor Queue Length',
+            '\Memory\Available MBytes',
+            '\Memory\Committed Bytes',
+            '\Memory\Pages/sec',
+            '\PhysicalDisk(_Total)\% Idle Time',
+            '\PhysicalDisk(_Total)\Avg. Disk Queue Length'
+          )
+          $perf = Start-Process typeperf -PassThru -NoNewWindow -ArgumentList (
+            ($counters | ForEach-Object { "`"$_`"" }) +
+            @('-si', '2', '-f', 'CSV', '-y', '-o', "`"$env:EW_THREADPOOL_SAMPLE_DIR\machine.csv`""))
+          try {
+            dotnet test "${{ steps.select.outputs.target }}" --no-build --configuration Release --logger "trx;LogFilePrefix=test-results"
+            $code = $LASTEXITCODE
+          } finally {
+            Stop-Process -Id $perf.Id -ErrorAction SilentlyContinue
+          }
+          Get-ChildItem $env:EW_THREADPOOL_SAMPLE_DIR | Format-Table Name, Length
+          exit $code
 
       - name: Pack
         if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
@@ -297,6 +323,13 @@ jobs:
         with:
           name: test-results
           path: '**/*.trx'
+
+      - name: Upload perf samples (MEASUREMENT ONLY)
+        if: always() && steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-samples
+          path: perf-samples/
 
       - name: Upload packages
         if: steps.changes.outputs.code == 'true' && steps.select.outputs.scope != 'none'
