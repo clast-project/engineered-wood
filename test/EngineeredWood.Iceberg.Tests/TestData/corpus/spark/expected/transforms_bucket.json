@@ -1,0 +1,2639 @@
+{
+ "all_delete_files": [],
+ "files": [
+  {
+   "column_sizes": {
+    "1": 43,
+    "10": 39,
+    "11": 43,
+    "12": 36,
+    "2": 39,
+    "3": 43,
+    "4": 43,
+    "5": 45,
+    "6": 43,
+    "7": 38,
+    "8": 43,
+    "9": 43
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/data/i_bucket=0/l_bucket=0/d_bucket=0/s_bucket=0/bin_bucket=0/dt_bucket=0/ts_bucket=1/tstz_bucket=2/00000-1-e0a7f6de-9e67-4ba6-9c8a-67f29f80bfe9-0-00004.parquet",
+   "file_size_in_bytes": 3012,
+   "first_row_id": 9,
+   "lower_bounds": {
+    "1": "BAAAAAAAAAA=",
+    "10": "AABgwQ==",
+    "11": "AAAAAADAIcA=",
+    "12": "AQ==",
+    "2": "MAAAAA==",
+    "3": "HDZlxP////8=",
+    "4": "/w7c",
+    "5": "Y2Fmw6k0",
+    "6": "eN3mxA==",
+    "7": "AicAAA==",
+    "8": "BCCdEQMbAwA=",
+    "9": "RDiSY7UuAwA="
+   },
+   "nan_value_counts": {
+    "10": 0,
+    "11": 0
+   },
+   "null_value_counts": {
+    "1": 0,
+    "10": 0,
+    "11": 0,
+    "12": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0
+   },
+   "partition": {
+    "bin_bucket": 0,
+    "d_bucket": 0,
+    "dt_bucket": 0,
+    "i_bucket": 0,
+    "l_bucket": 0,
+    "s_bucket": 0,
+    "ts_bucket": 1,
+    "tstz_bucket": 2
+   },
+   "readable_metrics": {
+    "bin": {
+     "column_size": 43,
+     "lower_bound": "eN3mxA==",
+     "null_value_count": 0,
+     "upper_bound": "eN3mxA==",
+     "value_count": 1
+    },
+    "d": {
+     "column_size": 43,
+     "lower_bound": "-617.32",
+     "null_value_count": 0,
+     "upper_bound": "-617.32",
+     "value_count": 1
+    },
+    "db": {
+     "column_size": 43,
+     "lower_bound": "-8.875",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-8.875",
+     "value_count": 1
+    },
+    "dt": {
+     "column_size": 38,
+     "lower_bound": "1997-05-05",
+     "null_value_count": 0,
+     "upper_bound": "1997-05-05",
+     "value_count": 1
+    },
+    "f": {
+     "column_size": 39,
+     "lower_bound": "-14.0",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-14.0",
+     "value_count": 1
+    },
+    "flag": {
+     "column_size": 36,
+     "lower_bound": true,
+     "null_value_count": 0,
+     "upper_bound": true,
+     "value_count": 1
+    },
+    "i": {
+     "column_size": 39,
+     "lower_bound": 48,
+     "null_value_count": 0,
+     "upper_bound": 48,
+     "value_count": 1
+    },
+    "id": {
+     "column_size": 43,
+     "lower_bound": 4,
+     "null_value_count": 0,
+     "upper_bound": 4,
+     "value_count": 1
+    },
+    "l": {
+     "column_size": 43,
+     "lower_bound": -999999972,
+     "null_value_count": 0,
+     "upper_bound": -999999972,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 45,
+     "lower_bound": "café4",
+     "null_value_count": 0,
+     "upper_bound": "café4",
+     "value_count": 1
+    },
+    "ts": {
+     "column_size": 43,
+     "lower_bound": "1997-09-13T04:28:44.493828",
+     "null_value_count": 0,
+     "upper_bound": "1997-09-13T04:28:44.493828",
+     "value_count": 1
+    },
+    "tstz": {
+     "column_size": 43,
+     "lower_bound": "1998-05-21T20:12:04.617284Z",
+     "null_value_count": 0,
+     "upper_bound": "1998-05-21T20:12:04.617284Z",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "BAAAAAAAAAA=",
+    "10": "AABgwQ==",
+    "11": "AAAAAADAIcA=",
+    "12": "AQ==",
+    "2": "MAAAAA==",
+    "3": "HDZlxP////8=",
+    "4": "/w7c",
+    "5": "Y2Fmw6k0",
+    "6": "eN3mxA==",
+    "7": "AicAAA==",
+    "8": "BCCdEQMbAwA=",
+    "9": "RDiSY7UuAwA="
+   },
+   "value_counts": {
+    "1": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 43,
+    "10": 38,
+    "11": 43,
+    "12": 36,
+    "2": 39,
+    "3": 43,
+    "4": 43,
+    "5": 45,
+    "6": 43,
+    "7": 39,
+    "8": 43,
+    "9": 43
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/data/i_bucket=0/l_bucket=0/d_bucket=0/s_bucket=0/bin_bucket=2/dt_bucket=0/ts_bucket=0/tstz_bucket=2/00000-1-e0a7f6de-9e67-4ba6-9c8a-67f29f80bfe9-0-00012.parquet",
+   "file_size_in_bytes": 3012,
+   "first_row_id": 4,
+   "lower_bounds": {
+    "1": "DAAAAAAAAAA=",
+    "10": "AAAAwA==",
+    "11": "AAAAAADgOsA=",
+    "12": "AA==",
+    "2": "yP///w==",
+    "3": "VIY7oQEAAAA=",
+    "4": "/SyU",
+    "5": "emV0YTEy",
+    "6": "apm0TA==",
+    "7": "3SAAAA==",
+    "8": "zCsPndKUAgA=",
+    "9": "jIa13DCxAgA="
+   },
+   "nan_value_counts": {
+    "10": 0,
+    "11": 0
+   },
+   "null_value_counts": {
+    "1": 0,
+    "10": 0,
+    "11": 0,
+    "12": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0
+   },
+   "partition": {
+    "bin_bucket": 2,
+    "d_bucket": 0,
+    "dt_bucket": 0,
+    "i_bucket": 0,
+    "l_bucket": 0,
+    "s_bucket": 0,
+    "ts_bucket": 0,
+    "tstz_bucket": 2
+   },
+   "readable_metrics": {
+    "bin": {
+     "column_size": 43,
+     "lower_bound": "apm0TA==",
+     "null_value_count": 0,
+     "upper_bound": "apm0TA==",
+     "value_count": 1
+    },
+    "d": {
+     "column_size": 43,
+     "lower_bound": "-1851.96",
+     "null_value_count": 0,
+     "upper_bound": "-1851.96",
+     "value_count": 1
+    },
+    "db": {
+     "column_size": 43,
+     "lower_bound": "-26.875",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-26.875",
+     "value_count": 1
+    },
+    "dt": {
+     "column_size": 39,
+     "lower_bound": "1993-01-13",
+     "null_value_count": 0,
+     "upper_bound": "1993-01-13",
+     "value_count": 1
+    },
+    "f": {
+     "column_size": 38,
+     "lower_bound": "-2.0",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-2.0",
+     "value_count": 1
+    },
+    "flag": {
+     "column_size": 36,
+     "lower_bound": false,
+     "null_value_count": 0,
+     "upper_bound": false,
+     "value_count": 1
+    },
+    "i": {
+     "column_size": 39,
+     "lower_bound": -56,
+     "null_value_count": 0,
+     "upper_bound": -56,
+     "value_count": 1
+    },
+    "id": {
+     "column_size": 43,
+     "lower_bound": 12,
+     "null_value_count": 0,
+     "upper_bound": 12,
+     "value_count": 1
+    },
+    "l": {
+     "column_size": 43,
+     "lower_bound": 7000000084,
+     "null_value_count": 0,
+     "upper_bound": 7000000084,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 45,
+     "lower_bound": "zeta12",
+     "null_value_count": 0,
+     "upper_bound": "zeta12",
+     "value_count": 1
+    },
+    "ts": {
+     "column_size": 43,
+     "lower_bound": "1993-01-09T12:24:12.481484",
+     "null_value_count": 0,
+     "upper_bound": "1993-01-09T12:24:12.481484",
+     "value_count": 1
+    },
+    "tstz": {
+     "column_size": 43,
+     "lower_bound": "1994-01-05T12:36:12.851852Z",
+     "null_value_count": 0,
+     "upper_bound": "1994-01-05T12:36:12.851852Z",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "DAAAAAAAAAA=",
+    "10": "AAAAwA==",
+    "11": "AAAAAADgOsA=",
+    "12": "AA==",
+    "2": "yP///w==",
+    "3": "VIY7oQEAAAA=",
+    "4": "/SyU",
+    "5": "emV0YTEy",
+    "6": "apm0TA==",
+    "7": "3SAAAA==",
+    "8": "zCsPndKUAgA=",
+    "9": "jIa13DCxAgA="
+   },
+   "value_counts": {
+    "1": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 43,
+    "10": 39,
+    "11": 43,
+    "12": 36,
+    "2": 39,
+    "3": 43,
+    "4": 42,
+    "5": 45,
+    "6": 43,
+    "7": 39,
+    "8": 43,
+    "9": 43
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/data/i_bucket=0/l_bucket=0/d_bucket=2/s_bucket=2/bin_bucket=2/dt_bucket=1/ts_bucket=0/tstz_bucket=2/00000-1-e0a7f6de-9e67-4ba6-9c8a-67f29f80bfe9-0-00003.parquet",
+   "file_size_in_bytes": 3012,
+   "first_row_id": 1,
+   "lower_bounds": {
+    "1": "AwAAAAAAAAA=",
+    "10": "AAB4wQ==",
+    "11": "AAAAAACAGsA=",
+    "12": "AA==",
+    "2": "CwAAAA==",
+    "3": "FWzKiP////8=",
+    "4": "CrzV",
+    "5": "ZGVsdGEz",
+    "6": "2qZtEw==",
+    "7": "5hwAAA==",
+    "8": "A7De4dFFAgA=",
+    "9": "UxM1WGRxAgA="
+   },
+   "nan_value_counts": {
+    "10": 0,
+    "11": 0
+   },
+   "null_value_counts": {
+    "1": 0,
+    "10": 0,
+    "11": 0,
+    "12": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0
+   },
+   "partition": {
+    "bin_bucket": 2,
+    "d_bucket": 2,
+    "dt_bucket": 1,
+    "i_bucket": 0,
+    "l_bucket": 0,
+    "s_bucket": 2,
+    "ts_bucket": 0,
+    "tstz_bucket": 2
+   },
+   "readable_metrics": {
+    "bin": {
+     "column_size": 43,
+     "lower_bound": "2qZtEw==",
+     "null_value_count": 0,
+     "upper_bound": "2qZtEw==",
+     "value_count": 1
+    },
+    "d": {
+     "column_size": 42,
+     "lower_bound": "7037.01",
+     "null_value_count": 0,
+     "upper_bound": "7037.01",
+     "value_count": 1
+    },
+    "db": {
+     "column_size": 43,
+     "lower_bound": "-6.625",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-6.625",
+     "value_count": 1
+    },
+    "dt": {
+     "column_size": 39,
+     "lower_bound": "1990-04-04",
+     "null_value_count": 0,
+     "upper_bound": "1990-04-04",
+     "value_count": 1
+    },
+    "f": {
+     "column_size": 39,
+     "lower_bound": "-15.5",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-15.5",
+     "value_count": 1
+    },
+    "flag": {
+     "column_size": 36,
+     "lower_bound": false,
+     "null_value_count": 0,
+     "upper_bound": false,
+     "value_count": 1
+    },
+    "i": {
+     "column_size": 39,
+     "lower_bound": 11,
+     "null_value_count": 0,
+     "upper_bound": 11,
+     "value_count": 1
+    },
+    "id": {
+     "column_size": 43,
+     "lower_bound": 3,
+     "null_value_count": 0,
+     "upper_bound": 3,
+     "value_count": 1
+    },
+    "l": {
+     "column_size": 43,
+     "lower_bound": -1999999979,
+     "null_value_count": 0,
+     "upper_bound": -1999999979,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 45,
+     "lower_bound": "delta3",
+     "null_value_count": 0,
+     "upper_bound": "delta3",
+     "value_count": 1
+    },
+    "ts": {
+     "column_size": 43,
+     "lower_bound": "1990-04-10T03:21:33.370371",
+     "null_value_count": 0,
+     "upper_bound": "1990-04-10T03:21:33.370371",
+     "value_count": 1
+    },
+    "tstz": {
+     "column_size": 43,
+     "lower_bound": "1991-10-16T15:09:03.962963Z",
+     "null_value_count": 0,
+     "upper_bound": "1991-10-16T15:09:03.962963Z",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "AwAAAAAAAAA=",
+    "10": "AAB4wQ==",
+    "11": "AAAAAACAGsA=",
+    "12": "AA==",
+    "2": "CwAAAA==",
+    "3": "FWzKiP////8=",
+    "4": "CrzV",
+    "5": "ZGVsdGEz",
+    "6": "2qZtEw==",
+    "7": "5hwAAA==",
+    "8": "A7De4dFFAgA=",
+    "9": "UxM1WGRxAgA="
+   },
+   "value_counts": {
+    "1": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 43,
+    "10": 39,
+    "11": 43,
+    "12": 36,
+    "2": 39,
+    "3": 43,
+    "4": 43,
+    "5": 44,
+    "6": 43,
+    "7": 39,
+    "8": 42,
+    "9": 43
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/data/i_bucket=0/l_bucket=0/d_bucket=2/s_bucket=2/bin_bucket=2/dt_bucket=1/ts_bucket=1/tstz_bucket=2/00000-1-e0a7f6de-9e67-4ba6-9c8a-67f29f80bfe9-0-00008.parquet",
+   "file_size_in_bytes": 3005,
+   "first_row_id": 7,
+   "lower_bounds": {
+    "1": "CAAAAAAAAAA=",
+    "10": "AAAAwQ==",
+    "11": "AAAAAADgMcA=",
+    "12": "AQ==",
+    "2": "/P///w==",
+    "3": "OF7QsgAAAAA=",
+    "4": "DV/4",
+    "5": "YmV0YTg=",
+    "6": "8bvNiA==",
+    "7": "dE8AAA==",
+    "8": "CFnPAfI1BgA=",
+    "9": "SG41v19bBgA="
+   },
+   "nan_value_counts": {
+    "10": 0,
+    "11": 0
+   },
+   "null_value_counts": {
+    "1": 0,
+    "10": 0,
+    "11": 0,
+    "12": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0
+   },
+   "partition": {
+    "bin_bucket": 2,
+    "d_bucket": 2,
+    "dt_bucket": 1,
+    "i_bucket": 0,
+    "l_bucket": 0,
+    "s_bucket": 2,
+    "ts_bucket": 1,
+    "tstz_bucket": 2
+   },
+   "readable_metrics": {
+    "bin": {
+     "column_size": 43,
+     "lower_bound": "8bvNiA==",
+     "null_value_count": 0,
+     "upper_bound": "8bvNiA==",
+     "value_count": 1
+    },
+    "d": {
+     "column_size": 43,
+     "lower_bound": "8765.36",
+     "null_value_count": 0,
+     "upper_bound": "8765.36",
+     "value_count": 1
+    },
+    "db": {
+     "column_size": 43,
+     "lower_bound": "-17.875",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-17.875",
+     "value_count": 1
+    },
+    "dt": {
+     "column_size": 39,
+     "lower_bound": "2025-09-09",
+     "null_value_count": 0,
+     "upper_bound": "2025-09-09",
+     "value_count": 1
+    },
+    "f": {
+     "column_size": 39,
+     "lower_bound": "-8.0",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-8.0",
+     "value_count": 1
+    },
+    "flag": {
+     "column_size": 36,
+     "lower_bound": true,
+     "null_value_count": 0,
+     "upper_bound": true,
+     "value_count": 1
+    },
+    "i": {
+     "column_size": 39,
+     "lower_bound": -4,
+     "null_value_count": 0,
+     "upper_bound": -4,
+     "value_count": 1
+    },
+    "id": {
+     "column_size": 43,
+     "lower_bound": 8,
+     "null_value_count": 0,
+     "upper_bound": 8,
+     "value_count": 1
+    },
+    "l": {
+     "column_size": 43,
+     "lower_bound": 3000000056,
+     "null_value_count": 0,
+     "upper_bound": 3000000056,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 44,
+     "lower_bound": "beta8",
+     "null_value_count": 0,
+     "upper_bound": "beta8",
+     "value_count": 1
+    },
+    "ts": {
+     "column_size": 42,
+     "lower_bound": "2025-05-25T08:56:28.987656",
+     "null_value_count": 0,
+     "upper_bound": "2025-05-25T08:56:28.987656",
+     "value_count": 1
+    },
+    "tstz": {
+     "column_size": 43,
+     "lower_bound": "2026-09-13T16:24:08.234568Z",
+     "null_value_count": 0,
+     "upper_bound": "2026-09-13T16:24:08.234568Z",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "CAAAAAAAAAA=",
+    "10": "AAAAwQ==",
+    "11": "AAAAAADgMcA=",
+    "12": "AQ==",
+    "2": "/P///w==",
+    "3": "OF7QsgAAAAA=",
+    "4": "DV/4",
+    "5": "YmV0YTg=",
+    "6": "8bvNiA==",
+    "7": "dE8AAA==",
+    "8": "CFnPAfI1BgA=",
+    "9": "SG41v19bBgA="
+   },
+   "value_counts": {
+    "1": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 43,
+    "10": 39,
+    "11": 43,
+    "12": 36,
+    "2": 39,
+    "3": 43,
+    "4": 43,
+    "5": 46,
+    "6": 42,
+    "7": 39,
+    "8": 43,
+    "9": 43
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/data/i_bucket=0/l_bucket=1/d_bucket=2/s_bucket=0/bin_bucket=2/dt_bucket=1/ts_bucket=0/tstz_bucket=0/00000-1-e0a7f6de-9e67-4ba6-9c8a-67f29f80bfe9-0-00011.parquet",
+   "file_size_in_bytes": 3019,
+   "first_row_id": 2,
+   "lower_bounds": {
+    "1": "CwAAAAAAAAA=",
+    "10": "AABgwA==",
+    "11": "AAAAAACgOMA=",
+    "12": "AQ==",
+    "2": "o////w==",
+    "3": "TbygZQEAAAA=",
+    "4": "CNqN",
+    "5": "Y2Fmw6kxMQ==",
+    "6": "zGI6mw==",
+    "7": "LRgAAA==",
+    "8": "y5tk+U/cAQA=",
+    "9": "W98o2er1AQA="
+   },
+   "nan_value_counts": {
+    "10": 0,
+    "11": 0
+   },
+   "null_value_counts": {
+    "1": 0,
+    "10": 0,
+    "11": 0,
+    "12": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0
+   },
+   "partition": {
+    "bin_bucket": 2,
+    "d_bucket": 2,
+    "dt_bucket": 1,
+    "i_bucket": 0,
+    "l_bucket": 1,
+    "s_bucket": 0,
+    "ts_bucket": 0,
+    "tstz_bucket": 0
+   },
+   "readable_metrics": {
+    "bin": {
+     "column_size": 42,
+     "lower_bound": "zGI6mw==",
+     "null_value_count": 0,
+     "upper_bound": "zGI6mw==",
+     "value_count": 1
+    },
+    "d": {
+     "column_size": 43,
+     "lower_bound": "5802.37",
+     "null_value_count": 0,
+     "upper_bound": "5802.37",
+     "value_count": 1
+    },
+    "db": {
+     "column_size": 43,
+     "lower_bound": "-24.625",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-24.625",
+     "value_count": 1
+    },
+    "dt": {
+     "column_size": 39,
+     "lower_bound": "1986-12-12",
+     "null_value_count": 0,
+     "upper_bound": "1986-12-12",
+     "value_count": 1
+    },
+    "f": {
+     "column_size": 39,
+     "lower_bound": "-3.5",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-3.5",
+     "value_count": 1
+    },
+    "flag": {
+     "column_size": 36,
+     "lower_bound": true,
+     "null_value_count": 0,
+     "upper_bound": true,
+     "value_count": 1
+    },
+    "i": {
+     "column_size": 39,
+     "lower_bound": -93,
+     "null_value_count": 0,
+     "upper_bound": -93,
+     "value_count": 1
+    },
+    "id": {
+     "column_size": 43,
+     "lower_bound": 11,
+     "null_value_count": 0,
+     "upper_bound": 11,
+     "value_count": 1
+    },
+    "l": {
+     "column_size": 43,
+     "lower_bound": 6000000077,
+     "null_value_count": 0,
+     "upper_bound": 6000000077,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 46,
+     "lower_bound": "café11",
+     "null_value_count": 0,
+     "upper_bound": "café11",
+     "value_count": 1
+    },
+    "ts": {
+     "column_size": 43,
+     "lower_bound": "1986-08-06T11:17:01.358027",
+     "null_value_count": 0,
+     "upper_bound": "1986-08-06T11:17:01.358027",
+     "value_count": 1
+    },
+    "tstz": {
+     "column_size": 43,
+     "lower_bound": "1987-06-28T07:33:11.197531Z",
+     "null_value_count": 0,
+     "upper_bound": "1987-06-28T07:33:11.197531Z",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "CwAAAAAAAAA=",
+    "10": "AABgwA==",
+    "11": "AAAAAACgOMA=",
+    "12": "AQ==",
+    "2": "o////w==",
+    "3": "TbygZQEAAAA=",
+    "4": "CNqN",
+    "5": "Y2Fmw6kxMQ==",
+    "6": "zGI6mw==",
+    "7": "LRgAAA==",
+    "8": "y5tk+U/cAQA=",
+    "9": "W98o2er1AQA="
+   },
+   "value_counts": {
+    "1": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 43,
+    "10": 39,
+    "11": 43,
+    "12": 36,
+    "2": 39,
+    "3": 43,
+    "4": 43,
+    "5": 45,
+    "6": 43,
+    "7": 39,
+    "8": 42,
+    "9": 43
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/data/i_bucket=0/l_bucket=1/d_bucket=2/s_bucket=1/bin_bucket=2/dt_bucket=2/ts_bucket=0/tstz_bucket=0/00000-1-e0a7f6de-9e67-4ba6-9c8a-67f29f80bfe9-0-00007.parquet",
+   "file_size_in_bytes": 3012,
+   "first_row_id": 3,
+   "lower_bounds": {
+    "1": "BwAAAAAAAAA=",
+    "10": "AAAYwQ==",
+    "11": "AAAAAABAL8A=",
+    "12": "AQ==",
+    "2": "1////w==",
+    "3": "MZQ1dwAAAAA=",
+    "4": "+olx",
+    "5": "YWxwaGE3",
+    "6": "U4RT1w==",
+    "7": "V0UAAA==",
+    "8": "B4nTmZd9BQA=",
+    "9": "V2nEJ2CBBQA="
+   },
+   "nan_value_counts": {
+    "10": 0,
+    "11": 0
+   },
+   "null_value_counts": {
+    "1": 0,
+    "10": 0,
+    "11": 0,
+    "12": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0
+   },
+   "partition": {
+    "bin_bucket": 2,
+    "d_bucket": 2,
+    "dt_bucket": 2,
+    "i_bucket": 0,
+    "l_bucket": 1,
+    "s_bucket": 1,
+    "ts_bucket": 0,
+    "tstz_bucket": 0
+   },
+   "readable_metrics": {
+    "bin": {
+     "column_size": 43,
+     "lower_bound": "U4RT1w==",
+     "null_value_count": 0,
+     "upper_bound": "U4RT1w==",
+     "value_count": 1
+    },
+    "d": {
+     "column_size": 43,
+     "lower_bound": "-3580.31",
+     "null_value_count": 0,
+     "upper_bound": "-3580.31",
+     "value_count": 1
+    },
+    "db": {
+     "column_size": 43,
+     "lower_bound": "-15.625",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-15.625",
+     "value_count": 1
+    },
+    "dt": {
+     "column_size": 39,
+     "lower_bound": "2018-08-08",
+     "null_value_count": 0,
+     "upper_bound": "2018-08-08",
+     "value_count": 1
+    },
+    "f": {
+     "column_size": 39,
+     "lower_bound": "-9.5",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-9.5",
+     "value_count": 1
+    },
+    "flag": {
+     "column_size": 36,
+     "lower_bound": true,
+     "null_value_count": 0,
+     "upper_bound": true,
+     "value_count": 1
+    },
+    "i": {
+     "column_size": 39,
+     "lower_bound": -41,
+     "null_value_count": 0,
+     "upper_bound": -41,
+     "value_count": 1
+    },
+    "id": {
+     "column_size": 43,
+     "lower_bound": 7,
+     "null_value_count": 0,
+     "upper_bound": 7,
+     "value_count": 1
+    },
+    "l": {
+     "column_size": 43,
+     "lower_bound": 2000000049,
+     "null_value_count": 0,
+     "upper_bound": 2000000049,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 45,
+     "lower_bound": "alpha7",
+     "null_value_count": 0,
+     "upper_bound": "alpha7",
+     "value_count": 1
+    },
+    "ts": {
+     "column_size": 42,
+     "lower_bound": "2018-12-22T07:49:17.864199",
+     "null_value_count": 0,
+     "upper_bound": "2018-12-22T07:49:17.864199",
+     "value_count": 1
+    },
+    "tstz": {
+     "column_size": 43,
+     "lower_bound": "2019-02-08T11:21:07.580247Z",
+     "null_value_count": 0,
+     "upper_bound": "2019-02-08T11:21:07.580247Z",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "BwAAAAAAAAA=",
+    "10": "AAAYwQ==",
+    "11": "AAAAAABAL8A=",
+    "12": "AQ==",
+    "2": "1////w==",
+    "3": "MZQ1dwAAAAA=",
+    "4": "+olx",
+    "5": "YWxwaGE3",
+    "6": "U4RT1w==",
+    "7": "V0UAAA==",
+    "8": "B4nTmZd9BQA=",
+    "9": "V2nEJ2CBBQA="
+   },
+   "value_counts": {
+    "1": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 43,
+    "10": 39,
+    "11": 43,
+    "12": 36,
+    "2": 39,
+    "3": 43,
+    "4": 43,
+    "5": 44,
+    "6": 43,
+    "7": 39,
+    "8": 43,
+    "9": 43
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/data/i_bucket=1/l_bucket=1/d_bucket=2/s_bucket=0/bin_bucket=1/dt_bucket=0/ts_bucket=1/tstz_bucket=0/00000-1-e0a7f6de-9e67-4ba6-9c8a-67f29f80bfe9-0-00001.parquet",
+   "file_size_in_bytes": 3006,
+   "first_row_id": 5,
+   "lower_bounds": {
+    "1": "AQAAAAAAAAA=",
+    "10": "AACUwQ==",
+    "11": "AAAAAAAAAcA=",
+    "12": "AQ==",
+    "2": "wf///w==",
+    "3": "B9iUEf////8=",
+    "4": "A5RH",
+    "5": "YmV0YTE=",
+    "6": "njd5sQ==",
+    "7": "rwgAAA==",
+    "8": "AdD7Z1q4AAA=",
+    "9": "MUeAl//ZAAA="
+   },
+   "nan_value_counts": {
+    "10": 0,
+    "11": 0
+   },
+   "null_value_counts": {
+    "1": 0,
+    "10": 0,
+    "11": 0,
+    "12": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0
+   },
+   "partition": {
+    "bin_bucket": 1,
+    "d_bucket": 2,
+    "dt_bucket": 0,
+    "i_bucket": 1,
+    "l_bucket": 1,
+    "s_bucket": 0,
+    "ts_bucket": 1,
+    "tstz_bucket": 0
+   },
+   "readable_metrics": {
+    "bin": {
+     "column_size": 43,
+     "lower_bound": "njd5sQ==",
+     "null_value_count": 0,
+     "upper_bound": "njd5sQ==",
+     "value_count": 1
+    },
+    "d": {
+     "column_size": 43,
+     "lower_bound": "2345.67",
+     "null_value_count": 0,
+     "upper_bound": "2345.67",
+     "value_count": 1
+    },
+    "db": {
+     "column_size": 43,
+     "lower_bound": "-2.125",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-2.125",
+     "value_count": 1
+    },
+    "dt": {
+     "column_size": 39,
+     "lower_bound": "1976-02-02",
+     "null_value_count": 0,
+     "upper_bound": "1976-02-02",
+     "value_count": 1
+    },
+    "f": {
+     "column_size": 39,
+     "lower_bound": "-18.5",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-18.5",
+     "value_count": 1
+    },
+    "flag": {
+     "column_size": 36,
+     "lower_bound": true,
+     "null_value_count": 0,
+     "upper_bound": true,
+     "value_count": 1
+    },
+    "i": {
+     "column_size": 39,
+     "lower_bound": -63,
+     "null_value_count": 0,
+     "upper_bound": -63,
+     "value_count": 1
+    },
+    "id": {
+     "column_size": 43,
+     "lower_bound": 1,
+     "null_value_count": 0,
+     "upper_bound": 1,
+     "value_count": 1
+    },
+    "l": {
+     "column_size": 43,
+     "lower_bound": -3999999993,
+     "null_value_count": 0,
+     "upper_bound": -3999999993,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 44,
+     "lower_bound": "beta1",
+     "null_value_count": 0,
+     "upper_bound": "beta1",
+     "value_count": 1
+    },
+    "ts": {
+     "column_size": 43,
+     "lower_bound": "1976-06-04T01:07:11.123457",
+     "null_value_count": 0,
+     "upper_bound": "1976-06-04T01:07:11.123457",
+     "value_count": 1
+    },
+    "tstz": {
+     "column_size": 43,
+     "lower_bound": "1977-08-06T05:03:01.654321Z",
+     "null_value_count": 0,
+     "upper_bound": "1977-08-06T05:03:01.654321Z",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "AQAAAAAAAAA=",
+    "10": "AACUwQ==",
+    "11": "AAAAAAAAAcA=",
+    "12": "AQ==",
+    "2": "wf///w==",
+    "3": "B9iUEf////8=",
+    "4": "A5RH",
+    "5": "YmV0YTE=",
+    "6": "njd5sQ==",
+    "7": "rwgAAA==",
+    "8": "AdD7Z1q4AAA=",
+    "9": "MUeAl//ZAAA="
+   },
+   "value_counts": {
+    "1": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 43,
+    "10": 39,
+    "11": 43,
+    "12": 36,
+    "2": 39,
+    "3": 43,
+    "4": 43,
+    "5": 45,
+    "6": 43,
+    "7": 39,
+    "8": 42,
+    "9": 43
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/data/i_bucket=1/l_bucket=2/d_bucket=0/s_bucket=1/bin_bucket=2/dt_bucket=1/ts_bucket=0/tstz_bucket=2/00000-1-e0a7f6de-9e67-4ba6-9c8a-67f29f80bfe9-0-00002.parquet",
+   "file_size_in_bytes": 3012,
+   "first_row_id": 0,
+   "lower_bounds": {
+    "1": "AgAAAAAAAAA=",
+    "10": "AACIwQ==",
+    "11": "AAAAAACAEcA=",
+    "12": "AQ==",
+    "2": "5v///w==",
+    "3": "DqIvTf////8=",
+    "4": "9+ZO",
+    "5": "Z2FtbWEy",
+    "6": "PG7zYg==",
+    "7": "yRIAAA==",
+    "8": "AuDieXeNAQA=",
+    "9": "ImzdolCXAQA="
+   },
+   "nan_value_counts": {
+    "10": 0,
+    "11": 0
+   },
+   "null_value_counts": {
+    "1": 0,
+    "10": 0,
+    "11": 0,
+    "12": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0
+   },
+   "partition": {
+    "bin_bucket": 2,
+    "d_bucket": 0,
+    "dt_bucket": 1,
+    "i_bucket": 1,
+    "l_bucket": 2,
+    "s_bucket": 1,
+    "ts_bucket": 0,
+    "tstz_bucket": 2
+   },
+   "readable_metrics": {
+    "bin": {
+     "column_size": 43,
+     "lower_bound": "PG7zYg==",
+     "null_value_count": 0,
+     "upper_bound": "PG7zYg==",
+     "value_count": 1
+    },
+    "d": {
+     "column_size": 43,
+     "lower_bound": "-5308.66",
+     "null_value_count": 0,
+     "upper_bound": "-5308.66",
+     "value_count": 1
+    },
+    "db": {
+     "column_size": 43,
+     "lower_bound": "-4.375",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-4.375",
+     "value_count": 1
+    },
+    "dt": {
+     "column_size": 39,
+     "lower_bound": "1983-03-03",
+     "null_value_count": 0,
+     "upper_bound": "1983-03-03",
+     "value_count": 1
+    },
+    "f": {
+     "column_size": 39,
+     "lower_bound": "-17.0",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-17.0",
+     "value_count": 1
+    },
+    "flag": {
+     "column_size": 36,
+     "lower_bound": true,
+     "null_value_count": 0,
+     "upper_bound": true,
+     "value_count": 1
+    },
+    "i": {
+     "column_size": 39,
+     "lower_bound": -26,
+     "null_value_count": 0,
+     "upper_bound": -26,
+     "value_count": 1
+    },
+    "id": {
+     "column_size": 43,
+     "lower_bound": 2,
+     "null_value_count": 0,
+     "upper_bound": 2,
+     "value_count": 1
+    },
+    "l": {
+     "column_size": 43,
+     "lower_bound": -2999999986,
+     "null_value_count": 0,
+     "upper_bound": -2999999986,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 45,
+     "lower_bound": "gamma2",
+     "null_value_count": 0,
+     "upper_bound": "gamma2",
+     "value_count": 1
+    },
+    "ts": {
+     "column_size": 42,
+     "lower_bound": "1983-11-07T02:14:22.246914",
+     "null_value_count": 0,
+     "upper_bound": "1983-11-07T02:14:22.246914",
+     "value_count": 1
+    },
+    "tstz": {
+     "column_size": 43,
+     "lower_bound": "1984-03-11T10:06:02.308642Z",
+     "null_value_count": 0,
+     "upper_bound": "1984-03-11T10:06:02.308642Z",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "AgAAAAAAAAA=",
+    "10": "AACIwQ==",
+    "11": "AAAAAACAEcA=",
+    "12": "AQ==",
+    "2": "5v///w==",
+    "3": "DqIvTf////8=",
+    "4": "9+ZO",
+    "5": "Z2FtbWEy",
+    "6": "PG7zYg==",
+    "7": "yRIAAA==",
+    "8": "AuDieXeNAQA=",
+    "9": "ImzdolCXAQA="
+   },
+   "value_counts": {
+    "1": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 43,
+    "10": 39,
+    "11": 43,
+    "12": 36,
+    "2": 39,
+    "3": 43,
+    "4": 43,
+    "5": 46,
+    "6": 43,
+    "7": 39,
+    "8": 43,
+    "9": 43
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/data/i_bucket=2/l_bucket=0/d_bucket=1/s_bucket=1/bin_bucket=1/dt_bucket=1/ts_bucket=1/tstz_bucket=1/00000-1-e0a7f6de-9e67-4ba6-9c8a-67f29f80bfe9-0-00010.parquet",
+   "file_size_in_bytes": 3020,
+   "first_row_id": 8,
+   "lower_bounds": {
+    "1": "CgAAAAAAAAA=",
+    "10": "AACgwA==",
+    "11": "AAAAAABgNsA=",
+    "12": "AQ==",
+    "2": "RgAAAA==",
+    "3": "RvIFKgEAAAA=",
+    "4": "9gQG",
+    "5": "ZGVsdGExMA==",
+    "6": "LirA6g==",
+    "7": "EQ4AAA==",
+    "8": "yrI5zR4HAQA=",
+    "9": "ahqj6604AQA="
+   },
+   "nan_value_counts": {
+    "10": 0,
+    "11": 0
+   },
+   "null_value_counts": {
+    "1": 0,
+    "10": 0,
+    "11": 0,
+    "12": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0
+   },
+   "partition": {
+    "bin_bucket": 1,
+    "d_bucket": 1,
+    "dt_bucket": 1,
+    "i_bucket": 2,
+    "l_bucket": 0,
+    "s_bucket": 1,
+    "ts_bucket": 1,
+    "tstz_bucket": 1
+   },
+   "readable_metrics": {
+    "bin": {
+     "column_size": 43,
+     "lower_bound": "LirA6g==",
+     "null_value_count": 0,
+     "upper_bound": "LirA6g==",
+     "value_count": 1
+    },
+    "d": {
+     "column_size": 43,
+     "lower_bound": "-6543.30",
+     "null_value_count": 0,
+     "upper_bound": "-6543.30",
+     "value_count": 1
+    },
+    "db": {
+     "column_size": 43,
+     "lower_bound": "-22.375",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-22.375",
+     "value_count": 1
+    },
+    "dt": {
+     "column_size": 39,
+     "lower_bound": "1979-11-11",
+     "null_value_count": 0,
+     "upper_bound": "1979-11-11",
+     "value_count": 1
+    },
+    "f": {
+     "column_size": 39,
+     "lower_bound": "-5.0",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-5.0",
+     "value_count": 1
+    },
+    "flag": {
+     "column_size": 36,
+     "lower_bound": true,
+     "null_value_count": 0,
+     "upper_bound": true,
+     "value_count": 1
+    },
+    "i": {
+     "column_size": 39,
+     "lower_bound": 70,
+     "null_value_count": 0,
+     "upper_bound": 70,
+     "value_count": 1
+    },
+    "id": {
+     "column_size": 43,
+     "lower_bound": 10,
+     "null_value_count": 0,
+     "upper_bound": 10,
+     "value_count": 1
+    },
+    "l": {
+     "column_size": 43,
+     "lower_bound": 5000000070,
+     "null_value_count": 0,
+     "upper_bound": 5000000070,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 46,
+     "lower_bound": "delta10",
+     "null_value_count": 0,
+     "upper_bound": "delta10",
+     "value_count": 1
+    },
+    "ts": {
+     "column_size": 43,
+     "lower_bound": "1979-03-03T10:10:50.234570",
+     "null_value_count": 0,
+     "upper_bound": "1979-03-03T10:10:50.234570",
+     "value_count": 1
+    },
+    "tstz": {
+     "column_size": 43,
+     "lower_bound": "1980-11-23T02:30:10.543210Z",
+     "null_value_count": 0,
+     "upper_bound": "1980-11-23T02:30:10.543210Z",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "CgAAAAAAAAA=",
+    "10": "AACgwA==",
+    "11": "AAAAAABgNsA=",
+    "12": "AQ==",
+    "2": "RgAAAA==",
+    "3": "RvIFKgEAAAA=",
+    "4": "9gQG",
+    "5": "ZGVsdGExMA==",
+    "6": "LirA6g==",
+    "7": "EQ4AAA==",
+    "8": "yrI5zR4HAQA=",
+    "9": "ahqj6604AQA="
+   },
+   "value_counts": {
+    "1": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 42,
+    "10": 39,
+    "11": 43,
+    "12": 36,
+    "2": 39,
+    "3": 43,
+    "4": 43,
+    "5": 45,
+    "6": 43,
+    "7": 39,
+    "8": 43,
+    "9": 43
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/data/i_bucket=2/l_bucket=0/d_bucket=2/s_bucket=2/bin_bucket=1/dt_bucket=2/ts_bucket=0/tstz_bucket=1/00000-1-e0a7f6de-9e67-4ba6-9c8a-67f29f80bfe9-0-00009.parquet",
+   "file_size_in_bytes": 3012,
+   "first_row_id": 11,
+   "lower_bounds": {
+    "1": "CQAAAAAAAAA=",
+    "10": "AADQwA==",
+    "11": "AAAAAAAgNMA=",
+    "12": "AA==",
+    "2": "IQAAAA==",
+    "3": "Pyhr7gAAAAA=",
+    "4": "AbH/",
+    "5": "Z2FtbWE5",
+    "6": "j/NHOQ==",
+    "7": "9QMAAA==",
+    "8": "ycKjxgtRAAA=",
+    "9": "ebVaNppeAAA="
+   },
+   "nan_value_counts": {
+    "10": 0,
+    "11": 0
+   },
+   "null_value_counts": {
+    "1": 0,
+    "10": 0,
+    "11": 0,
+    "12": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0
+   },
+   "partition": {
+    "bin_bucket": 1,
+    "d_bucket": 2,
+    "dt_bucket": 2,
+    "i_bucket": 2,
+    "l_bucket": 0,
+    "s_bucket": 2,
+    "ts_bucket": 0,
+    "tstz_bucket": 1
+   },
+   "readable_metrics": {
+    "bin": {
+     "column_size": 43,
+     "lower_bound": "j/NHOQ==",
+     "null_value_count": 0,
+     "upper_bound": "j/NHOQ==",
+     "value_count": 1
+    },
+    "d": {
+     "column_size": 43,
+     "lower_bound": "1111.03",
+     "null_value_count": 0,
+     "upper_bound": "1111.03",
+     "value_count": 1
+    },
+    "db": {
+     "column_size": 43,
+     "lower_bound": "-20.125",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-20.125",
+     "value_count": 1
+    },
+    "dt": {
+     "column_size": 39,
+     "lower_bound": "1972-10-10",
+     "null_value_count": 0,
+     "upper_bound": "1972-10-10",
+     "value_count": 1
+    },
+    "f": {
+     "column_size": 39,
+     "lower_bound": "-6.5",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-6.5",
+     "value_count": 1
+    },
+    "flag": {
+     "column_size": 36,
+     "lower_bound": false,
+     "null_value_count": 0,
+     "upper_bound": false,
+     "value_count": 1
+    },
+    "i": {
+     "column_size": 39,
+     "lower_bound": 33,
+     "null_value_count": 0,
+     "upper_bound": 33,
+     "value_count": 1
+    },
+    "id": {
+     "column_size": 42,
+     "lower_bound": 9,
+     "null_value_count": 0,
+     "upper_bound": 9,
+     "value_count": 1
+    },
+    "l": {
+     "column_size": 43,
+     "lower_bound": 4000000063,
+     "null_value_count": 0,
+     "upper_bound": 4000000063,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 45,
+     "lower_bound": "gamma9",
+     "null_value_count": 0,
+     "upper_bound": "gamma9",
+     "value_count": 1
+    },
+    "ts": {
+     "column_size": 43,
+     "lower_bound": "1972-10-28T09:03:39.111113",
+     "null_value_count": 0,
+     "upper_bound": "1972-10-28T09:03:39.111113",
+     "value_count": 1
+    },
+    "tstz": {
+     "column_size": 43,
+     "lower_bound": "1973-04-18T21:27:09.888889Z",
+     "null_value_count": 0,
+     "upper_bound": "1973-04-18T21:27:09.888889Z",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "CQAAAAAAAAA=",
+    "10": "AADQwA==",
+    "11": "AAAAAAAgNMA=",
+    "12": "AA==",
+    "2": "IQAAAA==",
+    "3": "Pyhr7gAAAAA=",
+    "4": "AbH/",
+    "5": "Z2FtbWE5",
+    "6": "j/NHOQ==",
+    "7": "9QMAAA==",
+    "8": "ycKjxgtRAAA=",
+    "9": "ebVaNppeAAA="
+   },
+   "value_counts": {
+    "1": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 43,
+    "10": 39,
+    "11": 43,
+    "12": 36,
+    "2": 39,
+    "3": 43,
+    "4": 43,
+    "5": 40,
+    "6": 43,
+    "7": 39,
+    "8": 42,
+    "9": 43
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/data/i_bucket=2/l_bucket=1/d_bucket=2/s_bucket=2/bin_bucket=0/dt_bucket=2/ts_bucket=1/tstz_bucket=0/00000-1-e0a7f6de-9e67-4ba6-9c8a-67f29f80bfe9-0-00006.parquet",
+   "file_size_in_bytes": 2977,
+   "first_row_id": 10,
+   "lower_bounds": {
+    "1": "BgAAAAAAAAA=",
+    "10": "AAAwwQ==",
+    "11": "AAAAAADAKsA=",
+    "12": "AA==",
+    "2": "sv///w==",
+    "3": "KsqaOwAAAAA=",
+    "4": "Bjdq",
+    "5": "Ng==",
+    "6": "tUzaJg==",
+    "7": "OjsAAA==",
+    "8": "BhkVamaoBAA=",
+    "9": "ZoS44ObDBAA="
+   },
+   "nan_value_counts": {
+    "10": 0,
+    "11": 0
+   },
+   "null_value_counts": {
+    "1": 0,
+    "10": 0,
+    "11": 0,
+    "12": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0
+   },
+   "partition": {
+    "bin_bucket": 0,
+    "d_bucket": 2,
+    "dt_bucket": 2,
+    "i_bucket": 2,
+    "l_bucket": 1,
+    "s_bucket": 2,
+    "ts_bucket": 1,
+    "tstz_bucket": 0
+   },
+   "readable_metrics": {
+    "bin": {
+     "column_size": 43,
+     "lower_bound": "tUzaJg==",
+     "null_value_count": 0,
+     "upper_bound": "tUzaJg==",
+     "value_count": 1
+    },
+    "d": {
+     "column_size": 43,
+     "lower_bound": "4074.02",
+     "null_value_count": 0,
+     "upper_bound": "4074.02",
+     "value_count": 1
+    },
+    "db": {
+     "column_size": 43,
+     "lower_bound": "-13.375",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-13.375",
+     "value_count": 1
+    },
+    "dt": {
+     "column_size": 39,
+     "lower_bound": "2011-07-07",
+     "null_value_count": 0,
+     "upper_bound": "2011-07-07",
+     "value_count": 1
+    },
+    "f": {
+     "column_size": 39,
+     "lower_bound": "-11.0",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-11.0",
+     "value_count": 1
+    },
+    "flag": {
+     "column_size": 36,
+     "lower_bound": false,
+     "null_value_count": 0,
+     "upper_bound": false,
+     "value_count": 1
+    },
+    "i": {
+     "column_size": 39,
+     "lower_bound": -78,
+     "null_value_count": 0,
+     "upper_bound": -78,
+     "value_count": 1
+    },
+    "id": {
+     "column_size": 43,
+     "lower_bound": 6,
+     "null_value_count": 0,
+     "upper_bound": 6,
+     "value_count": 1
+    },
+    "l": {
+     "column_size": 43,
+     "lower_bound": 1000000042,
+     "null_value_count": 0,
+     "upper_bound": 1000000042,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 40,
+     "lower_bound": "6",
+     "null_value_count": 0,
+     "upper_bound": "6",
+     "value_count": 1
+    },
+    "ts": {
+     "column_size": 42,
+     "lower_bound": "2011-07-19T06:42:06.740742",
+     "null_value_count": 0,
+     "upper_bound": "2011-07-19T06:42:06.740742",
+     "value_count": 1
+    },
+    "tstz": {
+     "column_size": 43,
+     "lower_bound": "2012-07-03T06:18:06.925926Z",
+     "null_value_count": 0,
+     "upper_bound": "2012-07-03T06:18:06.925926Z",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "BgAAAAAAAAA=",
+    "10": "AAAwwQ==",
+    "11": "AAAAAADAKsA=",
+    "12": "AA==",
+    "2": "sv///w==",
+    "3": "KsqaOwAAAAA=",
+    "4": "Bjdq",
+    "5": "Ng==",
+    "6": "tUzaJg==",
+    "7": "OjsAAA==",
+    "8": "BhkVamaoBAA=",
+    "9": "ZoS44ObDBAA="
+   },
+   "value_counts": {
+    "1": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 43,
+    "10": 39,
+    "11": 43,
+    "12": 36,
+    "2": 38,
+    "3": 43,
+    "4": 42,
+    "5": 44,
+    "6": 42,
+    "7": 39,
+    "8": 42,
+    "9": 43
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/data/i_bucket=2/l_bucket=2/d_bucket=1/s_bucket=1/bin_bucket=0/dt_bucket=0/ts_bucket=2/tstz_bucket=0/00000-1-e0a7f6de-9e67-4ba6-9c8a-67f29f80bfe9-0-00005.parquet",
+   "file_size_in_bytes": 3002,
+   "first_row_id": 6,
+   "lower_bounds": {
+    "1": "BQAAAAAAAAA=",
+    "10": "AABIwQ==",
+    "11": "AAAAAABAJsA=",
+    "12": "AQ==",
+    "2": "VQAAAA==",
+    "3": "IwAAAAAAAAA=",
+    "4": "82Dj",
+    "5": "emV0YTU=",
+    "6": "FxVgdQ==",
+    "7": "HzEAAA==",
+    "8": "BVBwl3HTAwA=",
+    "9": "NZ3aGMkIBAA="
+   },
+   "nan_value_counts": {
+    "10": 0,
+    "11": 0
+   },
+   "null_value_counts": {
+    "1": 0,
+    "10": 0,
+    "11": 0,
+    "12": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0
+   },
+   "partition": {
+    "bin_bucket": 0,
+    "d_bucket": 1,
+    "dt_bucket": 0,
+    "i_bucket": 2,
+    "l_bucket": 2,
+    "s_bucket": 1,
+    "ts_bucket": 2,
+    "tstz_bucket": 0
+   },
+   "readable_metrics": {
+    "bin": {
+     "column_size": 42,
+     "lower_bound": "FxVgdQ==",
+     "null_value_count": 0,
+     "upper_bound": "FxVgdQ==",
+     "value_count": 1
+    },
+    "d": {
+     "column_size": 42,
+     "lower_bound": "-8271.65",
+     "null_value_count": 0,
+     "upper_bound": "-8271.65",
+     "value_count": 1
+    },
+    "db": {
+     "column_size": 43,
+     "lower_bound": "-11.125",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-11.125",
+     "value_count": 1
+    },
+    "dt": {
+     "column_size": 39,
+     "lower_bound": "2004-06-06",
+     "null_value_count": 0,
+     "upper_bound": "2004-06-06",
+     "value_count": 1
+    },
+    "f": {
+     "column_size": 39,
+     "lower_bound": "-12.5",
+     "nan_value_count": 0,
+     "null_value_count": 0,
+     "upper_bound": "-12.5",
+     "value_count": 1
+    },
+    "flag": {
+     "column_size": 36,
+     "lower_bound": true,
+     "null_value_count": 0,
+     "upper_bound": true,
+     "value_count": 1
+    },
+    "i": {
+     "column_size": 38,
+     "lower_bound": 85,
+     "null_value_count": 0,
+     "upper_bound": 85,
+     "value_count": 1
+    },
+    "id": {
+     "column_size": 43,
+     "lower_bound": 5,
+     "null_value_count": 0,
+     "upper_bound": 5,
+     "value_count": 1
+    },
+    "l": {
+     "column_size": 43,
+     "lower_bound": 35,
+     "null_value_count": 0,
+     "upper_bound": 35,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 44,
+     "lower_bound": "zeta5",
+     "null_value_count": 0,
+     "upper_bound": "zeta5",
+     "value_count": 1
+    },
+    "ts": {
+     "column_size": 42,
+     "lower_bound": "2004-02-16T05:35:55.617285",
+     "null_value_count": 0,
+     "upper_bound": "2004-02-16T05:35:55.617285",
+     "value_count": 1
+    },
+    "tstz": {
+     "column_size": 43,
+     "lower_bound": "2005-12-26T01:15:05.271605Z",
+     "null_value_count": 0,
+     "upper_bound": "2005-12-26T01:15:05.271605Z",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "BQAAAAAAAAA=",
+    "10": "AABIwQ==",
+    "11": "AAAAAABAJsA=",
+    "12": "AQ==",
+    "2": "VQAAAA==",
+    "3": "IwAAAAAAAAA=",
+    "4": "82Dj",
+    "5": "emV0YTU=",
+    "6": "FxVgdQ==",
+    "7": "HzEAAA==",
+    "8": "BVBwl3HTAwA=",
+    "9": "NZ3aGMkIBAA="
+   },
+   "value_counts": {
+    "1": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1
+   }
+  }
+ ],
+ "format_version": 3,
+ "lineage": [
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 5,
+   "id": 1
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 0,
+   "id": 2
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 1,
+   "id": 3
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 9,
+   "id": 4
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 6,
+   "id": 5
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 10,
+   "id": 6
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 3,
+   "id": 7
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 7,
+   "id": 8
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 11,
+   "id": 9
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 8,
+   "id": 10
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 2,
+   "id": 11
+  },
+  {
+   "_last_updated_sequence_number": 1,
+   "_row_id": 4,
+   "id": 12
+  }
+ ],
+ "manifests": [
+  {
+   "added_data_files_count": 12,
+   "added_delete_files_count": 0,
+   "added_snapshot_id": 8760177621254245847,
+   "content": 0,
+   "deleted_data_files_count": 0,
+   "deleted_delete_files_count": 0,
+   "existing_data_files_count": 0,
+   "existing_delete_files_count": 0,
+   "length": 11295,
+   "partition_spec_id": 0,
+   "partition_summaries": [
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "2"
+    },
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "2"
+    },
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "2"
+    },
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "2"
+    },
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "2"
+    },
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "2"
+    },
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "2"
+    },
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "2"
+    }
+   ],
+   "path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/metadata/c5727572-d521-45d7-99de-a92bae068ca6-m0.avro"
+  }
+ ],
+ "metadata_location": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/metadata/v2.metadata.json",
+ "refs": [
+  {
+   "name": "main",
+   "snapshot_id": 8760177621254245847,
+   "type": "BRANCH"
+  }
+ ],
+ "rows": [
+  {
+   "bin": "njd5sQ==",
+   "d": "2345.67",
+   "db": "-2.125",
+   "dt": "1976-02-02",
+   "f": "-18.5",
+   "flag": true,
+   "i": -63,
+   "id": 1,
+   "l": -3999999993,
+   "s": "beta1",
+   "ts": "1976-06-04T01:07:11.123457",
+   "tstz": "1977-08-06T05:03:01.654321Z"
+  },
+  {
+   "bin": "PG7zYg==",
+   "d": "-5308.66",
+   "db": "-4.375",
+   "dt": "1983-03-03",
+   "f": "-17.0",
+   "flag": true,
+   "i": -26,
+   "id": 2,
+   "l": -2999999986,
+   "s": "gamma2",
+   "ts": "1983-11-07T02:14:22.246914",
+   "tstz": "1984-03-11T10:06:02.308642Z"
+  },
+  {
+   "bin": "2qZtEw==",
+   "d": "7037.01",
+   "db": "-6.625",
+   "dt": "1990-04-04",
+   "f": "-15.5",
+   "flag": false,
+   "i": 11,
+   "id": 3,
+   "l": -1999999979,
+   "s": "delta3",
+   "ts": "1990-04-10T03:21:33.370371",
+   "tstz": "1991-10-16T15:09:03.962963Z"
+  },
+  {
+   "bin": "eN3mxA==",
+   "d": "-617.32",
+   "db": "-8.875",
+   "dt": "1997-05-05",
+   "f": "-14.0",
+   "flag": true,
+   "i": 48,
+   "id": 4,
+   "l": -999999972,
+   "s": "café4",
+   "ts": "1997-09-13T04:28:44.493828",
+   "tstz": "1998-05-21T20:12:04.617284Z"
+  },
+  {
+   "bin": "FxVgdQ==",
+   "d": "-8271.65",
+   "db": "-11.125",
+   "dt": "2004-06-06",
+   "f": "-12.5",
+   "flag": true,
+   "i": 85,
+   "id": 5,
+   "l": 35,
+   "s": "zeta5",
+   "ts": "2004-02-16T05:35:55.617285",
+   "tstz": "2005-12-26T01:15:05.271605Z"
+  },
+  {
+   "bin": "tUzaJg==",
+   "d": "4074.02",
+   "db": "-13.375",
+   "dt": "2011-07-07",
+   "f": "-11.0",
+   "flag": false,
+   "i": -78,
+   "id": 6,
+   "l": 1000000042,
+   "s": "6",
+   "ts": "2011-07-19T06:42:06.740742",
+   "tstz": "2012-07-03T06:18:06.925926Z"
+  },
+  {
+   "bin": "U4RT1w==",
+   "d": "-3580.31",
+   "db": "-15.625",
+   "dt": "2018-08-08",
+   "f": "-9.5",
+   "flag": true,
+   "i": -41,
+   "id": 7,
+   "l": 2000000049,
+   "s": "alpha7",
+   "ts": "2018-12-22T07:49:17.864199",
+   "tstz": "2019-02-08T11:21:07.580247Z"
+  },
+  {
+   "bin": "8bvNiA==",
+   "d": "8765.36",
+   "db": "-17.875",
+   "dt": "2025-09-09",
+   "f": "-8.0",
+   "flag": true,
+   "i": -4,
+   "id": 8,
+   "l": 3000000056,
+   "s": "beta8",
+   "ts": "2025-05-25T08:56:28.987656",
+   "tstz": "2026-09-13T16:24:08.234568Z"
+  },
+  {
+   "bin": "j/NHOQ==",
+   "d": "1111.03",
+   "db": "-20.125",
+   "dt": "1972-10-10",
+   "f": "-6.5",
+   "flag": false,
+   "i": 33,
+   "id": 9,
+   "l": 4000000063,
+   "s": "gamma9",
+   "ts": "1972-10-28T09:03:39.111113",
+   "tstz": "1973-04-18T21:27:09.888889Z"
+  },
+  {
+   "bin": "LirA6g==",
+   "d": "-6543.30",
+   "db": "-22.375",
+   "dt": "1979-11-11",
+   "f": "-5.0",
+   "flag": true,
+   "i": 70,
+   "id": 10,
+   "l": 5000000070,
+   "s": "delta10",
+   "ts": "1979-03-03T10:10:50.234570",
+   "tstz": "1980-11-23T02:30:10.543210Z"
+  },
+  {
+   "bin": "zGI6mw==",
+   "d": "5802.37",
+   "db": "-24.625",
+   "dt": "1986-12-12",
+   "f": "-3.5",
+   "flag": true,
+   "i": -93,
+   "id": 11,
+   "l": 6000000077,
+   "s": "café11",
+   "ts": "1986-08-06T11:17:01.358027",
+   "tstz": "1987-06-28T07:33:11.197531Z"
+  },
+  {
+   "bin": "apm0TA==",
+   "d": "-1851.96",
+   "db": "-26.875",
+   "dt": "1993-01-13",
+   "f": "-2.0",
+   "flag": false,
+   "i": -56,
+   "id": 12,
+   "l": 7000000084,
+   "s": "zeta12",
+   "ts": "1993-01-09T12:24:12.481484",
+   "tstz": "1994-01-05T12:36:12.851852Z"
+  }
+ ],
+ "schema": {
+  "fields": [
+   {
+    "id": 1,
+    "name": "id",
+    "required": false,
+    "type": "long"
+   },
+   {
+    "id": 2,
+    "name": "i",
+    "required": false,
+    "type": "int"
+   },
+   {
+    "id": 3,
+    "name": "l",
+    "required": false,
+    "type": "long"
+   },
+   {
+    "id": 4,
+    "name": "d",
+    "required": false,
+    "type": "decimal(10, 2)"
+   },
+   {
+    "id": 5,
+    "name": "s",
+    "required": false,
+    "type": "string"
+   },
+   {
+    "id": 6,
+    "name": "bin",
+    "required": false,
+    "type": "binary"
+   },
+   {
+    "id": 7,
+    "name": "dt",
+    "required": false,
+    "type": "date"
+   },
+   {
+    "id": 8,
+    "name": "ts",
+    "required": false,
+    "type": "timestamp"
+   },
+   {
+    "id": 9,
+    "name": "tstz",
+    "required": false,
+    "type": "timestamptz"
+   },
+   {
+    "id": 10,
+    "name": "f",
+    "required": false,
+    "type": "float"
+   },
+   {
+    "id": 11,
+    "name": "db",
+    "required": false,
+    "type": "double"
+   },
+   {
+    "id": 12,
+    "name": "flag",
+    "required": false,
+    "type": "boolean"
+   }
+  ],
+  "schema-id": 0,
+  "type": "struct"
+ },
+ "snapshots": [
+  {
+   "committed_at": "2026-11-26T17:12:05.666000Z",
+   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/transforms_bucket/metadata/snap-8760177621254245847-1-c5727572-d521-45d7-99de-a92bae068ca6.avro",
+   "operation": "append",
+   "snapshot_id": 8760177621254245847,
+   "summary": {
+    "added-data-files": "12",
+    "added-files-size": "36101",
+    "added-records": "12",
+    "app-id": "local-1795713121078",
+    "app-name": "ew-iceberg-corpus",
+    "changed-partition-count": "12",
+    "engine-name": "spark",
+    "engine-version": "4.1.2",
+    "iceberg-version": "Apache Iceberg 1.12.0 (commit 212aa894e919ff9fdf89160da4aadcbe6858ac01)",
+    "manifests-created": "1",
+    "manifests-kept": "0",
+    "manifests-replaced": "0",
+    "spark.app.id": "local-1795713121078",
+    "total-data-files": "12",
+    "total-delete-files": "0",
+    "total-equality-deletes": "0",
+    "total-files-size": "36101",
+    "total-position-deletes": "0",
+    "total-records": "12"
+   }
+  }
+ ],
+ "table": "transforms_bucket"
+}

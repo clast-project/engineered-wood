@@ -1,0 +1,773 @@
+{
+ "all_delete_files": [
+  {
+   "column_sizes": {
+    "1": 57
+   },
+   "content": 2,
+   "equality_ids": [
+    1
+   ],
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/data/part=0/eq-delete-id-0-3706bbf9-827d-4f0b-ac23-de9fe128bce2.parquet",
+   "file_size_in_bytes": 461,
+   "lower_bounds": {
+    "1": "AgAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0
+   },
+   "partition": {
+    "part": 0
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 57,
+     "lower_bound": 2,
+     "null_value_count": 0,
+     "upper_bound": 7,
+     "value_count": 4
+    },
+    "part": {},
+    "s": {}
+   },
+   "record_count": 4,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "BwAAAA=="
+   },
+   "value_counts": {
+    "1": 4
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 53
+   },
+   "content": 2,
+   "equality_ids": [
+    1
+   ],
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/data/part=1/eq-delete-id-1-f4bbb748-2687-4f63-aaa9-eb4328438a3f.parquet",
+   "file_size_in_bytes": 457,
+   "lower_bounds": {
+    "1": "AQAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0
+   },
+   "partition": {
+    "part": 1
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 53,
+     "lower_bound": 1,
+     "null_value_count": 0,
+     "upper_bound": 8,
+     "value_count": 3
+    },
+    "part": {},
+    "s": {}
+   },
+   "record_count": 3,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "CAAAAA=="
+   },
+   "value_counts": {
+    "1": 3
+   }
+  },
+  {
+   "column_sizes": {
+    "2": 59
+   },
+   "content": 2,
+   "equality_ids": [
+    2
+   ],
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/data/part=1/eq-delete-s-1-95be4dd1-206a-4afc-9236-2419fa549f93.parquet",
+   "file_size_in_bytes": 466,
+   "lower_bounds": {
+    "2": "cm93MTE="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "2": 0
+   },
+   "partition": {
+    "part": 1
+   },
+   "readable_metrics": {
+    "id": {},
+    "part": {},
+    "s": {
+     "column_size": 59,
+     "lower_bound": "row11",
+     "null_value_count": 0,
+     "upper_bound": "row13",
+     "value_count": 2
+    }
+   },
+   "record_count": 2,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "2": "cm93MTM="
+   },
+   "value_counts": {
+    "2": 2
+   }
+  }
+ ],
+ "files": [
+  {
+   "column_sizes": {
+    "1": 75,
+    "2": 76,
+    "3": 78
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/data/part=0/00000-107-0f99ebd8-10c6-4d11-8151-0de74d1b6e7f-0-00001.parquet",
+   "file_size_in_bytes": 960,
+   "lower_bounds": {
+    "1": "AAAAAA==",
+    "2": "cm93MA==",
+    "3": "AAAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0,
+    "2": 0,
+    "3": 0
+   },
+   "partition": {
+    "part": 0
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 75,
+     "lower_bound": 0,
+     "null_value_count": 0,
+     "upper_bound": 18,
+     "value_count": 10
+    },
+    "part": {
+     "column_size": 78,
+     "lower_bound": 0,
+     "null_value_count": 0,
+     "upper_bound": 0,
+     "value_count": 10
+    },
+    "s": {
+     "column_size": 76,
+     "lower_bound": "row0",
+     "null_value_count": 0,
+     "upper_bound": "row8",
+     "value_count": 10
+    }
+   },
+   "record_count": 10,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "EgAAAA==",
+    "2": "cm93OA==",
+    "3": "AAAAAA=="
+   },
+   "value_counts": {
+    "1": 10,
+    "2": 10,
+    "3": 10
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 39,
+    "2": 49,
+    "3": 39
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/data/part=0/00000-109-66557404-44a2-4ad0-a365-7f9d6f1b19ef-0-00001.parquet",
+   "file_size_in_bytes": 886,
+   "lower_bounds": {
+    "1": "BAAAAA==",
+    "2": "cmVpbnNlcnRlZA==",
+    "3": "AAAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0,
+    "2": 0,
+    "3": 0
+   },
+   "partition": {
+    "part": 0
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 39,
+     "lower_bound": 4,
+     "null_value_count": 0,
+     "upper_bound": 4,
+     "value_count": 1
+    },
+    "part": {
+     "column_size": 39,
+     "lower_bound": 0,
+     "null_value_count": 0,
+     "upper_bound": 0,
+     "value_count": 1
+    },
+    "s": {
+     "column_size": 49,
+     "lower_bound": "reinserted",
+     "null_value_count": 0,
+     "upper_bound": "reinserted",
+     "value_count": 1
+    }
+   },
+   "record_count": 1,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "BAAAAA==",
+    "2": "cmVpbnNlcnRlZA==",
+    "3": "AAAAAA=="
+   },
+   "value_counts": {
+    "1": 1,
+    "2": 1,
+    "3": 1
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 75,
+    "2": 76,
+    "3": 78
+   },
+   "content": 0,
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/data/part=1/00000-107-0f99ebd8-10c6-4d11-8151-0de74d1b6e7f-0-00002.parquet",
+   "file_size_in_bytes": 960,
+   "lower_bounds": {
+    "1": "AQAAAA==",
+    "2": "cm93MQ==",
+    "3": "AQAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0,
+    "2": 0,
+    "3": 0
+   },
+   "partition": {
+    "part": 1
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 75,
+     "lower_bound": 1,
+     "null_value_count": 0,
+     "upper_bound": 19,
+     "value_count": 10
+    },
+    "part": {
+     "column_size": 78,
+     "lower_bound": 1,
+     "null_value_count": 0,
+     "upper_bound": 1,
+     "value_count": 10
+    },
+    "s": {
+     "column_size": 76,
+     "lower_bound": "row1",
+     "null_value_count": 0,
+     "upper_bound": "row9",
+     "value_count": 10
+    }
+   },
+   "record_count": 10,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "EwAAAA==",
+    "2": "cm93OQ==",
+    "3": "AQAAAA=="
+   },
+   "value_counts": {
+    "1": 10,
+    "2": 10,
+    "3": 10
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 57
+   },
+   "content": 2,
+   "equality_ids": [
+    1
+   ],
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/data/part=0/eq-delete-id-0-3706bbf9-827d-4f0b-ac23-de9fe128bce2.parquet",
+   "file_size_in_bytes": 461,
+   "lower_bounds": {
+    "1": "AgAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0
+   },
+   "partition": {
+    "part": 0
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 57,
+     "lower_bound": 2,
+     "null_value_count": 0,
+     "upper_bound": 7,
+     "value_count": 4
+    },
+    "part": {},
+    "s": {}
+   },
+   "record_count": 4,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "BwAAAA=="
+   },
+   "value_counts": {
+    "1": 4
+   }
+  },
+  {
+   "column_sizes": {
+    "1": 53
+   },
+   "content": 2,
+   "equality_ids": [
+    1
+   ],
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/data/part=1/eq-delete-id-1-f4bbb748-2687-4f63-aaa9-eb4328438a3f.parquet",
+   "file_size_in_bytes": 457,
+   "lower_bounds": {
+    "1": "AQAAAA=="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "1": 0
+   },
+   "partition": {
+    "part": 1
+   },
+   "readable_metrics": {
+    "id": {
+     "column_size": 53,
+     "lower_bound": 1,
+     "null_value_count": 0,
+     "upper_bound": 8,
+     "value_count": 3
+    },
+    "part": {},
+    "s": {}
+   },
+   "record_count": 3,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "1": "CAAAAA=="
+   },
+   "value_counts": {
+    "1": 3
+   }
+  },
+  {
+   "column_sizes": {
+    "2": 59
+   },
+   "content": 2,
+   "equality_ids": [
+    2
+   ],
+   "file_format": "PARQUET",
+   "file_path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/data/part=1/eq-delete-s-1-95be4dd1-206a-4afc-9236-2419fa549f93.parquet",
+   "file_size_in_bytes": 466,
+   "lower_bounds": {
+    "2": "cm93MTE="
+   },
+   "nan_value_counts": {},
+   "null_value_counts": {
+    "2": 0
+   },
+   "partition": {
+    "part": 1
+   },
+   "readable_metrics": {
+    "id": {},
+    "part": {},
+    "s": {
+     "column_size": 59,
+     "lower_bound": "row11",
+     "null_value_count": 0,
+     "upper_bound": "row13",
+     "value_count": 2
+    }
+   },
+   "record_count": 2,
+   "sort_order_id": 0,
+   "spec_id": 0,
+   "split_offsets": [
+    4
+   ],
+   "upper_bounds": {
+    "2": "cm93MTM="
+   },
+   "value_counts": {
+    "2": 2
+   }
+  }
+ ],
+ "format_version": 2,
+ "manifests": [
+  {
+   "added_data_files_count": 1,
+   "added_delete_files_count": 0,
+   "added_snapshot_id": 1972726012732702554,
+   "content": 0,
+   "deleted_data_files_count": 0,
+   "deleted_delete_files_count": 0,
+   "existing_data_files_count": 0,
+   "existing_delete_files_count": 0,
+   "length": 7317,
+   "partition_spec_id": 0,
+   "partition_summaries": [
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "0"
+    }
+   ],
+   "path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/metadata/8757ab80-3dd9-4d25-b4b8-a6c99c96493e-m0.avro"
+  },
+  {
+   "added_data_files_count": 0,
+   "added_delete_files_count": 2,
+   "added_snapshot_id": 7281602512299514296,
+   "content": 1,
+   "deleted_data_files_count": 0,
+   "deleted_delete_files_count": 0,
+   "existing_data_files_count": 0,
+   "existing_delete_files_count": 0,
+   "length": 7350,
+   "partition_spec_id": 0,
+   "partition_summaries": [
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "1"
+    }
+   ],
+   "path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/metadata/899195a3-504f-41fa-83ce-f241786ae39e-m0.avro"
+  },
+  {
+   "added_data_files_count": 0,
+   "added_delete_files_count": 1,
+   "added_snapshot_id": 1083769523129597542,
+   "content": 1,
+   "deleted_data_files_count": 0,
+   "deleted_delete_files_count": 0,
+   "existing_data_files_count": 0,
+   "existing_delete_files_count": 0,
+   "length": 7295,
+   "partition_spec_id": 0,
+   "partition_summaries": [
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "1",
+     "upper_bound": "1"
+    }
+   ],
+   "path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/metadata/a45b0dd8-fb06-493b-b4e9-b45fe1854d4a-m0.avro"
+  },
+  {
+   "added_data_files_count": 2,
+   "added_delete_files_count": 0,
+   "added_snapshot_id": 3227708558888695420,
+   "content": 0,
+   "deleted_data_files_count": 0,
+   "deleted_delete_files_count": 0,
+   "existing_data_files_count": 0,
+   "existing_delete_files_count": 0,
+   "length": 7352,
+   "partition_spec_id": 0,
+   "partition_summaries": [
+    {
+     "contains_nan": false,
+     "contains_null": false,
+     "lower_bound": "0",
+     "upper_bound": "1"
+    }
+   ],
+   "path": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/metadata/f495aef6-a216-4b38-baa8-4eb66febf2c6-m0.avro"
+  }
+ ],
+ "metadata_location": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/metadata/v5.metadata.json",
+ "refs": [
+  {
+   "name": "main",
+   "snapshot_id": 1083769523129597542,
+   "type": "BRANCH"
+  }
+ ],
+ "rows": [
+  {
+   "id": 0,
+   "part": 0,
+   "s": "row0"
+  },
+  {
+   "id": 4,
+   "part": 0,
+   "s": "reinserted"
+  },
+  {
+   "id": 5,
+   "part": 1,
+   "s": "row5"
+  },
+  {
+   "id": 7,
+   "part": 1,
+   "s": "row7"
+  },
+  {
+   "id": 8,
+   "part": 0,
+   "s": "row8"
+  },
+  {
+   "id": 9,
+   "part": 1,
+   "s": "row9"
+  },
+  {
+   "id": 10,
+   "part": 0,
+   "s": "row10"
+  },
+  {
+   "id": 12,
+   "part": 0,
+   "s": "row12"
+  },
+  {
+   "id": 14,
+   "part": 0,
+   "s": "row14"
+  },
+  {
+   "id": 15,
+   "part": 1,
+   "s": "row15"
+  },
+  {
+   "id": 16,
+   "part": 0,
+   "s": "row16"
+  },
+  {
+   "id": 17,
+   "part": 1,
+   "s": "row17"
+  },
+  {
+   "id": 18,
+   "part": 0,
+   "s": "row18"
+  },
+  {
+   "id": 19,
+   "part": 1,
+   "s": "row19"
+  }
+ ],
+ "schema": {
+  "fields": [
+   {
+    "id": 1,
+    "name": "id",
+    "required": false,
+    "type": "int"
+   },
+   {
+    "id": 2,
+    "name": "s",
+    "required": false,
+    "type": "string"
+   },
+   {
+    "id": 3,
+    "name": "part",
+    "required": false,
+    "type": "int"
+   }
+  ],
+  "schema-id": 0,
+  "type": "struct"
+ },
+ "snapshots": [
+  {
+   "committed_at": "2026-11-26T17:12:15.506000Z",
+   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/metadata/snap-3227708558888695420-1-f495aef6-a216-4b38-baa8-4eb66febf2c6.avro",
+   "operation": "append",
+   "snapshot_id": 3227708558888695420,
+   "summary": {
+    "added-data-files": "2",
+    "added-files-size": "1920",
+    "added-records": "20",
+    "app-id": "local-1795713121078",
+    "app-name": "ew-iceberg-corpus",
+    "changed-partition-count": "2",
+    "engine-name": "spark",
+    "engine-version": "4.1.2",
+    "iceberg-version": "Apache Iceberg 1.12.0 (commit 212aa894e919ff9fdf89160da4aadcbe6858ac01)",
+    "manifests-created": "1",
+    "manifests-kept": "0",
+    "manifests-replaced": "0",
+    "spark.app.id": "local-1795713121078",
+    "total-data-files": "2",
+    "total-delete-files": "0",
+    "total-equality-deletes": "0",
+    "total-files-size": "1920",
+    "total-position-deletes": "0",
+    "total-records": "20"
+   }
+  },
+  {
+   "committed_at": "2026-11-26T17:12:15.649000Z",
+   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/metadata/snap-7281602512299514296-1-899195a3-504f-41fa-83ce-f241786ae39e.avro",
+   "operation": "delete",
+   "parent_id": 3227708558888695420,
+   "snapshot_id": 7281602512299514296,
+   "summary": {
+    "added-delete-files": "2",
+    "added-equality-delete-files": "2",
+    "added-equality-deletes": "7",
+    "added-files-size": "918",
+    "app-id": "local-1795713121078",
+    "app-name": "ew-iceberg-corpus",
+    "changed-partition-count": "2",
+    "engine-name": "spark",
+    "engine-version": "4.1.2",
+    "iceberg-version": "Apache Iceberg 1.12.0 (commit 212aa894e919ff9fdf89160da4aadcbe6858ac01)",
+    "manifests-created": "1",
+    "manifests-kept": "1",
+    "manifests-replaced": "0",
+    "total-data-files": "2",
+    "total-delete-files": "2",
+    "total-equality-deletes": "7",
+    "total-files-size": "2838",
+    "total-position-deletes": "0",
+    "total-records": "20"
+   }
+  },
+  {
+   "committed_at": "2026-11-26T17:12:15.807000Z",
+   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/metadata/snap-1972726012732702554-1-8757ab80-3dd9-4d25-b4b8-a6c99c96493e.avro",
+   "operation": "append",
+   "parent_id": 7281602512299514296,
+   "snapshot_id": 1972726012732702554,
+   "summary": {
+    "added-data-files": "1",
+    "added-files-size": "886",
+    "added-records": "1",
+    "app-id": "local-1795713121078",
+    "app-name": "ew-iceberg-corpus",
+    "changed-partition-count": "1",
+    "engine-name": "spark",
+    "engine-version": "4.1.2",
+    "iceberg-version": "Apache Iceberg 1.12.0 (commit 212aa894e919ff9fdf89160da4aadcbe6858ac01)",
+    "manifests-created": "1",
+    "manifests-kept": "2",
+    "manifests-replaced": "0",
+    "spark.app.id": "local-1795713121078",
+    "total-data-files": "3",
+    "total-delete-files": "2",
+    "total-equality-deletes": "7",
+    "total-files-size": "3724",
+    "total-position-deletes": "0",
+    "total-records": "21"
+   }
+  },
+  {
+   "committed_at": "2026-11-26T17:12:15.953000Z",
+   "manifest_list": "file:/tmp/ew-iceberg-corpus/spark/warehouse/corpus/v2_equality_deletes/metadata/snap-1083769523129597542-1-a45b0dd8-fb06-493b-b4e9-b45fe1854d4a.avro",
+   "operation": "delete",
+   "parent_id": 1972726012732702554,
+   "snapshot_id": 1083769523129597542,
+   "summary": {
+    "added-delete-files": "1",
+    "added-equality-delete-files": "1",
+    "added-equality-deletes": "2",
+    "added-files-size": "466",
+    "app-id": "local-1795713121078",
+    "app-name": "ew-iceberg-corpus",
+    "changed-partition-count": "1",
+    "engine-name": "spark",
+    "engine-version": "4.1.2",
+    "iceberg-version": "Apache Iceberg 1.12.0 (commit 212aa894e919ff9fdf89160da4aadcbe6858ac01)",
+    "manifests-created": "1",
+    "manifests-kept": "3",
+    "manifests-replaced": "0",
+    "total-data-files": "3",
+    "total-delete-files": "3",
+    "total-equality-deletes": "9",
+    "total-files-size": "4190",
+    "total-position-deletes": "0",
+    "total-records": "21"
+   }
+  }
+ ],
+ "table": "v2_equality_deletes"
+}
