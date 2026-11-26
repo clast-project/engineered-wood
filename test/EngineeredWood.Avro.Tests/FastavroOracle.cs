@@ -13,6 +13,9 @@ namespace EngineeredWood.Avro.Tests;
 /// </summary>
 internal static class FastavroOracle
 {
+    private const int ProbeTimeoutMs = 10_000;
+    private const int ReadTimeoutMs = 30_000;
+
     private static readonly Lazy<string?> Python = new(FindPython);
 
     /// <summary>Whether a Python with fastavro installed is on the PATH.</summary>
@@ -49,19 +52,9 @@ internal static class FastavroOracle
                     print(json.dumps({"error": type(e).__name__}))
                 """);
 
-            var psi = new ProcessStartInfo(Python.Value!, $"-I \"{script}\" \"{path}\"")
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            using var p = Process.Start(psi)!;
-            string stdout = p.StandardOutput.ReadToEnd();
-            string stderr = p.StandardError.ReadToEnd();
-            p.WaitForExit(30_000);
-            if (p.ExitCode != 0)
-                throw new InvalidOperationException($"fastavro script failed: {stderr}");
+            var (exitCode, stdout, stderr) = Run(Python.Value!, $"\"{script}\" \"{path}\"", ReadTimeoutMs);
+            if (exitCode != 0)
+                throw new InvalidOperationException($"fastavro script failed (exit {exitCode}): {stderr}");
 
             var root = JsonDocument.Parse(stdout).RootElement;
             return root.TryGetProperty("error", out var error)
@@ -81,24 +74,51 @@ internal static class FastavroOracle
         {
             try
             {
-                var psi = new ProcessStartInfo(candidate, "-c \"import fastavro\"")
-                {
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                };
-                using var p = Process.Start(psi)!;
-                p.WaitForExit(10_000);
-                if (p.ExitCode == 0)
+                // Probed in the same isolated mode Read runs in: a fastavro only in the user site, or only on
+                // PYTHONPATH, would otherwise pass here and then fail to import there.
+                if (Run(candidate, "-c \"import fastavro\"", ProbeTimeoutMs).ExitCode == 0)
                     return candidate;
             }
             catch
             {
-                // not on the PATH
+                // not on the PATH, or the probe timed out
             }
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Runs Python in isolated mode (<c>-I</c>: no user site, no <c>PYTHON*</c> variables, no script directory on
+    /// the path) and returns its exit code and output. Both pipes are drained on their own threads, since reading
+    /// one to its end while the other fills would deadlock, and reading stdout on this thread would block until the
+    /// process exits however long that takes; the wait is bounded instead, and a process that overruns is killed.
+    /// </summary>
+    private static (int ExitCode, string Stdout, string Stderr) Run(string python, string arguments, int timeoutMs)
+    {
+        var psi = new ProcessStartInfo(python, "-I " + arguments)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        using var p = Process.Start(psi)!;
+        var stdout = Task.Factory.StartNew(
+            () => p.StandardOutput.ReadToEnd(),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        var stderr = Task.Factory.StartNew(
+            () => p.StandardError.ReadToEnd(),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+        if (!p.WaitForExit(timeoutMs))
+        {
+            try { p.Kill(); } catch { /* already gone */ }
+            throw new TimeoutException($"Python '{arguments}' did not finish in {timeoutMs / 1000} s.");
+        }
+
+        // The pipes close when the process exits; a grandchild holding them open must not hang us either.
+        string Drain(Task<string> t) => t.Wait(5_000) ? t.Result : "";
+        return (p.ExitCode, Drain(stdout), Drain(stderr));
     }
 }
