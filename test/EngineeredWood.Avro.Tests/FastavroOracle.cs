@@ -1,7 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-using System.Diagnostics;
 using System.Text.Json;
 
 namespace EngineeredWood.Avro.Tests;
@@ -90,35 +89,8 @@ internal static class FastavroOracle
 
     /// <summary>
     /// Runs Python in isolated mode (<c>-I</c>: no user site, no <c>PYTHON*</c> variables, no script directory on
-    /// the path) and returns its exit code and output. Both pipes are drained on their own threads, since reading
-    /// one to its end while the other fills would deadlock, and reading stdout on this thread would block until the
-    /// process exits however long that takes; the wait is bounded instead, and a process that overruns is killed.
+    /// the path), bounded by <see cref="PythonProcess.Run"/>.
     /// </summary>
-    private static (int ExitCode, string Stdout, string Stderr) Run(string python, string arguments, int timeoutMs)
-    {
-        var psi = new ProcessStartInfo(python, "-I " + arguments)
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        using var p = Process.Start(psi)!;
-        var stdout = Task.Factory.StartNew(
-            () => p.StandardOutput.ReadToEnd(),
-            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
-        var stderr = Task.Factory.StartNew(
-            () => p.StandardError.ReadToEnd(),
-            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
-
-        if (!p.WaitForExit(timeoutMs))
-        {
-            try { p.Kill(); } catch { /* already gone */ }
-            throw new TimeoutException($"Python '{arguments}' did not finish in {timeoutMs / 1000} s.");
-        }
-
-        // The pipes close when the process exits; a grandchild holding them open must not hang us either.
-        string Drain(Task<string> t) => t.Wait(5_000) ? t.Result : "";
-        return (p.ExitCode, Drain(stdout), Drain(stderr));
-    }
+    private static PythonProcess.Result Run(string python, string arguments, int timeoutMs) =>
+        PythonProcess.Run(python, "-I " + arguments, timeoutMs);
 }

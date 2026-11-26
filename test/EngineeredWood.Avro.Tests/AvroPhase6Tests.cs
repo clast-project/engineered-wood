@@ -1,7 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using Apache.Arrow;
@@ -550,16 +549,7 @@ public class AvroPhase6Tests
         {
             try
             {
-                var psi = new ProcessStartInfo(candidate, "--version")
-                {
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                };
-                var p = Process.Start(psi)!;
-                p.WaitForExit(3000);
-                if (p.ExitCode == 0)
+                if (PythonProcess.Run(candidate, "--version", 10_000).ExitCode == 0)
                     return candidate;
             }
             catch { }
@@ -589,40 +579,23 @@ public class AvroPhase6Tests
         if (PythonExe == null) return null;
         try
         {
-            var psi = new ProcessStartInfo(PythonExe,
-                "-c \"import os, tzdata; print(os.path.join(os.path.dirname(tzdata.__file__), 'zoneinfo'))\"")
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            var p = Process.Start(psi)!;
-            var stdout = p.StandardOutput.ReadToEnd().Trim();
-            p.WaitForExit(5000);
-            if (p.ExitCode == 0 && Directory.Exists(stdout))
+            var result = PythonProcess.Run(PythonExe,
+                "-c \"import os, tzdata; print(os.path.join(os.path.dirname(tzdata.__file__), 'zoneinfo'))\"", 10_000);
+            var stdout = result.Stdout.Trim();
+            if (result.ExitCode == 0 && Directory.Exists(stdout))
                 return stdout;
         }
         catch { }
         return null;
     }
 
-    private static ProcessStartInfo PythonPsi(string arguments)
+    /// <summary>Runs <see cref="PythonExe"/>, with TZDIR pointed at tzdata's zoneinfo when it has one.</summary>
+    private static PythonProcess.Result RunPython(string arguments, int timeoutMs)
     {
-        var psi = new ProcessStartInfo(PythonExe!, arguments)
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-
-        if (TzDataDir != null && !psi.Environment.ContainsKey("TZDIR"))
-        {
-            psi.Environment["TZDIR"] = TzDataDir;
-        }
-
-        return psi;
+        var environment = TzDataDir != null && Environment.GetEnvironmentVariable("TZDIR") == null
+            ? new Dictionary<string, string> { ["TZDIR"] = TzDataDir }
+            : null;
+        return PythonProcess.Run(PythonExe!, arguments, timeoutMs, environment);
     }
 
     private static bool IsFastavroAvailable()
@@ -630,9 +603,7 @@ public class AvroPhase6Tests
         if (PythonExe == null) return false;
         try
         {
-            var p = Process.Start(PythonPsi("-c \"import fastavro\""))!;
-            p.WaitForExit(5000);
-            return p.ExitCode == 0;
+            return RunPython("-c \"import fastavro\"", 10_000).ExitCode == 0;
         }
         catch { return false; }
     }
@@ -713,15 +684,11 @@ print(json.dumps(result))
 
         try
         {
-            var p = Process.Start(PythonPsi(scriptPath))!;
-            var stdout = p.StandardOutput.ReadToEnd();
-            var stderr = p.StandardError.ReadToEnd();
-            p.WaitForExit(10000);
+            var result = RunPython($"\"{scriptPath}\"", 30_000);
+            if (result.ExitCode != 0)
+                throw new Exception($"fastavro script failed (exit {result.ExitCode}): {result.Stderr}");
 
-            if (p.ExitCode != 0)
-                throw new Exception($"fastavro script failed: {stderr}");
-
-            return JsonDocument.Parse(stdout).RootElement;
+            return JsonDocument.Parse(result.Stdout).RootElement;
         }
         finally
         {
