@@ -407,6 +407,89 @@ public class ManifestCodecTests : IDisposable
         Assert.Equal([3, 19_000], tuple.Values.Select(v => (int)v.Value!));
     }
 
+    // A v2 manifest whose partition holds a bare fixed(4) and a string after it, so a misread fixed misaligns.
+    private static string FixedPartitionSchema(string fixedType)
+    {
+        // Splice the partition record's fields, whatever the whitespace around them.
+        const string open = "\"name\": \"r102\", \"fields\": [";
+        const string lastField = "\"field-id\": 1001}";
+        int from = JavaManifestSchema.IndexOf(open, StringComparison.Ordinal) + open.Length;
+        int to = JavaManifestSchema.IndexOf(lastField, from, StringComparison.Ordinal) + lastField.Length;
+        return JavaManifestSchema.Substring(0, from)
+            + "{\"name\": \"fx\", \"type\": [\"null\", " + fixedType + "], \"default\": null, \"field-id\": 1000}, "
+            + "{\"name\": \"s\", \"type\": [\"null\", \"string\"], \"default\": null, \"field-id\": 1001}"
+            + JavaManifestSchema.Substring(to);
+    }
+
+    private static AvroRecordValue FixedPartitionEntry(AvroRecordSchema schema, object? fx) => Entry(schema, new()
+    {
+        ["status"] = 1, ["snapshot_id"] = 1L,
+        ["data_file"] = (Func<AvroRecordSchema, AvroRecordValue>)(df => Rec(df, new()
+        {
+            ["content"] = 0, ["file_path"] = "a.parquet", ["file_format"] = "PARQUET",
+            ["partition"] = (Func<AvroRecordSchema, AvroRecordValue>)(p => Rec(p, new() { ["fx"] = fx, ["s"] = "after" })),
+            ["record_count"] = 1L, ["file_size_in_bytes"] = 1L,
+        })),
+    });
+
+    [Fact]
+    public void BareFixedPartitionValue_DecodesInBothEncodings()
+    {
+        const string fixedNode = "{\"type\": \"fixed\", \"name\": \"fixed_4\", \"size\": 4}";
+        string schemaJson = FixedPartitionSchema(fixedNode);
+        Assert.Contains("fixed_4", schemaJson, StringComparison.Ordinal);
+        var value = new byte[] { 0, 1, 2, 3 };
+        var spec = new List<PartitionValueType> { new(1000, "fx", new FixedType(4)), new(1001, "s", IcebergType.String) };
+
+        // As the spec and the schema say: four bytes, no prefix (iceberg-go, pyiceberg, EW).
+        var strict = WriteOcf(schemaJson, s => FixedPartitionEntry(s, value));
+        AssertTuple(ManifestCodec.DecodeManifest(strict, "strict.avro", spec));
+
+        // As Iceberg Java writes it (apache/iceberg#17501): the schema says fixed, the bytes have a length prefix.
+        // Encode the records with a bytes field in its place, and write the fixed schema in the header.
+        var asBytes = (AvroRecordSchema)AvroSchemaParser.Parse(FixedPartitionSchema("\"bytes\""));
+        var header = (AvroRecordSchema)AvroSchemaParser.Parse(schemaJson);
+        var w = new AvroBinaryWriter(new GrowableBuffer());
+        AvroDatum.Write(w, asBytes, FixedPartitionEntry(asBytes, value));
+        var ms = new MemoryStream();
+        using (var ocf = new OcfWriter(ms, AvroCodec.Null))
+        {
+            ocf.WriteHeader(header);
+            ocf.WriteBlock(w.WrittenSpan, 1);
+        }
+        AssertTuple(ManifestCodec.DecodeManifest(ms.ToArray(), "java.avro", spec));
+
+        void AssertTuple(DecodedManifest decoded)
+        {
+            var tuple = Assert.Single(decoded.Entries).DataFile.Partition!;
+            Assert.True(tuple.TryGetValue(1000, out var fx));
+            Assert.Equal(value, (byte[])fx!);
+            Assert.True(tuple.TryGetValue(1001, out var after));
+            Assert.Equal("after", after);
+        }
+    }
+
+    [Fact]
+    public void NonNullFixedPartitionValue_IsNotWritten()
+    {
+        var type = new List<PartitionValueType> { new(1000, "fx", new FixedType(4)) };
+        ManifestEntry With(byte[]? fx) => new()
+        {
+            Status = ManifestEntryStatus.Added, SnapshotId = 1,
+            DataFile = new DataFile
+            {
+                FilePath = "a.parquet", RecordCount = 1, FileSizeInBytes = 1,
+                Partition = new PartitionData([new PartitionValue(1000, "fx", new FixedType(4), fx)]),
+            },
+        };
+
+        var ex = Assert.Throws<NotSupportedException>(() =>
+            ManifestCodec.EncodeManifest([With([0, 1, 2, 3])], 2, ManifestContent.Data, type, new Dictionary<string, byte[]>()));
+        Assert.Contains("apache/iceberg#17501", ex.Message);
+        // A null value encodes the same in both readings.
+        ManifestCodec.EncodeManifest([With(null)], 2, ManifestContent.Data, type, new Dictionary<string, byte[]>());
+    }
+
     [Fact]
     public void UnmodelledFieldWithAValue_IsReported()
     {

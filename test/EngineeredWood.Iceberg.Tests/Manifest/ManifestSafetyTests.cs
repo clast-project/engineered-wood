@@ -294,7 +294,7 @@ public class ManifestSafetyTests : IDisposable
             "{\"name\":\"key_metadata\"",
             "{\"name\":\"future_field\",\"type\":[\"null\",\"long\"],\"default\":null,\"field-id\":599},{\"name\":\"key_metadata\"");
         var schema = (AvroRecordSchema)AvroSchemaParser.Parse(schemaJson);
-        var original = (AvroRecordValue)DecodeFirst(await _fs.ReadAllBytesAsync(snapshot.ManifestList));
+        var original = (AvroRecordValue)DecodeFirst(await _fs.ReadAllBytesAsync(snapshot.ManifestList))!;
         var values = schema.Fields.Select(f => f.Name == "future_field"
             ? 1L
             : original.Values[original.Schema.Fields.ToList().FindIndex(o => o.Name == f.Name)]).ToArray();

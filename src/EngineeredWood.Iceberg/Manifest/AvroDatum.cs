@@ -31,7 +31,12 @@ internal sealed class AvroRecordValue
 /// </remarks>
 internal static class AvroDatum
 {
-    public static object? Read(ref AvroBinaryReader r, AvroSchemaNode schema)
+    /// <summary>
+    /// Reads one value of <paramref name="schema"/>. A <c>fixed</c> node in <paramref name="lengthPrefixed"/> is
+    /// read with a length prefix, as Avro <c>bytes</c>: that is how Iceberg Java writes a bare <c>fixed</c>
+    /// (apache/iceberg#17501), whatever its schema says.
+    /// </summary>
+    public static object? Read(ref AvroBinaryReader r, AvroSchemaNode schema, HashSet<AvroFixedSchema>? lengthPrefixed = null)
     {
         switch (schema)
         {
@@ -53,7 +58,7 @@ internal static class AvroDatum
             {
                 var values = new object?[rec.Fields.Count];
                 for (int i = 0; i < values.Length; i++)
-                    values[i] = Read(ref r, rec.Fields[i].Schema);
+                    values[i] = Read(ref r, rec.Fields[i].Schema, lengthPrefixed);
                 return new AvroRecordValue(rec, values);
             }
 
@@ -71,7 +76,7 @@ internal static class AvroDatum
                 for (long count = ReadBlockCount(ref r); count != 0; count = ReadBlockCount(ref r))
                 {
                     for (long i = 0; i < count; i++)
-                        items.Add(Read(ref r, a.Items));
+                        items.Add(Read(ref r, a.Items, lengthPrefixed));
                 }
                 return items;
             }
@@ -84,10 +89,19 @@ internal static class AvroDatum
                     for (long i = 0; i < count; i++)
                     {
                         var key = r.ReadString();
-                        pairs.Add(new KeyValuePair<string, object?>(key, Read(ref r, m.Values)));
+                        pairs.Add(new KeyValuePair<string, object?>(key, Read(ref r, m.Values, lengthPrefixed)));
                     }
                 }
                 return pairs;
+            }
+
+            case AvroFixedSchema f when lengthPrefixed is not null && lengthPrefixed.Contains(f):
+            {
+                var bytes = r.ReadBytes();
+                if (bytes.Length != f.Size)
+                    throw new InvalidDataException(
+                        $"A length-prefixed fixed({f.Size}) value '{f.FullName}' has {bytes.Length} bytes.");
+                return bytes.ToArray();
             }
 
             case AvroFixedSchema f:
@@ -98,7 +112,7 @@ internal static class AvroDatum
                 int index = r.ReadUnionIndex();
                 if ((uint)index >= (uint)u.Branches.Count)
                     throw new InvalidDataException($"Union branch {index} is out of range.");
-                return Read(ref r, u.Branches[index]);
+                return Read(ref r, u.Branches[index], lengthPrefixed);
             }
 
             default:

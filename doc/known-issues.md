@@ -686,6 +686,13 @@ manifest EW rewrote. Remaining gaps:
   carries forward. The two deliberate exceptions are the ones the spec
   requires on a format upgrade: `block_size_in_bytes` isn't written past
   v1, and `distinct_counts` isn't written in v3.
+- **Fixed partition values (apache/iceberg#17501).** Since 1.8, Iceberg Java writes a bare
+  `fixed[N]` partition value (in practice an identity partition on a `fixed` column) with a
+  length prefix that the manifest's own schema says it doesn't have, and it reads the value
+  back the same way. EW reads both encodings: it decodes as the schema says, and falls back to
+  Java's form only if that fails. It refuses to write a non-null bare `fixed` partition value,
+  because either encoding would be misread by one group of readers. UUID and decimal values,
+  also stored as `fixed`, aren't affected.
 - **No row-lineage assignment.** Commits to v3 tables don't assign
   `first_row_id` or advance `next-row-id` (Phase 2 of
   `doc/iceberg-v3-plan.md`). Rewritten entries carry the row ids they

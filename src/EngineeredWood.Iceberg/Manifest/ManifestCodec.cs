@@ -80,22 +80,84 @@ internal static class ManifestCodec
             partition = new PartitionReader(partitionSchema, partitionType, path);
         }
 
-        var entries = new List<ManifestEntry>();
-        while (reader.ReadBlock() is { } block)
+        // Iceberg Java (1.8 on) writes a bare fixed partition value with a length prefix, though the schema it
+        // writes says fixed (apache/iceberg#17501), and reads it back the same way. Decode as the schema says;
+        // only if that does not decode cleanly, and the partition has a bare fixed field, decode as Java writes.
+        var javaFixed = BareFixedPartitionFields(schema);
+        List<ManifestEntry> entries;
+        try
         {
-            var br = new AvroBinaryReader(block.data.Span);
-            for (long i = 0; i < block.objectCount; i++)
+            entries = DecodeEntries(lengthPrefixed: null);
+        }
+        catch (Exception strictError) when (javaFixed.Count > 0 && IsDecodeFailure(strictError))
+        {
+            try
             {
-                var entry = (AvroRecordValue)AvroDatum.Read(ref br, schema)!;
-                NoteUnmodelled(entry, entryFields, EntryIds, "manifest_entry", lost);
-                var df = (AvroRecordValue)entry.Values[dataFileIndex]!;
-                NoteUnmodelled(df, dataFileFields, DataFileIds, "data_file", lost);
-                entries.Add(DecodeEntry(entry, entryFields, df, dataFileFields, partition, path));
+                entries = DecodeEntries(javaFixed);
+            }
+            catch (Exception javaError) when (IsDecodeFailure(javaError))
+            {
+                throw strictError;
             }
         }
 
         return new DecodedManifest(entries, reader.Metadata, hasSequenceNumbers, lost.ToList());
+
+        List<ManifestEntry> DecodeEntries(HashSet<AvroFixedSchema>? lengthPrefixed)
+        {
+            lost.Clear();
+            using var stream = new MemoryStream(data);
+            using var blocks = OcfReader.Open(stream);
+            // The same schema text parses to new nodes, so map the fixed nodes to this parse by position.
+            var decodeSchema = blocks.WriterSchema;
+            var prefixed = lengthPrefixed is null ? null : BareFixedPartitionFields(decodeSchema);
+            var result = new List<ManifestEntry>();
+            while (blocks.ReadBlock() is { } block)
+            {
+                var br = new AvroBinaryReader(block.data.Span);
+                for (long i = 0; i < block.objectCount; i++)
+                {
+                    var entry = (AvroRecordValue)AvroDatum.Read(ref br, decodeSchema, prefixed)!;
+                    NoteUnmodelled(entry, entryFields, EntryIds, "manifest_entry", lost);
+                    var df = (AvroRecordValue)entry.Values[dataFileIndex]!;
+                    NoteUnmodelled(df, dataFileFields, DataFileIds, "data_file", lost);
+                    result.Add(DecodeEntry(entry, entryFields, df, dataFileFields, partition, path));
+                }
+                // A block that decodes into its record count but leaves bytes over was read misaligned.
+                if (!br.IsEmpty)
+                    throw Invalid(path, $"has a block with {br.Remaining} bytes left after its {block.objectCount} records");
+            }
+            return result;
+        }
     }
+
+    /// <summary>
+    /// The bare <c>fixed</c> nodes (no logical type) of a manifest's partition record: the fields Iceberg Java
+    /// writes with a length prefix. UUIDs and decimals, also fixed, it writes as the schema says.
+    /// </summary>
+    private static HashSet<AvroFixedSchema> BareFixedPartitionFields(AvroRecordSchema manifestEntrySchema)
+    {
+        var result = new HashSet<AvroFixedSchema>();
+        var entryFields = FieldIds(manifestEntrySchema, S.EntryFieldsByName);
+        if (IndexOf(entryFields, S.DataFileId) is not { } dIndex
+            || Unwrap(manifestEntrySchema.Fields[dIndex].Schema) is not AvroRecordSchema dataFile)
+            return result;
+        var dataFileFields = FieldIds(dataFile, S.DataFileFieldsByName);
+        if (IndexOf(dataFileFields, S.Partition) is { } pIndex
+            && Unwrap(dataFile.Fields[pIndex].Schema) is AvroRecordSchema partition)
+        {
+            foreach (var field in partition.Fields)
+            {
+                if (Unwrap(field.Schema) is AvroFixedSchema { LogicalType: null } fixedNode)
+                    result.Add(fixedNode);
+            }
+        }
+        return result;
+    }
+
+    private static bool IsDecodeFailure(Exception e) =>
+        e is InvalidDataException or OverflowException or IndexOutOfRangeException or ArgumentOutOfRangeException
+            or EndOfStreamException or InvalidCastException;
 
     private static ManifestEntry DecodeEntry(
         AvroRecordValue entry, int?[] entryFields, AvroRecordValue df, int?[] dfFields,
@@ -368,6 +430,13 @@ internal static class ManifestCodec
             var t = partitionType[i];
             if (!partition.TryGetValue(t.FieldId, out var value))
                 throw new ArgumentException($"Data file '{df.FilePath}' has no value for partition field {t.FieldId} ({t.Name}).");
+            // Iceberg Java (1.8 on) reads a fixed partition value with a length prefix, though the spec and the
+            // schema say fixed has none (apache/iceberg#17501). Either encoding would be misread by one group of
+            // readers, so refuse to write one until that is settled. A null value is encoded the same either way.
+            if (t.Type is FixedType && value is not null)
+                throw new NotSupportedException(
+                    $"Cannot write data file '{df.FilePath}': its partition field '{t.Name}' is a non-null fixed " +
+                    "value, and readers disagree on how a manifest encodes fixed (apache/iceberg#17501).");
             values[i] = IcebergAvroTypes.ToAvro(value, t.Type);
         }
         return new AvroRecordValue(partitionSchema, values);
