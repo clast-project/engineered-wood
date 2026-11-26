@@ -67,6 +67,8 @@ public static class CatalogCommitExtensions
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The committed table.</returns>
     /// <exception cref="CommitFailedException">Every attempt lost a race, or the time limit passed.</exception>
+    /// <exception cref="CommitValidationException"><paramref name="update"/> refused the change, or the table was
+    /// dropped and re-created between attempts.</exception>
     public static async Task<Table> CommitWithRetryAsync(
         this ICatalog catalog,
         TableIdentifier identifier,
@@ -79,10 +81,20 @@ public static class CatalogCommitExtensions
 
         var clock = System.Diagnostics.Stopwatch.StartNew();
         var random = new Random();
+        string? tableUuid = null;
         for (var attempt = 0; ; attempt++)
         {
             var table = await catalog.LoadTableAsync(identifier, ct).ConfigureAwait(false);
             options ??= CommitRetryOptions.FromProperties(table.Metadata.Properties);
+
+            // A retry re-applies the change to newer versions of the SAME table. If the name now holds a
+            // different table (dropped and re-created since the first attempt), the change was meant for one
+            // that no longer exists: fail rather than apply it to an unrelated table.
+            tableUuid ??= table.Metadata.TableUuid;
+            if (table.Metadata.TableUuid != tableUuid)
+                throw new CommitValidationException(
+                    $"{identifier} was dropped and re-created (table {tableUuid} is now {table.Metadata.TableUuid}) " +
+                    "while the commit was being retried; the change was not applied to the new table.");
 
             var newMetadata = await update(table.Metadata, ct).ConfigureAwait(false);
             try

@@ -308,7 +308,10 @@ public sealed class FileSystemCatalog : ICatalog
         {
             // A commit to the source after it was loaded would be lost by copying the loaded version, so
             // undo the destination and fail instead. Checked before the source is touched...
-            if (await FindCurrentVersionAsync(from, ct).ConfigureAwait(false) != baseVersion)
+            // The version number alone is not enough: a drop and re-create of the source starts again at v1,
+            // and removing that would delete an unrelated table.
+            if (await FindCurrentVersionAsync(from, ct).ConfigureAwait(false) != baseVersion ||
+                await ReadTableUuidAsync(from, baseVersion, ct).ConfigureAwait(false) != current.Metadata.TableUuid)
                 throw new CommitFailedException(from, "the table changed while it was being renamed; it was not renamed.");
 
             // ...and again after its versions up to the loaded one are gone: one published in between
@@ -350,9 +353,7 @@ public sealed class FileSystemCatalog : ICatalog
                 $"the commit is based on version {baseVersion}, but the table is at version {current}.");
 
         // Same version number, but is it the same table? A drop and re-create starts again at v1.
-        var currentMetadata = IcebergJsonSerializer.Deserialize<TableMetadata>(Encoding.UTF8.GetString(
-            await _fs.ReadAllBytesAsync(MetadataFilePath(identifier, current), ct).ConfigureAwait(false)));
-        if (currentMetadata.TableUuid != baseTable.Metadata.TableUuid)
+        if (await ReadTableUuidAsync(identifier, current, ct).ConfigureAwait(false) != baseTable.Metadata.TableUuid)
             throw new CommitFailedException(identifier,
                 "the table was dropped and re-created after the commit's base was loaded.");
 
@@ -385,6 +386,27 @@ public sealed class FileSystemCatalog : ICatalog
                 break;
             await _fs.DeleteAsync(path, ct).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// The table UUID recorded in the table's <paramref name="version"/>, or null when that version is gone (a
+    /// concurrent drop), which callers treat as a different table.
+    /// </summary>
+    private async ValueTask<string?> ReadTableUuidAsync(TableIdentifier identifier, int version, CancellationToken ct)
+    {
+        var path = MetadataFilePath(identifier, version);
+        if (!await _fs.ExistsAsync(path, ct).ConfigureAwait(false))
+            return null;
+        byte[] data;
+        try
+        {
+            data = await _fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+        return IcebergJsonSerializer.Deserialize<TableMetadata>(Encoding.UTF8.GetString(data)).TableUuid;
     }
 
     /// <summary>How many times a drop deletes newly committed versions before giving up.</summary>

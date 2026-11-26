@@ -248,6 +248,15 @@ public sealed class InMemoryCatalog : ICatalog
                 $"The new metadata belongs to table {newMetadata.TableUuid}, not {baseTable.Metadata.TableUuid}.",
                 nameof(newMetadata));
 
+        // A base this catalog never issued (constructed by hand, or loaded from another catalog) is a misuse,
+        // not a lost race, as in FileSystemCatalog.
+        if (baseTable.MetadataLocation is not { } location ||
+            location.IndexOf($"/metadata/{_instanceId}-", StringComparison.Ordinal) < 0)
+            throw new ArgumentException(
+                $"The base table's metadata location '{baseTable.MetadataLocation}' was not issued by this catalog; " +
+                "load the table from this catalog before committing to it.",
+                nameof(baseTable));
+
         lock (_lock)
         {
             if (!_tables.TryGetValue(identifier, out var current))

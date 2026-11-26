@@ -522,9 +522,75 @@ public class CommitSafetyTests : IDisposable
         var fromA = await a.CreateTableAsync(id, _schema);
         await b.CreateTableAsync(id, _schema);
 
-        await Assert.ThrowsAsync<CommitFailedException>(
+        await Assert.ThrowsAsync<ArgumentException>(
             () => b.CommitTableAsync(fromA, WithProperty(fromA.Metadata, "foreign", "yes")));
         Assert.False((await b.LoadTableAsync(id)).Metadata.Properties.ContainsKey("foreign"));
+    }
+
+    [Fact]
+    public async Task InMemory_RejectsABaseWithoutAMetadataLocation()
+    {
+        var catalog = new InMemoryCatalog();
+        await catalog.CreateNamespaceAsync(_ns);
+        var id = new TableIdentifier(_ns, "t");
+        var table = await catalog.CreateTableAsync(id, _schema);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => catalog.CommitTableAsync(new Table(id, table.Metadata), table.Metadata));
+    }
+
+    // --- Review round 3: a drop and re-create racing a retry or a rename ---
+
+    [Fact]
+    public async Task CommitWithRetry_DoesNotApplyTheChangeToARecreatedTable()
+    {
+        var (catalog, id, _) = await CreateTableAsync();
+        var other = new FileSystemCatalog(new LocalTableFileSystem(_warehouse));
+        var calls = 0;
+
+        await Assert.ThrowsAsync<CommitValidationException>(() => catalog.CommitWithRetryAsync(
+            id,
+            async (metadata, ct) =>
+            {
+                // The first attempt's table is dropped and a new one created under the name (again at v1).
+                if (++calls == 1)
+                {
+                    await other.DropTableAsync(id, ct: ct);
+                    await other.CreateTableAsync(id, _schema, ct: ct);
+                }
+                return WithProperty(metadata, "mine", "yes");
+            },
+            EagerRetry));
+
+        Assert.Equal(1, calls);
+        Assert.False((await catalog.LoadTableAsync(id)).Metadata.Properties.ContainsKey("mine"));
+    }
+
+    [Fact]
+    public async Task Rename_DoesNotDeleteASourceThatWasRecreated()
+    {
+        var (_, id, original) = await CreateTableAsync();
+        var to = new TableIdentifier(_ns, "renamed");
+        var other = new FileSystemCatalog(new LocalTableFileSystem(_warehouse));
+        var hooked = new HookedFileSystem(_fs)
+        {
+            // Just before the destination's v1 is written, the source is dropped and re-created: a different
+            // table, at the same v1.
+            BeforeTryWrite = async path =>
+            {
+                if (path != "db/renamed/metadata/v1.metadata.json")
+                    return;
+                await other.DropTableAsync(id);
+                await other.CreateTableAsync(id, _schema);
+            },
+        };
+        var catalog = new FileSystemCatalog(hooked);
+
+        await Assert.ThrowsAsync<CommitFailedException>(() => catalog.RenameTableAsync(id, to));
+
+        Assert.False(await catalog.TableExistsAsync(to));
+        var source = await catalog.LoadTableAsync(id);
+        Assert.NotEqual(original.Metadata.TableUuid, source.Metadata.TableUuid);
     }
 
     [Fact]
