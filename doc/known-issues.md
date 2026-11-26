@@ -675,7 +675,9 @@ manifest EW rewrote. Remaining gaps:
   the current schema, and scan planning prunes on them. A bound written
   before a type promotion is read by its length. A bound that can't be
   used safely (NaN, an unknown type, a field the schema no longer has) is
-  left out, so the file is kept. The raw bytes stay in
+  left out, so the file is kept. UUID bounds are left out too: Iceberg
+  Java orders UUIDs by their signed 64-bit halves, and the planner
+  compares them differently, so using them could prune a matching file. The raw bytes stay in
   `LowerBounds`/`UpperBounds` and are written back unchanged.
 - **Partition summaries.** A commit writes the manifest-list `partitions`
   of a new manifest: whether any value is null or NaN, and the least and

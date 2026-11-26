@@ -207,9 +207,9 @@ public static class ManifestIO
     {
         var decoded = await ReadSnapshotManifestDecodedAsync(fs, metadata, snapshot, manifest, ct).ConfigureAwait(false);
         // Bounds are decoded against the current schema, which planning binds filters to.
-        var schema = metadata.Schemas.First(s => s.SchemaId == metadata.CurrentSchemaId);
+        var columnTypes = ManifestValues.BoundColumnTypes(metadata.Schemas.First(s => s.SchemaId == metadata.CurrentSchemaId));
         return ManifestCodec.Inherit(decoded, manifest)
-            .Select(e => e with { DataFile = ManifestValues.WithDecodedBounds(e.DataFile, schema) })
+            .Select(e => e with { DataFile = ManifestValues.WithDecodedBounds(e.DataFile, columnTypes) })
             .ToList();
     }
 

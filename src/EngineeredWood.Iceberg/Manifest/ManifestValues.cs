@@ -60,35 +60,67 @@ internal static class ManifestValues
     }
 
     /// <summary>
+    /// The primitive columns of <paramref name="schema"/> whose bounds planning can use, by field id, at any
+    /// struct depth. Built once per read, so typing a file's bounds costs a lookup per bound.
+    /// </summary>
+    /// <remarks>
+    /// UUID columns are left out. Iceberg Java orders UUIDs by their two signed 64-bit halves when it computes
+    /// a file's bounds, and the planner compares <see cref="Guid"/>s in another order, so a UUID bound could
+    /// prune a file that holds a match. Partition summaries leave UUIDs out for the same reason.
+    /// </remarks>
+    public static IReadOnlyDictionary<int, PrimitiveType> BoundColumnTypes(Schema schema)
+    {
+        var types = new Dictionary<int, PrimitiveType>();
+        Collect(schema.Fields);
+        return types;
+
+        void Collect(IReadOnlyList<NestedField> fields)
+        {
+            foreach (var field in fields)
+            {
+                switch (field.Type)
+                {
+                    case StructType s:
+                        Collect(s.Fields);
+                        break;
+                    case UuidType:
+                        break;
+                    case PrimitiveType p:
+                        types[field.Id] = p;
+                        break;
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// <paramref name="file"/> with <see cref="DataFile.ColumnLowerBounds"/> and
     /// <see cref="DataFile.ColumnUpperBounds"/> decoded from its raw bounds, for scan planning. Each column is
-    /// typed by <paramref name="schema"/>; a bound written before the column's type was promoted is read by
-    /// its length. A bound that cannot be used safely, or a field the schema no longer has, is left out, and
-    /// planning then treats it as unknown and keeps the file.
+    /// typed by <paramref name="columnTypes"/> (see <see cref="BoundColumnTypes"/>); a bound written before the
+    /// column's type was promoted is read by its length. A bound that cannot be used safely, or a field with no
+    /// usable type, is left out, and planning then treats it as unknown and keeps the file.
     /// </summary>
-    public static DataFile WithDecodedBounds(DataFile file, Schema schema)
+    public static DataFile WithDecodedBounds(DataFile file, IReadOnlyDictionary<int, PrimitiveType> columnTypes)
     {
         if (file.LowerBounds is null && file.UpperBounds is null)
             return file;
         return file with
         {
-            ColumnLowerBounds = Decode(file.LowerBounds, schema) ?? file.ColumnLowerBounds,
-            ColumnUpperBounds = Decode(file.UpperBounds, schema) ?? file.ColumnUpperBounds,
+            ColumnLowerBounds = Decode(file.LowerBounds, columnTypes) ?? file.ColumnLowerBounds,
+            ColumnUpperBounds = Decode(file.UpperBounds, columnTypes) ?? file.ColumnUpperBounds,
         };
     }
 
-    private static Dictionary<int, LiteralValue>? Decode(IReadOnlyDictionary<int, byte[]>? raw, Schema schema)
+    private static Dictionary<int, LiteralValue>? Decode(
+        IReadOnlyDictionary<int, byte[]>? raw, IReadOnlyDictionary<int, PrimitiveType> columnTypes)
     {
         if (raw is null)
             return null;
         var decoded = new Dictionary<int, LiteralValue>(raw.Count);
         foreach (var (fieldId, bytes) in raw)
         {
-            if (PartitionTypes.FindField(schema.Fields, fieldId) is { Type: PrimitiveType type }
-                && SingleValueBinary.TryDecodeBound(type, bytes, out var bound))
-            {
+            if (columnTypes.TryGetValue(fieldId, out var type) && SingleValueBinary.TryDecodeBound(type, bytes, out var bound))
                 decoded[fieldId] = bound;
-            }
         }
         return decoded.Count > 0 ? decoded : null;
     }
