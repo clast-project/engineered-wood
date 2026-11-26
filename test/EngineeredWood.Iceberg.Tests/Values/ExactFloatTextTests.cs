@@ -36,6 +36,11 @@ public class ExactFloatTextTests
     [InlineData("2.4703282292062328E-324", 0x0000000000000001L)] // just over half the smallest subnormal
     [InlineData("2.4703282292062327E-324", 0x0000000000000000L)] // just under
     [InlineData("1e-400", 0x0000000000000000L)]
+    [InlineData("0e10001", 0x0000000000000000L)]                  // zero at any exponent (#971 review)
+    [InlineData("-0e10001", unchecked((long)0x8000000000000000UL))]
+    [InlineData("1e-10001", 0x0000000000000000L)]                 // far below the range: zero
+    [InlineData("1e10001", 0x7FF0000000000000L)]                  // far above it: an infinity
+    [InlineData("9.99e-401", 0x0000000000000000L)]                // just under the cut-off
     [InlineData("2.2250738585072014E-308", 0x0010000000000000L)] // smallest normal
     [InlineData("2.225073858507201E-308", 0x000FFFFFFFFFFFFFL)]  // largest subnormal
     [InlineData("1.7976931348623157E308", 0x7FEFFFFFFFFFFFFFL)]
@@ -49,6 +54,9 @@ public class ExactFloatTextTests
 
     [Theory]
     [InlineData("1.0", 0x3F800000)]
+    [InlineData("0e10001", 0x00000000)]
+    [InlineData("-1e-10001", unchecked((int)0x80000000))]
+    [InlineData("1e10001", 0x7F800000)]
     [InlineData("0.1", 0x3DCCCCCD)]
     [InlineData("1.4E-45", 0x00000001)]
     [InlineData("3.4028235E38", 0x7F7FFFFF)]

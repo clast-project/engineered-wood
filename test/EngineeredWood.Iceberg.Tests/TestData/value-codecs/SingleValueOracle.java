@@ -127,6 +127,25 @@ public class SingleValueOracle {
     parse("timestamptz_ns", "\"2017-11-16T22:31:08.123456789+00:00\"");
     parse("timestamptz_ns", "\"2017-11-16T22:31:08.123456789Z\"");
     parse("timestamptz_ns", "\"2017-11-16T22:31:08.123456789\"");
+    // Review of #971: case of the T and Z, offsets with seconds, exponents far past a scale limit.
+    parse("timestamp", "\"2017-11-16t22:31:08\"");
+    parse("timestamp_ns", "\"2017-11-16t22:31:08.123456789\"");
+    parse("timestamptz", "\"2017-11-16T22:31:08z\"");
+    parse("timestamptz", "\"2017-11-16t22:31:08Z\"");
+    parse("timestamptz", "\"2017-11-16T22:31:08+00:00:00\"");
+    parse("timestamptz", "\"2017-11-16T22:31:08-00:00:00\"");
+    parse("timestamptz", "\"2017-11-16T22:31:08+00:00:01\"");
+    parse("timestamptz_ns", "\"2017-11-16T22:31:08.123456789z\"");
+    parse("timestamptz_ns", "\"2017-11-16T22:31:08.123456789+00:00:00\"");
+    parse("float", "1e-10001");
+    parse("float", "0e10001");
+    parse("float", "-0e10001");
+    parse("double", "1e-10001");
+    parse("double", "0e10001");
+    parse("double", "1e-400");
+    parse("double", "1e10001");
+    parse("decimal(9, 0)", "\"0E+5\"");
+    parse("decimal(9, 2)", "\"0.00E+0\"");
     parse("string", "\"iceberg\"");
     parse("string", "34");
     parse("uuid", "\"f79c3e09-677c-4bbd-a479-3f349cb785e7\"");

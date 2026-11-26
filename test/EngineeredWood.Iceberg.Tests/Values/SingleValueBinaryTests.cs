@@ -210,6 +210,45 @@ public class SingleValueBinaryTests
         Assert.Throws<ArgumentException>(() => SingleValueBinary.Encode(IcebergType.Int, LiteralValue.Of(34L)));
     }
 
+    /// <summary>Rescaling is exact or refused, however far apart the scales (#971 review).</summary>
+    [Fact]
+    public void Encode_RescalesAcrossLargeScaleGaps()
+    {
+        // 10^100 at scale 100 is exactly 1.
+        Assert.Equal("01", ToHex(SingleValueBinary.Encode(IcebergType.Decimal(9, 0),
+            LiteralValue.HighPrecisionDecimalOf(BigInteger.Pow(10, 100), 100))));
+        // Zero at any scale.
+        Assert.Equal("00", ToHex(SingleValueBinary.Encode(IcebergType.Decimal(9, 2), LiteralValue.HighPrecisionDecimalOf(0, 1_000_000))));
+        Assert.Equal("00", ToHex(SingleValueBinary.Encode(IcebergType.Decimal(9, 2), LiteralValue.HighPrecisionDecimalOf(0, -1_000_000))));
+        // A scale far past the value's digits cannot be exact, and is refused without building the power.
+        Assert.Throws<ArgumentException>(() => SingleValueBinary.Encode(IcebergType.Decimal(9, 0),
+            LiteralValue.HighPrecisionDecimalOf(7, 50_000_000)));
+        Assert.Throws<ArgumentException>(() => SingleValueBinary.Encode(IcebergType.Decimal(38, 0),
+            LiteralValue.HighPrecisionDecimalOf(7, -50_000_000)));
+        // Scaling up stops at the precision: 9.99 is three digits, at scale 2 of decimal(3, 2) and no further.
+        Assert.Equal("03e7", ToHex(SingleValueBinary.Encode(IcebergType.Decimal(3, 2), LiteralValue.HighPrecisionDecimalOf(999, 2))));
+        Assert.Throws<ArgumentException>(() => SingleValueBinary.Encode(IcebergType.Decimal(3, 3), LiteralValue.HighPrecisionDecimalOf(999, 2)));
+        Assert.Equal("2710", ToHex(SingleValueBinary.Encode(IcebergType.Decimal(5, 0), LiteralValue.HighPrecisionDecimalOf(1, -4))));
+        Assert.Throws<ArgumentException>(() => SingleValueBinary.Encode(IcebergType.Decimal(4, 0), LiteralValue.HighPrecisionDecimalOf(1, -4)));
+    }
+
+    /// <summary>An unpaired surrogate has no UTF-8 form; it is refused, not replaced with U+FFFD (#971 review).</summary>
+    /// <remarks>A fact, not a theory: xUnit serializes theory data, and that turns a lone surrogate into U+FFFD.</remarks>
+    [Fact]
+    public void Encode_RefusesUnpairedSurrogates()
+    {
+        char high = (char)0xD800, low = (char)0xDC00;
+        foreach (string s in new[] { "a" + high, low + "b", new string(high, 2), new string(new[] { low, high }) })
+        {
+            Assert.Throws<ArgumentException>(() => SingleValueBinary.Encode(IcebergType.String, LiteralValue.Of(s)));
+            Assert.Throws<ArgumentException>(() => SingleValueJson.ToJsonString(IcebergType.String, LiteralValue.Of(s)));
+        }
+
+        // A pair is one character, and encodes.
+        Assert.Equal("f09fa78a", ToHex(SingleValueBinary.Encode(IcebergType.String, LiteralValue.Of(char.ConvertFromUtf32(0x1F9CA)))));
+        Assert.Equal("f09fa78a", ToHex(SingleValueBinary.Encode(IcebergType.String, LiteralValue.Of(new string(new[] { high, low }).Replace(new string(new[] { high, low }), char.ConvertFromUtf32(0x1F9CA))))));
+    }
+
     [Fact]
     public void Encode_Timestamps()
     {

@@ -24,6 +24,7 @@ public class JavaSingleValueVectorTests
         [("decimal(9, 2)", "\"12345678.90\"")] = "refused: more digits than the precision",
         // Java reads an infinity, then writes "Infinity", which it cannot read back.
         [("float", "1e40")] = "refused: out of range for a float",
+        [("double", "1e10001")] = "refused: out of range for a double",
         // A legal Iceberg date that .NET's date types cannot hold.
         [("date", "\"+10000-01-01\"")] = "unsupported: outside the years 1 to 9999",
     };

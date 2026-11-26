@@ -45,14 +45,17 @@ internal static class IsoTemporalText
         return false;
     }
 
-    /// <summary>A date, a <c>T</c>, a time, and an optional offset: <c>Z</c> or <c>±HH:MM</c>.</summary>
+    /// <summary>
+    /// A date, a <c>T</c>, a time, and an optional offset: <c>Z</c>, <c>±HH:MM</c> or <c>±HH:MM:SS</c>. The
+    /// <c>T</c> and <c>Z</c> may be lower case, as java.time accepts.
+    /// </summary>
     internal static bool TryParseTimestamp(string text, out long epochDays, out long nanosOfDay, out Offset offset)
     {
         int pos = 0;
         nanosOfDay = 0;
         offset = Offset.None;
         if (!TryParseDatePart(text, ref pos, out epochDays)
-            || pos >= text.Length || text[pos] != 'T')
+            || pos >= text.Length || text[pos] is not ('T' or 't'))
             return false;
         pos++;
         if (!TryParseTimePart(text, ref pos, out nanosOfDay))
@@ -60,17 +63,21 @@ internal static class IsoTemporalText
         if (pos == text.Length)
             return true;
 
-        if (text[pos] == 'Z' && pos + 1 == text.Length)
+        if (text[pos] is 'Z' or 'z' && pos + 1 == text.Length)
         {
             offset = Offset.Zero;
             return true;
         }
 
-        if (text[pos] is '+' or '-' && pos + 6 == text.Length && text[pos + 3] == ':'
+        if (text[pos] is '+' or '-' && pos + 6 <= text.Length && text[pos + 3] == ':'
             && TryDigits(text, pos + 1, 2, out int hours) && TryDigits(text, pos + 4, 2, out int minutes)
             && hours <= 18 && minutes <= 59)
         {
-            offset = hours == 0 && minutes == 0 ? Offset.Zero : Offset.NonZero;
+            int seconds = 0;
+            if (pos + 6 != text.Length
+                && !(pos + 9 == text.Length && text[pos + 6] == ':' && TryDigits(text, pos + 7, 2, out seconds) && seconds <= 59))
+                return false;
+            offset = hours == 0 && minutes == 0 && seconds == 0 ? Offset.Zero : Offset.NonZero;
             return true;
         }
 
