@@ -186,6 +186,8 @@ public sealed record TableMetadata : IJsonOnDeserialized, IJsonOnSerializing
     /// </summary>
     internal void ThrowIfDataInaccessible(Snapshot? snapshot)
     {
+        // Metadata built in code (`with { FormatVersion = 4 }`) never passes through deserialization.
+        ThrowIfUnsupportedVersion("read");
         // Table keys refuse every read, including one of an empty table: there is no plaintext view of it.
         ThrowIfTableKeys("read");
         if (snapshot?.KeyId is { } keyId)
@@ -198,10 +200,13 @@ public sealed record TableMetadata : IJsonOnDeserialized, IJsonOnSerializing
     /// Throws <see cref="UnsupportedTableFeatureException"/> when the table is encrypted in any way: it has
     /// <see cref="EncryptionKeys"/>, or any snapshot has a <see cref="Snapshot.KeyId"/>. Writing plaintext
     /// manifests into an encrypted table would leave its data unprotected, so every write checks this before
-    /// it writes anything.
+    /// it writes anything. A <see cref="FormatVersion"/> outside 1 to 3 is refused here too.
     /// </summary>
     internal void ThrowIfNotWritable()
     {
+        // Checked here, not only when the metadata is serialized: that happens after the commit has written
+        // its manifests, which would then be files of a format version this library does not write.
+        ThrowIfUnsupportedVersion("written");
         ThrowIfTableKeys("written");
         if (Snapshots.FirstOrDefault(s => s.KeyId is not null) is { } keyed)
             throw new UnsupportedTableFeatureException(

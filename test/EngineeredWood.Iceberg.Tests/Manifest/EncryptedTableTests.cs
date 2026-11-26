@@ -192,4 +192,27 @@ public class EncryptedTableTests : IDisposable
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
             async () => await new TableScan(picked, _fs).PlanFilesAsync());
     }
+
+    [Theory]
+    [InlineData(4)]
+    [InlineData(0)]
+    public async Task UnsupportedFormatVersionInMemory_IsRefusedBeforeAnyWrite(int version)
+    {
+        // Never deserialized, so only the operations' own preflight can catch it.
+        var md = await TableWithOneSnapshotAsync() with { FormatVersion = version };
+        var before = FilesUnder(md.Location);
+
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await _ops.AppendFilesAsync(md, [File1 with { FilePath = "data/file2.parquet" }]));
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await _ops.AppendDeleteFilesAsync(md,
+                [File1 with { FilePath = "data/del.parquet", Content = FileContent.PositionDeletes }]));
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await _ops.OverwriteFilesAsync(md, [File1], []));
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await new ExpireSnapshots().ExpireOlderThan(long.MaxValue).ApplyAsync(md, _fs));
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await new TableScan(md, _fs).PlanFilesAsync());
+        Assert.Equal(before, FilesUnder(md.Location));
+    }
 }
