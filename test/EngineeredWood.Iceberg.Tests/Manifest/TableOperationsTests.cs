@@ -196,4 +196,17 @@ public class TableOperationsTests : IDisposable
         Assert.Single(dataFiles);
         Assert.Equal("data/events-001.parquet", dataFiles[0].FilePath);
     }
+
+    [Fact]
+    public async Task UnknownTransformInTheDefaultSpec_RefusesNewFiles()
+    {
+        // Readers must accept such a spec; committing files under it is forbidden.
+        var spec = new PartitionSpec(0, [new PartitionField(1, 1000, "z", new UnknownTransform("zorder"), [1, 2])]);
+        var metadata = TableMetadata.Create(_schema, spec, location: Path.Combine(_warehouse, "unknown_transform"));
+        var file = new DataFile { FilePath = "data/a.parquet", RecordCount = 1, FileSizeInBytes = 1 };
+
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(async () => await _ops.AppendFilesAsync(metadata, [file]));
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(async () => await _ops.OverwriteFilesAsync(metadata, [], [file]));
+        Assert.False(Directory.Exists(Path.Combine(_warehouse, "unknown_transform")));
+    }
 }

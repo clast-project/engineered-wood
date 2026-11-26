@@ -73,14 +73,37 @@ public class EncryptedTableTests : IDisposable
 
     [Theory]
     [MemberData(nameof(Encryptions))]
-    public async Task Writes_AreRefused(string how)
+    public async Task Writes_AreRefused_AndWriteNothing(string how)
     {
         var md = Encrypt(await TableWithOneSnapshotAsync(), how);
+        var before = FilesUnder(md.Location);
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
             async () => await _ops.AppendFilesAsync(md, [File1 with { FilePath = "data/file2.parquet" }]));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
             async () => await _ops.OverwriteFilesAsync(md, [File1], []));
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await _ops.AppendDeleteFilesAsync(md,
+                [File1 with { FilePath = "data/del.parquet", Content = FileContent.PositionDeletes }]));
+        Assert.Equal(before, FilesUnder(md.Location));
     }
+
+    [Fact]
+    public async Task KeyOnAnOlderSnapshotOnly_StillRefusesWrites()
+    {
+        // Only a historical snapshot is keyed; the current one is not. The table is still encrypted.
+        var md = await _ops.AppendFilesAsync(await TableWithOneSnapshotAsync(), [File1 with { FilePath = "data/file2.parquet" }]);
+        md = md with { Snapshots = [md.Snapshots[0] with { KeyId = "k1" }, md.Snapshots[1]] };
+        var before = FilesUnder(md.Location);
+        await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
+            async () => await _ops.AppendFilesAsync(md, [File1 with { FilePath = "data/file3.parquet" }]));
+        Assert.Equal(before, FilesUnder(md.Location));
+
+        // Reading the unkeyed current snapshot is still fine.
+        Assert.Equal(2, (await _ops.ListDataFilesAsync(md)).Count);
+    }
+
+    private static List<string> FilesUnder(string dir) =>
+        Directory.Exists(dir) ? Directory.GetFiles(dir, "*", SearchOption.AllDirectories).OrderBy(p => p).ToList() : [];
 
     [Fact]
     public async Task AppendToAnEncryptedTable_WritesNothing()

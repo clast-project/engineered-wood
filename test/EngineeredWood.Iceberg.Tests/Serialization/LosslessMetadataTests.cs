@@ -273,6 +273,46 @@ public class LosslessMetadataTests
             IcebergJsonSerializer.Deserialize<IcebergType>(JsonSerializer.Serialize(spelling)));
     }
 
+    [Fact]
+    public void V1SpecWithoutFieldIds_NumbersThemFrom1000()
+    {
+        var spec = IcebergJsonSerializer.Deserialize<PartitionSpec>("""
+            {"spec-id": 0, "fields": [
+              {"source-id": 1, "name": "a", "transform": "identity"},
+              {"source-id": 2, "name": "b", "transform": "bucket[4]"}
+            ]}
+            """);
+        Assert.Equal([1000, 1001], spec.Fields.Select(f => f.FieldId));
+
+        Assert.Throws<JsonException>(() => IcebergJsonSerializer.Deserialize<PartitionSpec>("""
+            {"spec-id": 0, "fields": [
+              {"source-id": 1, "field-id": 1000, "name": "a", "transform": "identity"},
+              {"source-id": 2, "name": "b", "transform": "identity"}
+            ]}
+            """));
+    }
+
+    [Theory]
+    [InlineData("bucket[16,2]")]
+    [InlineData("bucket[x]")]
+    [InlineData("truncate[ 4 ]")]
+    [InlineData("bucket[99999999999]")]
+    [InlineData("bucketed[4]")]
+    public void TransformsThatOnlyLookKnown_AreUnknown(string name)
+    {
+        var transform = IcebergJsonSerializer.Deserialize<Transform>(JsonSerializer.Serialize(name));
+        Assert.Equal(new UnknownTransform(name), transform);
+        Assert.Equal(JsonSerializer.Serialize(name), IcebergJsonSerializer.Serialize(transform));
+    }
+
+    [Fact]
+    public void DecimalPrecision_IsAtMost38()
+    {
+        Assert.Equal(IcebergType.Decimal(38, 10),
+            IcebergJsonSerializer.Deserialize<IcebergType>("\"decimal(38, 10)\""));
+        Assert.Throws<JsonException>(() => IcebergJsonSerializer.Deserialize<IcebergType>("\"decimal(39, 2)\""));
+    }
+
     [Theory]
     [InlineData(4)]
     [InlineData(5)]
