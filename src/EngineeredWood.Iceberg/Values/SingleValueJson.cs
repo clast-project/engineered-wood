@@ -44,10 +44,12 @@ public static class SingleValueJson
     /// <param name="type">The value's Iceberg type.</param>
     /// <param name="json">The JSON value. A JSON null reads as <see cref="LiteralValue.Null"/>.</param>
     /// <returns>The value, in the kind <see cref="IcebergLiterals.KindOf"/> gives for the type.</returns>
-    /// <exception cref="FormatException">The JSON is not a value of the type.</exception>
-    /// <exception cref="NotSupportedException">The type is nested, or has no non-null single value
-    /// (<c>unknown</c>, <c>variant</c>; <c>geometry</c> and <c>geography</c>, whose WKT is not parsed), or the
-    /// value is outside what .NET's date types hold.</exception>
+    /// <exception cref="FormatException">The JSON is not a value of the type. That includes any non-null value
+    /// for <c>unknown</c> or <c>variant</c>: the spec gives them no single value but null, so one is malformed
+    /// metadata, not something EngineeredWood lacks.</exception>
+    /// <exception cref="NotSupportedException">EngineeredWood cannot represent the value: the type is nested
+    /// (validate it with <see cref="Validate"/> instead), it is <c>geometry</c> or <c>geography</c>, whose WKT is
+    /// not parsed, or the value is outside what .NET's date types hold.</exception>
     public static LiteralValue Parse(IcebergType type, JsonElement json)
     {
         if (json.ValueKind == JsonValueKind.Null)
@@ -133,8 +135,10 @@ public static class SingleValueJson
     public static void Validate(IcebergType type, JsonElement json) => ValidateAt(type, json, "$");
 
     /// <summary>Writes a value of a primitive type as a JSON single value. A null literal writes JSON null.</summary>
-    /// <exception cref="ArgumentException">The value is not one of the type's, or is a NaN or an infinity.</exception>
-    /// <exception cref="NotSupportedException">The type is nested, or has no non-null single value.</exception>
+    /// <exception cref="ArgumentException">The value is not one of the type's: a NaN or an infinity, or any non-null
+    /// value for <c>unknown</c> or <c>variant</c>, whose only single value is null.</exception>
+    /// <exception cref="NotSupportedException">The type is nested, or <c>geometry</c> or <c>geography</c>, whose
+    /// WKT is not written.</exception>
     public static void Write(Utf8JsonWriter writer, IcebergType type, LiteralValue value)
     {
 #if NET6_0_OR_GREATER
@@ -148,7 +152,10 @@ public static class SingleValueJson
             return;
         }
 
-        if (type is GeometryType or GeographyType or UnknownType or VariantType or NestedType)
+        if (type is UnknownType or VariantType)
+            throw new ArgumentException(
+                $"Iceberg type {IcebergLiterals.TypeName(type)} has no single value but null.", nameof(value));
+        if (type is GeometryType or GeographyType or NestedType)
             throw new NotSupportedException($"A non-null {IcebergLiterals.TypeName(type)} value cannot be written as a JSON single value.");
 
         var v = IcebergLiterals.Coerce(type, value);

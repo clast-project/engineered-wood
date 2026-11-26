@@ -33,7 +33,7 @@
     <None Update="Interop\iceberg-go\*.go;Interop\iceberg-go\go.mod;Interop\iceberg-go\go.sum" CopyToOutputDirectory="PreserveNewest" />
     <!-- Committed oracle vectors, read from the test output. The corpus is read in place (Corpus/IcebergCorpus.cs):
          copied under bin/, its deepest paths pass Windows' 260-character limit. -->
-    <None Include="TestData\**\*" Exclude="TestData\corpus\**" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="TestData\value-codecs\**\*;TestData\java-vectors\**\*" CopyToOutputDirectory="PreserveNewest" />
     <!-- Shared with the Delta and Parquet suites' tiers; see test/Shared/InteropDriver.cs. -->
     <Compile Include="..\Shared\InteropDriver.cs" Link="Interop\InteropDriver.cs" />
   </ItemGroup>
