@@ -126,7 +126,7 @@ real v3 tables. **P2** = needed to write v3. **P3** = row-level DML. **P4** = ma
 
 Work lands in reviewable PRs, roughly one per bullet. Phases overlap where noted.
 
-### Phase 0: make it safe and lossless (G1-G6)
+### Phase 0: make it safe and lossless (G1-G6), #953
 
 1. **Commit safety.**
    - `FileSystemCatalog` writes `vN+1.metadata.json` with `TryWriteAllBytesAsync`; losing the race throws
@@ -181,7 +181,7 @@ Work lands in reviewable PRs, roughly one per bullet. Phases overlap where noted
 **Exit:** EW reads the manifests of every corpus table losslessly. Committing an append to a Spark-written table
 leaves Spark reading identical rows and identical other metadata. Two concurrent EW committers never lose a commit.
 
-### Phase 1: a correct v1-v3 reader (G7-G11)
+### Phase 1: a correct v1-v3 reader (G7-G11), #954
 
 7. **Transforms.**
    - murmur3_x86_32 bucket with the per-type rules, checked against the Appendix B vectors.
@@ -210,7 +210,7 @@ leaves Spark reading identical rows and identical other metadata. Two concurrent
 **Exit:** every corpus table reads row-identical to Spark, including deletes, defaults, promotions, lineage
 columns and time travel. Pruning counts are reported and tested.
 
-### Phase 2: v2 + v3 writer and append (G12-G15)
+### Phase 2: v2 + v3 writer and append (G12-G15), #955
 
 12. **Data writer.**
     - Parquet with Iceberg field ids. Name the list element `element`, as Java does.
@@ -236,7 +236,7 @@ columns and time travel. Pruning counts are reported and tested.
 then commit on top of EW's commits, and EW on top of Spark's. Lineage invariants are checked by a validator
 test helper on every commit.
 
-### Phase 3: row-level DML (G16-G17)
+### Phase 3: row-level DML (G16-G17), #956
 
 16. **Puffin writer and DV writer.** One DV per data file. Merge in the existing DV and v2 position deletes, and
     remove the superseded entries. Many DVs can share one Puffin file. Blob properties are `referenced-data-file`
@@ -252,7 +252,7 @@ test helper on every commit.
 **Exit:** Spark reads identical rows and lineage after an EW DELETE, UPDATE or MERGE in both modes, and EW reads
 Spark's. A differential fuzz test runs random DML sequences, alternating engines.
 
-### Phase 4: maintenance and breadth (G18-G20)
+### Phase 4: maintenance and breadth (G18-G20), #957
 
 - Expire snapshots that are aware of delete and Puffin files, plus orphan-file removal.
 - Compaction that carries lineage and drops DVs it has applied.
@@ -261,7 +261,7 @@ Spark's. A differential fuzz test runs random DML sequences, alternating engines
 - Variant bounds.
 - ORC and Avro data files on read.
 
-### Phase 5: niche (G21-G24)
+### Phase 5: niche (G21-G24), #958
 
 - Geo needs Parquet GEOMETRY/GEOGRAPHY logical types and geospatial stats first, then the Iceberg mapping and bbox bounds.
 - Encryption needs a design document of its own; `doc/encryption-design.md` covers Parquet.
@@ -308,7 +308,18 @@ Items 1, 5 and 6 have no dependencies and can start in parallel.
    Spark-generated corpus; live Spark nightly. See item 6.
 6. **UniForm: yes.** It is scheduled after Phase 2 (above), and is the first second consumer of shared table code.
 
-Work is tracked on GitHub: one tracking issue per phase, one issue per numbered item, linked from here.
+Work is tracked on GitHub as one tracking issue per phase, each with a checklist. An item gets an issue of its
+own when work on it starts.
+
+| Phase | Issue |
+|---|---|
+| 0: safe and lossless, oracles | #953 (item 4 = #586) |
+| 1: correct v1-v3 reader | #954 |
+| 2: v2/v3 writer, append, REST | #955 |
+| 3: row-level DML | #956 |
+| 4: maintenance and breadth | #957 |
+| 5: niche v3 features | #958 |
+| UniForm | #490 (AMT: #497) |
 
 ## 6. Shared table-format code
 
