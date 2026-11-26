@@ -58,6 +58,56 @@ public class DecodedBoundsScanTests
 
     private static string[] Paths(ScanResult r) => r.DataFiles.Select(f => f.FilePath).ToArray();
 
+    /// <summary>
+    /// A truncated upper bound is stored already incremented: Iceberg Java 1.12 truncates <c>[00 FF]</c> to one byte
+    /// as lower <c>00</c>, upper <c>01</c> (and <c>abcdef</c> to three as <c>abc</c> / <c>abd</c>), and omits the
+    /// upper bound when no successor exists. So the bytes decode as a sound bound as they stand, and must not be
+    /// incremented again. Measured with <c>BinaryUtil.truncateBinaryMax</c> / <c>UnicodeUtil.truncateStringMax</c>
+    /// (review of #971).
+    /// </summary>
+    [Fact]
+    public void TruncatedUpperBounds_AsJavaWritesThem_DoNotPruneAMatch()
+    {
+        var schema = new Schema(0, [
+            new NestedField(1, "fx", IcebergType.Fixed(2), false),
+            new NestedField(2, "s", IcebergType.String, false),
+        ]);
+        var file = new DataFile
+        {
+            FilePath = "truncated.parquet",
+            RecordCount = 1,
+            FileSizeInBytes = 100,
+            NullValueCounts = new Dictionary<int, long> { [1] = 0, [2] = 0 },
+            ColumnLowerBounds = DecodeAll(schema, new() { [1] = "00", [2] = "616263" }), // 00, "abc"
+            ColumnUpperBounds = DecodeAll(schema, new() { [1] = "01", [2] = "616264" }), // 01, "abd"
+        };
+
+        ScanResult Plan(Predicate p) => new TableScan(TableMetadata.Create(schema, location: "memory://table"),
+            new LocalTableFileSystem(Path.GetTempPath())).Filter(p).PlanFiles([file]);
+
+        // The file holds fx = [00 FF] and s = "abcdef".
+        Assert.Single(Plan(Cmp("fx", ComparisonOperator.GreaterThan, LiteralValue.Of(new byte[] { 0x00 }))).DataFiles);
+        Assert.Single(Plan(Cmp("fx", ComparisonOperator.Equal, LiteralValue.Of(new byte[] { 0x00, 0xFF }))).DataFiles);
+        Assert.Single(Plan(Cmp("s", ComparisonOperator.GreaterThan, LiteralValue.Of("abc"))).DataFiles);
+        Assert.Single(Plan(Cmp("s", ComparisonOperator.Equal, LiteralValue.Of("abcdef"))).DataFiles);
+
+        // And the bounds still prune what is truly outside them.
+        Assert.Empty(Plan(Cmp("fx", ComparisonOperator.GreaterThan, LiteralValue.Of(new byte[] { 0x01 }))).DataFiles);
+        Assert.Empty(Plan(Cmp("s", ComparisonOperator.Equal, LiteralValue.Of("abz"))).DataFiles);
+    }
+
+    private static Dictionary<int, LiteralValue> DecodeAll(Schema schema, Dictionary<int, string> raw)
+    {
+        var bounds = new Dictionary<int, LiteralValue>();
+        foreach (var (id, hex) in raw)
+        {
+            Assert.True(SingleValueBinary.TryDecodeBound(schema.Fields.Single(f => f.Id == id).Type, FromHex(hex), out var b));
+            bounds[id] = b;
+        }
+
+        return bounds;
+    }
+
     [Fact]
     public void PromotedIntBounds_PruneALongPredicate()
     {
