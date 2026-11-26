@@ -374,6 +374,40 @@ public class CrossValidationTests
 
     // ─── Direction 2: EngineeredWood writes → fastavro reads ───
 
+    /// <summary>
+    /// The file's path reached fastavro spliced into a raw string literal, with a quote escaped as \' and the
+    /// backslash kept, so a path with an apostrophe named a file that is not there.
+    /// </summary>
+    [SkippableFact]
+    public void WriteEW_ReadFastavro_PathWithAnApostrophe()
+    {
+        Skip.If(!IsFastavroAvailable(), "fastavro is not installed.");
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Apache.Arrow.Types.Int32Type.Default, false))
+            .Build();
+        var batch = new RecordBatch(schema, [new Int32Array.Builder().Append(7).Build()], 1);
+
+        var tmpFile = Path.Combine(Path.GetTempPath(), $"ew_avro_o'brien_{Guid.NewGuid()}.avro");
+        try
+        {
+            using (var fs = File.Create(tmpFile))
+            using (var writer = new AvroWriterBuilder(schema).Build(fs))
+            {
+                writer.Write(batch);
+                writer.Finish();
+            }
+
+            var result = ReadWithFastavro(tmpFile);
+            Assert.Equal(1, result.GetProperty("num_rows").GetInt32());
+            Assert.Equal(7, result.GetProperty("rows")[0].GetProperty("id").GetInt32());
+        }
+        finally
+        {
+            File.Delete(tmpFile);
+        }
+    }
+
     [SkippableFact]
     public void WriteThenReadWithFastavro_Primitives()
     {
@@ -643,12 +677,14 @@ public class CrossValidationTests
 
     private static JsonElement ReadWithFastavro(string path)
     {
-        var escapedPath = path.Replace("\\", "\\\\").Replace("'", "\\'");
+        // The path goes to the script as an argument. Spliced into a raw string literal, a quote in it was
+        // escaped as \' and the backslash kept, so a path with an apostrophe named a different file.
         var script = """
 import fastavro
 import json
+import sys
 
-with open(r'__PATH__', 'rb') as f:
+with open(sys.argv[1], 'rb') as f:
     reader = fastavro.reader(f)
     rows = list(reader)
 
@@ -666,14 +702,14 @@ result = {
     "rows": [convert(r) for r in rows]
 }
 print(json.dumps(result))
-""".Replace("__PATH__", escapedPath);
+""";
 
         var scriptPath = Path.Combine(Path.GetTempPath(), $"ew_fastavro_{Guid.NewGuid()}.py");
         File.WriteAllText(scriptPath, script);
 
         try
         {
-            var result = RunPython($"\"{scriptPath}\"", 30_000);
+            var result = RunPython($"\"{scriptPath}\" \"{path}\"", 30_000);
             if (result.ExitCode != 0)
                 throw new Exception($"fastavro script failed (exit {result.ExitCode}): {result.Stderr}");
 

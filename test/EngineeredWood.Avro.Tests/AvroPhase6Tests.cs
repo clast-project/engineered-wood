@@ -648,14 +648,16 @@ public class AvroPhase6Tests
 
     private static JsonElement ReadWithFastavro(string path)
     {
-        var escapedPath = path.Replace("\\", "\\\\").Replace("'", "\\'");
+        // The path goes to the script as an argument. Spliced into a raw string literal, a quote in it was
+        // escaped as \' and the backslash kept, so a path with an apostrophe named a different file.
         var script = """
 import fastavro
 import json
 import decimal
+import sys
 import uuid
 
-with open(r'__PATH__', 'rb') as f:
+with open(sys.argv[1], 'rb') as f:
     reader = fastavro.reader(f)
     rows = list(reader)
 
@@ -677,14 +679,14 @@ result = {
     "rows": [convert(r) for r in rows]
 }
 print(json.dumps(result))
-""".Replace("__PATH__", escapedPath);
+""";
 
         var scriptPath = Path.Combine(Path.GetTempPath(), $"ew_fastavro_{Guid.NewGuid()}.py");
         File.WriteAllText(scriptPath, script);
 
         try
         {
-            var result = RunPython($"\"{scriptPath}\"", 30_000);
+            var result = RunPython($"\"{scriptPath}\" \"{path}\"", 30_000);
             if (result.ExitCode != 0)
                 throw new Exception($"fastavro script failed (exit {result.ExitCode}): {result.Stderr}");
 

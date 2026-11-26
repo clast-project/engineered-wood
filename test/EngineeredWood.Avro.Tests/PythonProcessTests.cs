@@ -35,7 +35,8 @@ public class PythonProcessTests
     public void AProcessThatOverruns_IsKilledAndReported()
     {
         Skip.If(Python.Value == null, "Python is not on the PATH.");
-        string pidFile = Path.Combine(Path.GetTempPath(), $"ew_python_pid_{Guid.NewGuid():N}.txt");
+        // An apostrophe in the path: spliced into the script's source, it ended the string literal.
+        string pidFile = Path.Combine(Path.GetTempPath(), $"ew_python_pid_o'brien_{Guid.NewGuid():N}.txt");
         int? pid = null;
         try
         {
@@ -43,7 +44,7 @@ public class PythonProcessTests
             // Long enough for the interpreter to start and write its id on a busy machine, far short of the sleep.
             Assert.Throws<TimeoutException>(() => PythonProcess.Run(
                 Python.Value!,
-                $"-c \"import os, time; open(r'{pidFile}', 'w').write(str(os.getpid())); time.sleep(120)\"",
+                $"-c \"import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(120)\" \"{pidFile}\"",
                 10_000));
             Assert.True(DateTime.UtcNow - started < TimeSpan.FromSeconds(60));
 
