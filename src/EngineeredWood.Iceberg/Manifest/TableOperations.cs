@@ -428,7 +428,7 @@ public sealed class TableOperations
             AddedRowsCount = files.Sum(f => f.RecordCount),
             ExistingRowsCount = 0,
             DeletedRowsCount = 0,
-            Partitions = PartitionSummaries.Build(options.ResolvePartitionType(entries), files, encodeBound: null),
+            Partitions = PartitionSummaries.Build(options.ResolvePartitionType(entries), files, ManifestValues.EncodeBound),
         };
     }
 

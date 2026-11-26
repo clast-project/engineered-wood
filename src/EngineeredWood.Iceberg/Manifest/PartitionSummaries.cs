@@ -13,8 +13,8 @@ namespace EngineeredWood.Iceberg.Manifest;
 /// The bounds are Appendix D single-value binary, written by the encoder the caller passes. A summary whose
 /// bound is null states that every value is null or NaN, and readers prune on that, so a bound must never be
 /// left out for want of an encoder: without one, or for a type this ordering does not cover, no summary is
-/// written at all (<c>partitions</c> null), which readers treat as "unknown". Until the Appendix D codec
-/// lands (#953 item 5) the table operations pass no encoder.
+/// written at all (<c>partitions</c> null), which readers treat as "unknown". The table operations pass
+/// <see cref="ManifestValues.EncodeBound"/>.
 /// </remarks>
 internal static class PartitionSummaries
 {

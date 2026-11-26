@@ -670,15 +670,22 @@ v1 to v3 (#586). It checks itself against iceberg-go in both directions:
 EW's reading of iceberg-go's manifests, and iceberg-go's reading of a
 manifest EW rewrote. Remaining gaps:
 
-- **Bounds stay raw.** `DataFile.LowerBounds`/`UpperBounds` hold the
-  Appendix D bytes, which are carried through a rewrite unchanged.
-  `ColumnLowerBounds`/`ColumnUpperBounds`, which scan planning prunes on,
-  are not filled from a manifest until the value codecs land (#953 item 5).
-- **No partition summaries yet.** A partitioned manifest EW writes gets
-  `partitions = null` in the manifest list, which readers treat as unknown:
-  they can't skip the manifest by partition, but they never skip it wrongly.
-  Summary bounds are Appendix D values too. Foreign summaries are carried
-  through unchanged.
+- **Bounds.** Reading a manifest through a snapshot decodes each column's
+  Appendix D bounds into `ColumnLowerBounds`/`ColumnUpperBounds` against
+  the current schema, and scan planning prunes on them. A bound written
+  before a type promotion is read by its length. A bound that can't be
+  used safely (NaN, an unknown type, a field the schema no longer has) is
+  left out, so the file is kept. UUID bounds are left out too: Iceberg
+  Java orders UUIDs by their signed 64-bit halves, and the planner
+  compares them differently, so using them could prune a matching file. The raw bytes stay in
+  `LowerBounds`/`UpperBounds` and are written back unchanged.
+- **Partition summaries.** A commit writes the manifest-list `partitions`
+  of a new manifest: whether any value is null or NaN, and the least and
+  greatest value. A UUID field gets no summary, because implementations
+  disagree on UUID order. Summaries are then left out for the whole
+  manifest (`partitions = null`, which readers treat as unknown), never
+  written with a bound missing. Foreign summaries are carried through
+  unchanged. Planning doesn't use summaries yet (Phase 1).
 - **Rewrites refuse what they can't keep.** A commit rewrites a manifest
   only if every field it holds is modelled. A manifest with a populated
   field this library doesn't know throws `NotSupportedException` instead

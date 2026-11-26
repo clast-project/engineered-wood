@@ -163,7 +163,7 @@ with schema fingerprints and a `SchemaStore`. Codecs: null, deflate, snappy, zst
 - **Iceberg:** parses table metadata (v1–v3) and plans scans with predicate pruning. It reads manifests
   from any writer and any format version by field id, and writes the spec's manifest schema for the
   table's version, with typed partition tuples. Both directions are checked against iceberg-go. Column
-  bounds stay raw bytes until the value codecs land, and partition transforms can't yet be applied to
+  bounds are decoded for pruning and partition summaries are written, but partition transforms can't yet be applied to
   values. **Do not use it to write tables other engines will read.** Table metadata round-trips without
   loss, including properties it doesn't model. It refuses (`UnsupportedTableFeatureException`)
   `format-version` 4 or later, and won't read or write the data of an encrypted table.
