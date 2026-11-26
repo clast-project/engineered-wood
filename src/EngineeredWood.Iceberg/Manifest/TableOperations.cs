@@ -360,13 +360,10 @@ public sealed class TableOperations
     private async ValueTask<IReadOnlyList<DataFile>> ListFilesByContentAsync(
         TableMetadata metadata, FileContent contentType, CancellationToken ct)
     {
-        var current = metadata.Snapshots.FirstOrDefault(s => s.SnapshotId == metadata.CurrentSnapshotId);
-        metadata.ThrowIfDataInaccessible(current);
-        if (metadata.CurrentSnapshotId is null)
+        var snapshot = metadata.CurrentSnapshotOrNull();
+        metadata.ThrowIfDataInaccessible(snapshot);
+        if (snapshot is null)
             return [];
-
-        var snapshot = metadata.Snapshots.First(
-            s => s.SnapshotId == metadata.CurrentSnapshotId);
 
         var manifestList = await ReadManifestListAsync(metadata, snapshot, ct).ConfigureAwait(false);
         var result = new List<DataFile>();

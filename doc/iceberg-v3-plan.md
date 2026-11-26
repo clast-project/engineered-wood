@@ -256,7 +256,9 @@ Spark's. A differential fuzz test runs random DML sequences, alternating engines
 
 ### Phase 4: maintenance and breadth (G18-G20), #957
 
-- Expire snapshots that are aware of delete and Puffin files, plus orphan-file removal.
+- Expire snapshots that are aware of delete and Puffin files, plus orphan-file removal. This includes
+  deleting the `statistics` and `partition-statistics` files of expired snapshots. Phase 0 (#969) already
+  drops their metadata entries, but leaves the files in place.
 - Compaction that carries lineage and drops DVs it has applied.
 - Rewrite manifests.
 - Write partition stats files (including `dv_count`), and keep table statistics.

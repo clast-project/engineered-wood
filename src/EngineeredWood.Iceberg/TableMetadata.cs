@@ -217,6 +217,20 @@ public sealed record TableMetadata : IJsonOnDeserialized
                 $"table encryption is not supported, so its data cannot be {verb}.");
     }
 
+    /// <summary>
+    /// The current snapshot, or <see langword="null"/> when the table has none. Throws
+    /// <see cref="InvalidDataException"/> when <see cref="CurrentSnapshotId"/> names a snapshot the metadata
+    /// does not hold: reading that as an empty table would silently drop every row.
+    /// </summary>
+    internal Snapshot? CurrentSnapshotOrNull()
+    {
+        if (CurrentSnapshotId is not { } id)
+            return null;
+        return Snapshots.FirstOrDefault(s => s.SnapshotId == id)
+            ?? throw new InvalidDataException(
+                $"Table {TableUuid}'s current-snapshot-id {id} names no snapshot in its metadata.");
+    }
+
     void IJsonOnDeserialized.OnDeserialized()
     {
         // "Implementations must throw an exception if a table's version is higher than the supported

@@ -209,4 +209,21 @@ public class TableOperationsTests : IDisposable
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(async () => await _ops.OverwriteFilesAsync(metadata, [], [file]));
         Assert.False(Directory.Exists(Path.Combine(_warehouse, "unknown_transform")));
     }
+
+    [Fact]
+    public async Task CurrentSnapshotIdNamingNoSnapshot_IsAnError_NotAnEmptyTable()
+    {
+        var metadata = await _ops.AppendFilesAsync(CreateTable(),
+            [new DataFile { FilePath = "data/a.parquet", RecordCount = 1, FileSizeInBytes = 1 }]);
+        var dangling = metadata with { Snapshots = [] };
+
+        await Assert.ThrowsAsync<InvalidDataException>(
+            async () => await new EngineeredWood.Iceberg.Expressions.TableScan(dangling, _fs).PlanFilesAsync());
+        Assert.Throws<InvalidDataException>(
+            () => new EngineeredWood.Iceberg.Expressions.TableScan(dangling, _fs).PlanFiles([]));
+        await Assert.ThrowsAsync<InvalidDataException>(async () => await _ops.ListDataFilesAsync(dangling));
+
+        // A table with no current snapshot is still empty.
+        Assert.Empty((await new EngineeredWood.Iceberg.Expressions.TableScan(CreateTable(), _fs).PlanFilesAsync()).DataFiles);
+    }
 }

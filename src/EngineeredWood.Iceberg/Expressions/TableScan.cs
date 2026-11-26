@@ -57,13 +57,10 @@ public sealed class TableScan
             ? TimeTravel.AtSnapshot(_metadata, _snapshotId.Value)
             : _metadata;
 
-        var current = effectiveMetadata.Snapshots.FirstOrDefault(s => s.SnapshotId == effectiveMetadata.CurrentSnapshotId);
-        effectiveMetadata.ThrowIfDataInaccessible(current);
-        if (current is null)
+        var snapshot = effectiveMetadata.CurrentSnapshotOrNull();
+        effectiveMetadata.ThrowIfDataInaccessible(snapshot);
+        if (snapshot is null)
             return new ScanResult([], [], 0, 0);
-
-        var snapshot = effectiveMetadata.Snapshots.First(
-            s => s.SnapshotId == effectiveMetadata.CurrentSnapshotId);
 
         var schema = effectiveMetadata.Schemas.First(
             s => s.SchemaId == effectiveMetadata.CurrentSchemaId);
@@ -116,8 +113,7 @@ public sealed class TableScan
     {
         // The files come from the caller, but planning them is still reading the table.
         var effective = _snapshotId is not null ? TimeTravel.AtSnapshot(_metadata, _snapshotId.Value) : _metadata;
-        effective.ThrowIfDataInaccessible(
-            effective.Snapshots.FirstOrDefault(s => s.SnapshotId == effective.CurrentSnapshotId));
+        effective.ThrowIfDataInaccessible(effective.CurrentSnapshotOrNull());
 
         var schema = _metadata.Schemas.First(
             s => s.SchemaId == _metadata.CurrentSchemaId);
