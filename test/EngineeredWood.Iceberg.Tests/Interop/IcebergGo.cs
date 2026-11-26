@@ -64,7 +64,25 @@ internal static class IcebergGo
     public static string Scenario(string warehouse, string scenario) =>
         Invoke("scenario", new { warehouse, scenario }).GetProperty("metadata_location").GetString()!;
 
+    /// <summary>
+    /// Locates or builds the driver and reads its version. Never throws: a failure of any kind becomes
+    /// an "unavailable" result carrying the reason, as the Python probe's does. The result is cached in
+    /// a <see cref="Lazy{T}"/>, which would cache an exception too, so one that escaped would make every
+    /// iceberg-go test error out, instead of skipping or reporting the require-env-var failure.
+    /// </summary>
     private static (string? Exe, string? Version, string? Error) Resolve()
+    {
+        try
+        {
+            return ResolveCore();
+        }
+        catch (Exception e)
+        {
+            return (null, null, $"probing the iceberg-go driver failed: {e.GetType().Name}: {e.Message}");
+        }
+    }
+
+    private static (string? Exe, string? Version, string? Error) ResolveCore()
     {
         string? exe = System.Environment.GetEnvironmentVariable(DriverOverrideEnvVar) is { Length: > 0 } ov
             ? ov
@@ -90,15 +108,25 @@ internal static class IcebergGo
         var (exit, stdout, stderr) = Run(exe, "version", null, 30_000);
         if (exit != 0)
             return (null, null, $"`{exe} version` failed (exit {exit}): {Tail(stdout + stderr)}");
+        JsonElement root;
         try
         {
-            string version = JsonDocument.Parse(stdout).RootElement.GetProperty("v").GetString()!;
-            return (exe, version, null);
+            root = JsonDocument.Parse(stdout).RootElement.Clone();
         }
         catch (JsonException e)
         {
-            return (null, null, $"`{exe} version` printed no version: {e.Message}: {Tail(stdout)}");
+            return (null, null, $"`{exe} version` did not print JSON ({e.Message}): {Tail(stdout)}");
         }
+
+        if (root.ValueKind != JsonValueKind.Object
+            || !root.TryGetProperty("v", out var v)
+            || v.ValueKind != JsonValueKind.String
+            || v.GetString() is not { Length: > 0 } version)
+        {
+            return (null, null, $"`{exe} version` printed no string \"v\" version: {Tail(stdout)}");
+        }
+
+        return (exe, version, null);
     }
 
     /// <summary>Runs a process to completion, returning its exit code and output; exit -1 when it cannot
