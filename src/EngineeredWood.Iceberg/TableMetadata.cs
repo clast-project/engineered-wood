@@ -1,14 +1,20 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
 namespace EngineeredWood.Iceberg;
 
 /// <summary>
 /// The immutable metadata for an Iceberg table at a specific version, including schemas,
 /// partition specs, sort orders, snapshots, and table properties.
 /// </summary>
-public sealed record TableMetadata
+public sealed record TableMetadata : IJsonOnDeserialized
 {
+    /// <summary>The newest table format version this library reads and writes.</summary>
+    public const int MaxSupportedFormatVersion = 3;
+
     /// <summary>Creates a new <see cref="TableMetadata"/> for an initial table with the given schema and optional configuration.</summary>
     /// <param name="schema">The initial table schema.</param>
     /// <param name="partitionSpec">The partition spec, or <see langword="null"/> for unpartitioned.</param>
@@ -25,7 +31,7 @@ public sealed record TableMetadata
         IReadOnlyDictionary<string, string>? properties = null,
         int formatVersion = 2)
     {
-        if (formatVersion is < 1 or > 3)
+        if (formatVersion is < 1 or > MaxSupportedFormatVersion)
             throw new ArgumentOutOfRangeException(nameof(formatVersion), "Format version must be 1, 2, or 3");
 
         var spec = partitionSpec ?? PartitionSpec.Unpartitioned;
@@ -142,4 +148,62 @@ public sealed record TableMetadata
 
     /// <summary>The next row ID to assign for row-level lineage tracking (v3 only).</summary>
     public long? NextRowId { get; init; }
+
+    /// <summary>Table-statistics (Puffin) files, or <see langword="null"/> when the metadata lists none.</summary>
+    public IReadOnlyList<StatisticsFile>? Statistics { get; init; }
+
+    /// <summary>Partition-statistics files, or <see langword="null"/> when the metadata lists none.</summary>
+    public IReadOnlyList<PartitionStatisticsFile>? PartitionStatistics { get; init; }
+
+    /// <summary>
+    /// The table's encryption keys (v3), or <see langword="null"/> when it has none. A table with any is
+    /// encrypted, and this library refuses to read or write its data.
+    /// </summary>
+    public IReadOnlyList<EncryptedKey>? EncryptionKeys { get; init; }
+
+    /// <summary>The table's stats-only fields (v3), or <see langword="null"/> when it has none.</summary>
+    public IReadOnlyList<StatsField>? StatsFields { get; init; }
+
+    /// <summary>
+    /// Top-level properties this library does not model, kept so that rewriting another engine's metadata
+    /// does not drop them. <see langword="null"/> when there are none.
+    /// </summary>
+    [JsonExtensionData, JsonInclude]
+    public IDictionary<string, JsonElement>? AdditionalProperties { get; internal set; }
+
+    /// <summary>
+    /// Whether the table is encrypted: it has <see cref="EncryptionKeys"/>, or a snapshot names a
+    /// <see cref="Snapshot.KeyId"/>.
+    /// </summary>
+    [JsonIgnore]
+    public bool IsEncrypted =>
+        EncryptionKeys is { Count: > 0 } || Snapshots.Any(s => s.KeyId is not null);
+
+    /// <summary>
+    /// Throws <see cref="UnsupportedTableFeatureException"/> when the table's data cannot be read or
+    /// written safely by this library: the table, or <paramref name="snapshot"/>, is encrypted. Reading an
+    /// encrypted manifest list as plaintext would misread it, and writing plaintext files into an encrypted
+    /// table would leave its data unprotected.
+    /// </summary>
+    internal void ThrowIfDataInaccessible(Snapshot? snapshot = null)
+    {
+        if (EncryptionKeys is { Count: > 0 })
+            throw new UnsupportedTableFeatureException(
+                $"Table {TableUuid} is encrypted (its metadata lists encryption-keys); " +
+                "table encryption is not supported, so its data cannot be read or written.");
+        if (snapshot?.KeyId is { } keyId)
+            throw new UnsupportedTableFeatureException(
+                $"Snapshot {snapshot.SnapshotId} of table {TableUuid} is encrypted (key-id '{keyId}'); " +
+                "table encryption is not supported, so its data cannot be read.");
+    }
+
+    void IJsonOnDeserialized.OnDeserialized()
+    {
+        // "Implementations must throw an exception if a table's version is higher than the supported
+        // version." Opening a newer table anyway would misread it, and a commit would corrupt it.
+        if (FormatVersion is < 1 or > MaxSupportedFormatVersion)
+            throw new UnsupportedTableFeatureException(
+                $"Table format-version {FormatVersion} is not supported; this library supports " +
+                $"format versions 1 to {MaxSupportedFormatVersion}.");
+    }
 }

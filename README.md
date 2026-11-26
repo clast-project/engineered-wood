@@ -164,7 +164,9 @@ with schema fingerprints and a `SchemaStore`. Codecs: null, deflate, snappy, zst
   pruning. It refuses (`NotSupportedException`) any manifest it didn't write itself rather than misreading
   it, so for now scans work only on tables EngineeredWood wrote. The manifests it writes lack bounds and
   partition tuples, and partition transforms can't yet be applied to values. **Do not use it to write
-  tables other engines will read.**
+  tables other engines will read.** Table metadata round-trips without loss, including properties it
+  doesn't model. It refuses (`UnsupportedTableFeatureException`) `format-version` 4 or later, and won't read
+  or write the data of an encrypted table.
 
 ## Usage
 

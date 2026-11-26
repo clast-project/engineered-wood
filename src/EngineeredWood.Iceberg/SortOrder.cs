@@ -3,6 +3,7 @@
 
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using EngineeredWood.Iceberg.Serialization;
 
 namespace EngineeredWood.Iceberg;
 
@@ -25,7 +26,21 @@ public sealed record SortOrder(int OrderId, IReadOnlyList<SortField> Fields)
 /// <param name="Transform">The transform applied to the source column before sorting.</param>
 /// <param name="Direction">The sort direction (ascending or descending).</param>
 /// <param name="NullOrder">Whether nulls sort before or after non-null values.</param>
-public sealed record SortField(int SourceId, Transform Transform, SortDirection Direction, NullOrder NullOrder);
+/// <param name="SourceIds">
+/// The source field ids of a multi-argument transform (v3 <c>source-ids</c>), or <see langword="null"/> for a
+/// single-argument one. When set, <paramref name="SourceId"/> is its first element.
+/// </param>
+[JsonConverter(typeof(SortFieldConverter))]
+public sealed record SortField(
+    int SourceId, Transform Transform, SortDirection Direction, NullOrder NullOrder,
+    IReadOnlyList<int>? SourceIds = null)
+{
+    /// <summary>
+    /// Sort-field properties this library does not model, kept so that rewriting another engine's metadata
+    /// does not drop them. <see langword="null"/> when there are none.
+    /// </summary>
+    public IDictionary<string, JsonElement>? AdditionalProperties { get; internal set; }
+}
 
 /// <summary>Specifies ascending or descending sort direction.</summary>
 [JsonConverter(typeof(SortDirectionConverter))]

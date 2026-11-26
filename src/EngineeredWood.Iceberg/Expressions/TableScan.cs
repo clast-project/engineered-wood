@@ -67,7 +67,7 @@ public sealed class TableScan
             s => s.SchemaId == effectiveMetadata.CurrentSchemaId);
         var (boundFilter, accessor) = BindFilter(_filter, schema);
 
-        var manifestList = await ManifestIO.ReadSnapshotManifestListAsync(_fs, snapshot, ct)
+        var manifestList = await ManifestIO.ReadSnapshotManifestListAsync(_fs, effectiveMetadata, snapshot, ct)
             .ConfigureAwait(false);
 
         var dataFiles = new List<DataFile>();

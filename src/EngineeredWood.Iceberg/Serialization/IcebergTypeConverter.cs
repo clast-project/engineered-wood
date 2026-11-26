@@ -1,8 +1,10 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
 namespace EngineeredWood.Iceberg.Serialization;
 
@@ -64,9 +66,12 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
             case BinaryType: writer.WriteStringValue("binary"); break;
             case UnknownType: writer.WriteStringValue("unknown"); break;
             case VariantType: writer.WriteStringValue("variant"); break;
+            // Canonical spellings, as Java writes them: a space after each comma.
             case GeometryType g: writer.WriteStringValue($"geometry({g.Crs})"); break;
-            case GeographyType g: writer.WriteStringValue($"geography({g.Crs},{g.Algorithm})"); break;
-            case DecimalType d: writer.WriteStringValue($"decimal({d.Precision},{d.Scale})"); break;
+            case GeographyType g: writer.WriteStringValue($"geography({g.Crs}, {g.Algorithm})"); break;
+            case DecimalType d: writer.WriteStringValue(
+                "decimal(" + d.Precision.ToString(CultureInfo.InvariantCulture) + ", " +
+                d.Scale.ToString(CultureInfo.InvariantCulture) + ")"); break;
             case FixedType f: writer.WriteStringValue($"fixed[{f.Length}]"); break;
             case StructType s: WriteStruct(writer, s, options); break;
             case ListType l: WriteList(writer, l, options); break;
@@ -75,38 +80,67 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
         }
     }
 
-    private static IcebergType ParsePrimitive(string typeString)
+    // Parameterized type strings. The spec's canonical forms put a space after each comma
+    // ("decimal(9, 2)", "geography(srid:4326, spherical)"), and readers must accept optional whitespace
+    // around parameters and separators. These are Java's own patterns (Types.java, 1.10 and main).
+    private static readonly Regex DecimalPattern =
+        new(@"^decimal\(\s*([0-9]+)\s*,\s*([0-9]+)\s*\)\z", RegexOptions.CultureInvariant);
+    private static readonly Regex FixedPattern =
+        new(@"^fixed\[\s*([0-9]+)\s*\]\z", RegexOptions.CultureInvariant);
+    private static readonly Regex GeometryPattern =
+        new(@"^geometry\s*(?:\(\s*([^)]*?)\s*\))?\z", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    private static readonly Regex GeographyPattern =
+        new(@"^geography\s*(?:\(\s*([^,]*?)\s*(?:,\s*(\w*)\s*)?\))?\z",
+            RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+
+    /// <summary>The CRS a geometry or geography type has when its type string names none.</summary>
+    internal const string DefaultCrs = "OGC:CRS84";
+
+    /// <summary>The edge algorithm a geography type has when its type string names none.</summary>
+    internal const string DefaultEdgeAlgorithm = "spherical";
+
+    internal static IcebergType ParsePrimitive(string typeString)
     {
-        if (typeString.StartsWith("decimal(", StringComparison.Ordinal))
+        var trimmed = typeString.Trim();
+
+        if (trimmed.StartsWith("decimal", StringComparison.Ordinal))
         {
-            var inner = typeString[8..^1];
-            var comma = inner.IndexOf(',');
-            var precision = int.Parse(inner[..comma]);
-            var scale = int.Parse(inner[(comma + 1)..].Trim());
-            return new DecimalType(precision, scale);
+            var m = DecimalPattern.Match(trimmed);
+            if (!m.Success)
+                throw new JsonException($"Invalid decimal type: {typeString}");
+            return new DecimalType(ParseInt(m.Groups[1].Value, typeString), ParseInt(m.Groups[2].Value, typeString));
         }
 
-        if (typeString.StartsWith("fixed[", StringComparison.Ordinal))
+        if (trimmed.StartsWith("fixed", StringComparison.Ordinal))
         {
-            var length = int.Parse(typeString[6..^1]);
-            return new FixedType(length);
+            var m = FixedPattern.Match(trimmed);
+            if (!m.Success)
+                throw new JsonException($"Invalid fixed type: {typeString}");
+            return new FixedType(ParseInt(m.Groups[1].Value, typeString));
         }
 
-        if (typeString.StartsWith("geometry(", StringComparison.Ordinal))
+        if (trimmed.StartsWith("geometry", StringComparison.OrdinalIgnoreCase))
         {
-            var crs = typeString[9..^1];
+            var m = GeometryPattern.Match(trimmed);
+            if (!m.Success)
+                throw new JsonException($"Invalid geometry type: {typeString}");
+            var crs = m.Groups[1].Success && m.Groups[1].Value.Length > 0 ? m.Groups[1].Value : DefaultCrs;
             return new GeometryType(crs);
         }
 
-        if (typeString.StartsWith("geography(", StringComparison.Ordinal))
+        if (trimmed.StartsWith("geography", StringComparison.OrdinalIgnoreCase))
         {
-            var inner = typeString[10..^1];
-            var comma = inner.IndexOf(',');
-            var crs = inner[..comma];
-            var algorithm = inner[(comma + 1)..].Trim();
+            var m = GeographyPattern.Match(trimmed);
+            if (!m.Success)
+                throw new JsonException($"Invalid geography type: {typeString}");
+            var crs = m.Groups[1].Success && m.Groups[1].Value.Length > 0 ? m.Groups[1].Value : DefaultCrs;
+            var algorithm = m.Groups[2].Success && m.Groups[2].Value.Length > 0
+                ? m.Groups[2].Value
+                : DefaultEdgeAlgorithm;
             return new GeographyType(crs, algorithm);
         }
 
+        typeString = trimmed;
         return typeString switch
         {
             "boolean" => IcebergType.Boolean,
@@ -128,6 +162,11 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
             _ => throw new JsonException($"Unknown primitive type: {typeString}")
         };
     }
+
+    private static int ParseInt(string digits, string typeString) =>
+        int.TryParse(digits, NumberStyles.None, CultureInfo.InvariantCulture, out var value)
+            ? value
+            : throw new JsonException($"Type parameter out of range: {typeString}");
 
     private static StructType ReadStruct(JsonElement element, JsonSerializerOptions options)
     {

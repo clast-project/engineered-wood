@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Text.Json;
+
 namespace EngineeredWood.Iceberg;
 
 /// <summary>
@@ -15,6 +17,12 @@ public sealed record Schema(
     IReadOnlyList<NestedField> Fields,
     IReadOnlyList<int>? IdentifierFieldIds = null)
 {
+    /// <summary>
+    /// Schema properties this library does not model, kept so that rewriting another engine's metadata does
+    /// not drop them. <see langword="null"/> when there are none.
+    /// </summary>
+    public IDictionary<string, JsonElement>? AdditionalProperties { get; internal set; }
+
     /// <summary>Returns the schema fields wrapped in a <see cref="StructType"/>.</summary>
     public StructType AsStruct() => new(Fields);
 }

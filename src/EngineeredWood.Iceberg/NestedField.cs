@@ -24,4 +24,12 @@ public sealed record NestedField(
     [property: JsonPropertyName("required")] bool IsRequired,
     string? Doc = null,
     [property: JsonPropertyName("initial-default")] JsonElement? InitialDefault = null,
-    [property: JsonPropertyName("write-default")] JsonElement? WriteDefault = null);
+    [property: JsonPropertyName("write-default")] JsonElement? WriteDefault = null)
+{
+    /// <summary>
+    /// Field properties this library does not model, kept so that rewriting another engine's metadata does
+    /// not drop them. <see langword="null"/> when there are none.
+    /// </summary>
+    [JsonExtensionData, JsonInclude]
+    public IDictionary<string, JsonElement>? AdditionalProperties { get; internal set; }
+}
