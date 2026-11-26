@@ -29,10 +29,13 @@ public sealed record CommitRetryOptions(
     /// </summary>
     public static CommitRetryOptions FromProperties(IReadOnlyDictionary<string, string> properties)
     {
+        // NumberStyles.None admits no sign, so a negative value falls back like any other unparseable one.
+        // Large values are clamped to int.MaxValue (about 24.8 days in milliseconds), which keeps every wait
+        // within what TimeSpan and Task.Delay accept.
         long? Read(string key) =>
             properties.TryGetValue(key, out var text) &&
             long.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var value)
-                ? value
+                ? Math.Min(value, int.MaxValue)
                 : null;
 
         var d = Default;
@@ -96,6 +99,9 @@ public static class CatalogCommitExtensions
                 // no attempt starts once TotalTimeout has passed.
                 var scaled = options.MinWait.TotalMilliseconds * Math.Pow(2, attempt);
                 var wait = Math.Min(scaled, options.MaxWait.TotalMilliseconds) * (0.9 + 0.2 * random.NextDouble());
+                // Options built directly (not FromProperties) may hold any TimeSpan: keep the wait to what
+                // Task.Delay accepts.
+                wait = Math.Max(0, Math.Min(wait, int.MaxValue));
                 // A wait cut short to the remaining budget ends at the deadline by construction; deciding that
                 // from the clock instead would let a timer that fires a fraction early start one more attempt.
                 var reachesDeadline = wait >= remaining.TotalMilliseconds;

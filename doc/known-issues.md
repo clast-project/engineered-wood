@@ -732,6 +732,21 @@ unreadable. Gaps:
 - A commit is checked against the base's metadata version and table UUID.
   A drop and re-create that lands between that check and the
   create-if-absent is not detected.
+- Drop and rename can't be made conditional on concurrent commits in the
+  Hadoop layout; only a tombstone version, which other Hadoop-catalog
+  readers would see as a broken table, could do that. So `FileSystemCatalog`
+  narrows the window:
+  - A drop deletes versions until a listing finds none, and gives up with
+    `CommitFailedException` after 5 rounds.
+  - A rename re-checks the source's version before and after removing it.
+    If a commit landed, the rename undoes its copy and fails, and the source
+    keeps its name.
+
+  A commit that publishes after the last check still re-creates a dropped
+  table at its version, or leaves a renamed table under both names. Iceberg
+  Java's Hadoop catalog doesn't guard drop either and has no rename. Use a
+  catalog with server-side commits (REST, planned in #955) when drops or
+  renames race with writers.
 - Only uncompressed `v<N>.metadata.json` is recognised, not
   `v<N>.gz.metadata.json`, and not the `<NNNNN>-<uuid>.metadata.json` names
   of catalogs that don't use the Hadoop layout.

@@ -262,7 +262,19 @@ public sealed class FileSystemCatalog : ICatalog
         if (!await TableExistsAsync(identifier, ct).ConfigureAwait(false))
             throw new NoSuchTableException(identifier);
 
-        await RemoveVersionsAsync(identifier, ct).ConfigureAwait(false);
+        // A commit can publish a new version while the old ones are being deleted, so delete until a listing
+        // finds none. That narrows the race but cannot close it: the Hadoop layout has no way to make the
+        // delete conditional, so a commit that publishes after the last listing re-creates the table at its
+        // version (see doc/known-issues.md, "Commits").
+        for (var round = 1; ; round++)
+        {
+            await RemoveVersionsAsync(identifier, ct).ConfigureAwait(false);
+            if ((await ListVersionsAsync(identifier, ct).ConfigureAwait(false)).Count == 0)
+                break;
+            if (round == MaxRemovalRounds)
+                throw new CommitFailedException(identifier,
+                    $"new versions kept being committed while the table was dropped ({round} rounds); it was not dropped.");
+        }
 
         var prefix = (purge ? TablePath(identifier) : MetadataDir(identifier)) + "/";
         var remaining = new List<string>();
@@ -284,13 +296,34 @@ public sealed class FileSystemCatalog : ICatalog
         // cleanly. Then only the source's version files and hint go: the renamed table's snapshots still
         // name the manifest lists and manifests under the source's metadata directory, and its data files
         // stay where they are. Nothing is moved.
+        var baseVersion = ParseBaseVersion(current);
         var renamed = current.Metadata with
         {
             Location = TablePath(to),
             MetadataLog = [],
         };
         await CreateAsync(to, renamed, ct).ConfigureAwait(false);
-        await RemoveVersionsAsync(from, ct).ConfigureAwait(false);
+
+        try
+        {
+            // A commit to the source after it was loaded would be lost by copying the loaded version, so
+            // undo the destination and fail instead. Checked before the source is touched...
+            if (await FindCurrentVersionAsync(from, ct).ConfigureAwait(false) != baseVersion)
+                throw new CommitFailedException(from, "the table changed while it was being renamed; it was not renamed.");
+
+            // ...and again after its versions up to the loaded one are gone: one published in between
+            // survives (it holds the complete metadata), so the source keeps its name at that version.
+            await RemoveVersionsAsync(from, ct, upTo: baseVersion).ConfigureAwait(false);
+            if ((await ListVersionsAsync(from, ct).ConfigureAwait(false)).Count > 0)
+                throw new CommitFailedException(from,
+                    "a commit landed while the table was being renamed; it keeps its old name at that commit.");
+        }
+        catch (CommitFailedException)
+        {
+            // Only the v1 this rename wrote: a version someone already committed on top of it is theirs.
+            await RemoveVersionsAsync(to, CancellationToken.None, upTo: 1).ConfigureAwait(false);
+            throw;
+        }
     }
 
     public async Task<bool> TableExistsAsync(
@@ -343,12 +376,19 @@ public sealed class FileSystemCatalog : ICatalog
     /// versions oldest first, so a removal that fails part way leaves the newest versions (which a reader
     /// would find) rather than resurrecting an older one.
     /// </summary>
-    private async ValueTask RemoveVersionsAsync(TableIdentifier identifier, CancellationToken ct)
+    private async ValueTask RemoveVersionsAsync(TableIdentifier identifier, CancellationToken ct, int? upTo = null)
     {
         await _fs.DeleteAsync(VersionHintPath(identifier), ct).ConfigureAwait(false);
-        foreach (var (_, path) in await ListVersionsAsync(identifier, ct).ConfigureAwait(false))
+        foreach (var (version, path) in await ListVersionsAsync(identifier, ct).ConfigureAwait(false))
+        {
+            if (upTo is { } last && version > last)
+                break;
             await _fs.DeleteAsync(path, ct).ConfigureAwait(false);
+        }
     }
+
+    /// <summary>How many times a drop deletes newly committed versions before giving up.</summary>
+    private const int MaxRemovalRounds = 5;
 
     private async ValueTask<Table> CreateAsync(
         TableIdentifier identifier, TableMetadata metadata, CancellationToken ct)

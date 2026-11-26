@@ -220,8 +220,11 @@ public sealed class InMemoryCatalog : ICatalog
             if (_tables.ContainsKey(to))
                 throw new TableAlreadyExistsException(to);
 
+            // The renamed table reports, and builds new files under, its new location, as FileSystemCatalog's does.
             _tables.Remove(from);
-            _tables[to] = (stored.Metadata, NextLocation(to));
+            _tables[to] = (
+                stored.Metadata with { Location = $"{_warehouseLocation}/{to.Namespace}/{to.Name}" },
+                NextLocation(to));
         }
 
         return Task.CompletedTask;

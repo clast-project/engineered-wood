@@ -552,6 +552,145 @@ public class CommitSafetyTests : IDisposable
         Assert.True(clock.Elapsed < TimeSpan.FromSeconds(5), $"took {clock.Elapsed}");
     }
 
+    // --- Review round 2: drop and rename racing a commit ---
+
+    /// <summary>Commits a property to the table through a separate catalog over the same files.</summary>
+    private async Task CommitElsewhereAsync(TableIdentifier id, string key, string value)
+    {
+        var other = new FileSystemCatalog(new LocalTableFileSystem(_warehouse));
+        var current = await other.LoadTableAsync(id);
+        await other.CommitTableAsync(current, WithProperty(current.Metadata, key, value));
+    }
+
+    [Fact]
+    public async Task Rename_FailsAndUndoesTheCopy_WhenTheSourceChangedAfterItWasLoaded()
+    {
+        var (_, id, _) = await CreateTableAsync();
+        var to = new TableIdentifier(_ns, "renamed");
+        var hooked = new HookedFileSystem(_fs)
+        {
+            // Just before the destination's v1 is written, another writer commits v2 to the source.
+            BeforeTryWrite = path => path == "db/renamed/metadata/v1.metadata.json"
+                ? CommitElsewhereAsync(id, "late", "commit")
+                : Task.CompletedTask,
+        };
+        var catalog = new FileSystemCatalog(hooked);
+
+        await Assert.ThrowsAsync<CommitFailedException>(() => catalog.RenameTableAsync(id, to));
+
+        Assert.False(await catalog.TableExistsAsync(to));
+        var source = await catalog.LoadTableAsync(id);
+        Assert.Equal("commit", source.Metadata.Properties["late"]);
+        Assert.EndsWith("/v2.metadata.json", source.MetadataLocation);
+    }
+
+    [Fact]
+    public async Task Rename_KeepsACommitThatLandsWhileTheSourceIsRemoved()
+    {
+        var (_, id, _) = await CreateTableAsync();
+        var to = new TableIdentifier(_ns, "renamed");
+        var hooked = new HookedFileSystem(_fs)
+        {
+            // After the version check, as the source's v1 is deleted, another writer commits v2.
+            BeforeDelete = path => path == "db/t/metadata/v1.metadata.json"
+                ? CommitElsewhereAsync(id, "late", "commit")
+                : Task.CompletedTask,
+        };
+        var catalog = new FileSystemCatalog(hooked);
+
+        await Assert.ThrowsAsync<CommitFailedException>(() => catalog.RenameTableAsync(id, to));
+
+        Assert.False(await catalog.TableExistsAsync(to));
+        Assert.Equal("commit", (await catalog.LoadTableAsync(id)).Metadata.Properties["late"]);
+    }
+
+    [Fact]
+    public async Task Drop_AlsoRemovesAVersionCommittedWhileDropping()
+    {
+        var (_, id, _) = await CreateTableAsync();
+        var once = 0;
+        var hooked = new HookedFileSystem(_fs)
+        {
+            BeforeDelete = path => path == "db/t/metadata/v1.metadata.json" && Interlocked.Exchange(ref once, 1) == 0
+                ? CommitElsewhereAsync(id, "late", "commit")
+                : Task.CompletedTask,
+        };
+        var catalog = new FileSystemCatalog(hooked);
+
+        await catalog.DropTableAsync(id);
+
+        Assert.False(await catalog.TableExistsAsync(id));
+        Assert.Empty(Directory.EnumerateFiles(MetadataDir));
+    }
+
+    [Fact]
+    public async Task InMemory_RenameMovesTheLocation()
+    {
+        var catalog = new InMemoryCatalog("memory://wh");
+        await catalog.CreateNamespaceAsync(_ns);
+        var id = new TableIdentifier(_ns, "t");
+        await catalog.CreateTableAsync(id, _schema);
+        var to = new TableIdentifier(_ns, "renamed");
+
+        await catalog.RenameTableAsync(id, to);
+
+        Assert.Equal("memory://wh/db/renamed", (await catalog.LoadTableAsync(to)).Location);
+    }
+
+    [Fact]
+    public void RetryProperties_NegativeFallsBackAndHugeIsClamped()
+    {
+        var options = CommitRetryOptions.FromProperties(new Dictionary<string, string>
+        {
+            ["commit.retry.min-wait-ms"] = "-1",
+            ["commit.retry.max-wait-ms"] = "99999999999999999",
+            ["commit.retry.total-timeout-ms"] = "+5",
+        });
+
+        Assert.Equal(CommitRetryOptions.Default.MinWait, options.MinWait);
+        Assert.Equal(TimeSpan.FromMilliseconds(int.MaxValue), options.MaxWait);
+        Assert.Equal(CommitRetryOptions.Default.TotalTimeout, options.TotalTimeout);
+    }
+
+    /// <summary>Runs a hook before selected writes and deletes, to interleave another writer.</summary>
+    private sealed class HookedFileSystem(EngineeredWood.IO.ITableFileSystem inner) : EngineeredWood.IO.ITableFileSystem
+    {
+        public Func<string, Task> BeforeTryWrite { get; init; } = _ => Task.CompletedTask;
+        public Func<string, Task> BeforeDelete { get; init; } = _ => Task.CompletedTask;
+
+        public EngineeredWood.IO.PathNameConstraints PathConstraints => inner.PathConstraints;
+
+        public IAsyncEnumerable<EngineeredWood.IO.TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default) =>
+            inner.ListAsync(prefix, cancellationToken);
+
+        public ValueTask<EngineeredWood.IO.IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default) =>
+            inner.OpenReadAsync(path, cancellationToken);
+
+        public ValueTask<EngineeredWood.IO.ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default) =>
+            inner.CreateAsync(path, overwrite, cancellationToken);
+
+        public async ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
+        {
+            await BeforeDelete(path);
+            await inner.DeleteAsync(path, cancellationToken);
+        }
+
+        public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default) =>
+            inner.ExistsAsync(path, cancellationToken);
+
+        public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default) =>
+            inner.ReadAllBytesAsync(path, cancellationToken);
+
+        public async ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+        {
+            await BeforeTryWrite(path);
+            return await inner.TryWriteAllBytesAsync(path, data, cancellationToken);
+        }
+
+        public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
+            inner.WriteAllBytesAsync(path, data, cancellationToken);
+    }
+
     /// <summary>Throws <see cref="OperationCanceledException"/> from every version-hint write.</summary>
     private sealed class HintWriteCancelledFileSystem(EngineeredWood.IO.ITableFileSystem inner)
         : EngineeredWood.IO.ITableFileSystem
