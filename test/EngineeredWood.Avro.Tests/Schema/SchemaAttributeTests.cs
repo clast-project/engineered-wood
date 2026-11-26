@@ -123,6 +123,28 @@ public class SchemaAttributeTests
         Assert.Equal(Canonical(json), Canonical(written));
     }
 
+    [Theory]
+    [InlineData("""{"type": "string", "precision": "custom", "scale": 3}""")]
+    [InlineData("""{"type": "long", "logicalType": "timestamp-micros", "precision": 6}""")]
+    [InlineData("""{"type": "fixed", "name": "F", "size": 8, "precision": 1, "scale": {"x": 1}}""")]
+    public void PrecisionAndScale_OnANonDecimal_AreExtraAttributes(string type)
+    {
+        var json = $$"""{"type": "record", "name": "R", "fields": [{"name": "a", "type": {{type}}}]}""";
+        var written = AvroSchemaWriter.ToJson(AvroSchemaParser.Parse(json));
+        Assert.Equal(Canonical(json), Canonical(written));
+    }
+
+    [Fact]
+    public void InvalidDecimal_StillFallsBackToItsUnderlyingType()
+    {
+        // Scale above precision: the annotation is ignored, and the decimal's own attributes go with it.
+        var root = (AvroRecordSchema)AvroSchemaParser.Parse(
+            """{"type": "record", "name": "R", "fields": [{"name": "a", "type": {"type": "bytes", "logicalType": "decimal", "precision": 2, "scale": 5}}]}""");
+        var bytes = (AvroPrimitiveSchema)root.Fields[0].Schema;
+        Assert.Null(bytes.LogicalType);
+        Assert.Empty(bytes.Properties);
+    }
+
     [Fact]
     public void Fingerprint_IgnoresExtraAttributes()
     {

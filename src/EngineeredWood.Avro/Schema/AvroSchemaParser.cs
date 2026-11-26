@@ -284,10 +284,11 @@ internal static class AvroSchemaParser
         bytes < 1 ? 0 : (int)Math.Floor((8.0 * bytes - 1) * Math.Log10(2));
 
     // The attributes the Avro specification defines for each kind of schema object. Everything else is an
-    // extra attribute, kept in Properties. A decimal's precision and scale are defined attributes even when
-    // the annotation turns out to be invalid and is ignored.
+    // extra attribute, kept in Properties. A decimal's precision and scale are defined attributes only on a
+    // decimal (even one whose annotation turns out to be invalid and is ignored); on any other schema they
+    // are extra attributes like the rest.
     private static readonly HashSet<string> PrimitiveAttributes =
-        new(StringComparer.Ordinal) { "type", "logicalType", "precision", "scale" };
+        new(StringComparer.Ordinal) { "type", "logicalType" };
     private static readonly HashSet<string> RecordAttributes =
         new(StringComparer.Ordinal) { "type", "name", "namespace", "doc", "aliases", "fields" };
     private static readonly HashSet<string> FieldAttributes =
@@ -299,14 +300,18 @@ internal static class AvroSchemaParser
     private static readonly HashSet<string> MapAttributes =
         new(StringComparer.Ordinal) { "type", "values", "logicalType" };
     private static readonly HashSet<string> FixedAttributes =
-        new(StringComparer.Ordinal) { "type", "name", "namespace", "size", "aliases", "logicalType", "precision", "scale" };
+        new(StringComparer.Ordinal) { "type", "name", "namespace", "size", "aliases", "logicalType" };
 
     private static IReadOnlyDictionary<string, JsonElement> ExtraProperties(JsonElement obj, HashSet<string> defined)
     {
         Dictionary<string, JsonElement>? extra = null;
+        bool isDecimal = obj.TryGetProperty("logicalType", out var lt)
+            && lt.ValueKind == JsonValueKind.String && lt.GetString() == "decimal";
         foreach (var property in obj.EnumerateObject())
         {
             if (defined.Contains(property.Name))
+                continue;
+            if (isDecimal && property.Name is "precision" or "scale")
                 continue;
             extra ??= new Dictionary<string, JsonElement>(StringComparer.Ordinal);
             // Clone: the element must outlive the JsonDocument it was parsed from.
