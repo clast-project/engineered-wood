@@ -827,7 +827,9 @@ public class RestoreTests : IDisposable
     [InlineData(false)]
     public async Task Restore_ToAVersionWhoseAbsoluteDeletionVectorIsGone_IsRefused(bool registered)
     {
-        string dvLocation = Fs.Location.Combine("elsewhere/absolute_dv.bin").ToString();
+        // Outside the table, so only a registered location reaches it (one inside would be the table's own).
+        var elsewhere = new LocalTableFileSystem(_tempDir + "_elsewhere");
+        string dvLocation = elsewhere.Location.Combine("absolute_dv.bin").ToString();
         var dv = new DeletionVector
         {
             StorageType = "p",
@@ -863,7 +865,7 @@ public class RestoreTests : IDisposable
             DeletionVector = dv,
         });
         await using var table = await DeltaTable.OpenAsync(Fs,
-            registered ? new DeltaTableOptions { StorageResolver = new StorageResolver().Register(Fs) } : DeltaTableOptions.Default);
+            registered ? new DeltaTableOptions { StorageResolver = new StorageResolver().Register(elsewhere) } : DeltaTableOptions.Default);
 
         if (!registered)
         {

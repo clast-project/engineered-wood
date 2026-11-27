@@ -386,11 +386,12 @@ public sealed partial class DeltaTable
     {
         // (file system, path, the name the refusal reports)
         var paths = new List<(ITableFileSystem Fs, string Path, string Name)>(files.Count);
-        var resolver = _options.StorageResolver ?? new StorageResolver();
         foreach (var file in files)
         {
-            string decoded = DeltaPath.Decode(file.Path);
-            paths.Add((_fs, decoded, decoded));
+            // Each file is checked where it is read from: an absolute one outside the table through the resolver,
+            // which refuses a location nothing is registered for rather than report it missing.
+            var data = _locator.Resolve(file.Path);
+            paths.Add((data.FileSystem, data.Path, DeltaFileLocator.IsAbsolute(file.Path) ? file.Path : data.Path));
             if (file.DeletionVector is not { } dv)
                 continue;
             if (DeletionVectorPath.GetRelativePath(dv) is { } dvPath)
@@ -399,9 +400,7 @@ public sealed partial class DeltaTable
             }
             else if (DeletionVectorPath.IsAbsolute(dv))
             {
-                // An absolute-path vector is checked where it is read from: through the resolver, which refuses a
-                // location nothing is registered for rather than report it missing.
-                var resolved = resolver.Resolve(DeletionVectorPath.AbsoluteLocation(dv));
+                var resolved = _locator.Resolve(DeletionVectorPath.AbsoluteLocation(dv));
                 paths.Add((resolved.FileSystem, resolved.Path, dv.PathOrInlineDv));
             }
         }

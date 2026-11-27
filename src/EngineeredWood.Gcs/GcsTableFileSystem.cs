@@ -28,7 +28,7 @@ namespace EngineeredWood.IO.Gcs;
 /// not at all.
 /// </para>
 /// </remarks>
-public sealed class GcsTableFileSystem : ITableFileSystem, IReadConcurrencyHint
+public sealed class GcsTableFileSystem : ITableFileSystem, IReadConcurrencyHint, ILocatedFileSystem
 {
     private readonly StorageClient _client;
     private readonly string _bucket;

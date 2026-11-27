@@ -104,6 +104,8 @@ internal static class CdfReader
 
         // Stateless over the file system — one instance serves every action in the range.
         var dvReader = new DeletionVectorReader(fs, resolver);
+        // An add, remove or cdc path may be an absolute location, inside the table or not.
+        var files = new DeltaFileLocator(fs, resolver);
 
         // The units come from ONE enumeration, in order. It reads the commits ahead of itself, and under
         // OrderedScan those reads overlap the files already dispatched. Every other request is made by a file's
@@ -111,10 +113,10 @@ internal static class CdfReader
         var units = UnitsAsync(log, versions, Math.Max(1, maxConcurrentReads), dvReader, cancellationToken);
 
         IAsyncEnumerable<RecordBatch> batches = maxConcurrentReads <= 1
-            ? SeriallyAsync(fs, units, readOptions, ctx, dvReader, cancellationToken)
+            ? SeriallyAsync(files, units, readOptions, ctx, dvReader, cancellationToken)
             : OrderedScan.RunAsync(
                 units,
-                (unit, reservation, ct) => ReadUnitAsync(fs, unit, readOptions, ctx, dvReader, reservation, ct),
+                (unit, reservation, ct) => ReadUnitAsync(files, unit, readOptions, ctx, dvReader, reservation, ct),
                 static b => RollingDataFileWriter.EstimatedBytes(b),
                 static b => b.Dispose(),
                 maxConcurrentReads,
@@ -328,7 +330,7 @@ internal static class CdfReader
     }
 
     private static async IAsyncEnumerable<RecordBatch> SeriallyAsync(
-        ITableFileSystem fs,
+        DeltaFileLocator files,
         IAsyncEnumerable<CdfUnit> units,
         ParquetReadOptions? readOptions,
         CdfSchemaContext ctx,
@@ -338,7 +340,7 @@ internal static class CdfReader
         await foreach (var unit in units.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
             await foreach (var batch in ReadUnitAsync(
-                fs, unit, readOptions, ctx, dvReader, ScanReservation.None, cancellationToken).ConfigureAwait(false))
+                files, unit, readOptions, ctx, dvReader, ScanReservation.None, cancellationToken).ConfigureAwait(false))
             {
                 yield return batch;
             }
@@ -346,7 +348,7 @@ internal static class CdfReader
     }
 
     private static IAsyncEnumerable<RecordBatch> ReadUnitAsync(
-        ITableFileSystem fs,
+        DeltaFileLocator files,
         CdfUnit unit,
         ParquetReadOptions? readOptions,
         CdfSchemaContext ctx,
@@ -354,8 +356,8 @@ internal static class CdfReader
         ScanReservation reservation,
         CancellationToken cancellationToken) =>
         unit.IsChangeFile
-            ? ReadCdcFileAsync(fs, unit, readOptions, ctx, reservation, cancellationToken)
-            : ReadDataFileAsChangesAsync(fs, unit, readOptions, ctx, dvReader, reservation, cancellationToken);
+            ? ReadCdcFileAsync(files, unit, readOptions, ctx, reservation, cancellationToken)
+            : ReadDataFileAsChangesAsync(files, unit, readOptions, ctx, dvReader, reservation, cancellationToken);
 
     /// <summary>
     /// Opens <paramref name="diskPath"/> and reads its footer, which is where a missing file shows up. The size
@@ -456,7 +458,7 @@ internal static class CdfReader
     }
 
     private static async IAsyncEnumerable<RecordBatch> ReadCdcFileAsync(
-        ITableFileSystem fs,
+        DeltaFileLocator files,
         CdfUnit unit,
         ParquetReadOptions? readOptions,
         CdfSchemaContext ctx,
@@ -467,8 +469,9 @@ internal static class CdfReader
         long? commitTimestamp = unit.CommitTimestamp;
 
         // A missing change file is an error, as it was before.
+        var located = files.Resolve(unit.Path);
         await using var opened = (await OpenAsync(
-            fs, EngineeredWood.DeltaLake.DeltaPath.Decode(unit.Path), unit.Size, readOptions,
+            located.FileSystem, located.Path, unit.Size, readOptions,
             missingMeansVacuumed: false, cancellationToken).ConfigureAwait(false))!;
         var reader = opened.Reader;
         // Widened byte/short columns read as their stored INT32 (#839), before the first read.
@@ -742,7 +745,7 @@ internal static class CdfReader
     }
 
     private static async IAsyncEnumerable<RecordBatch> ReadDataFileAsChangesAsync(
-        ITableFileSystem fs,
+        DeltaFileLocator files,
         CdfUnit unit,
         ParquetReadOptions? readOptions,
         CdfSchemaContext ctx,
@@ -757,8 +760,10 @@ internal static class CdfReader
         long? baseRowId = unit.BaseRowId;
         long? defaultRowCommitVersion = unit.DefaultRowCommitVersion;
 
-        // path is an add.path (URL-encoded on-disk relative path) — decode to the on-disk name.
-        string diskPath = EngineeredWood.DeltaLake.DeltaPath.Decode(unit.Path);
+        // path is an add.path: URL-encoded, relative to the table root or an absolute location.
+        var located = files.Resolve(unit.Path);
+        var fs = located.FileSystem;
+        string diskPath = located.Path;
 
         // A vector edit's side first: when it changed no rows (an ordinary vector DELETE un-deletes none), the
         // file is never opened. Its vectors failing to read may mean VACUUM removed them with the file; only

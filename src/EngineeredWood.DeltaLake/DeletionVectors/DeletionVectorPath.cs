@@ -50,7 +50,7 @@ internal static class DeletionVectorPath
     public static StorageLocation AbsoluteLocation(DeletionVector dv)
     {
         string text = dv.PathOrInlineDv;
-        if (!HasUriScheme(text))
+        if (!DeltaFileLocator.HasUriScheme(text))
             throw new DeltaFormatException(
                 DeltaErrorCodes.InvalidDeletionVector,
                 $"Deletion vector storage type 'p' must hold an absolute URI, but it holds '{text}'.");
@@ -65,25 +65,6 @@ internal static class DeletionVectorPath
                 $"Deletion vector path '{text}' is not a valid absolute location: {ex.Message}", ex);
         }
     }
-
-    /// <summary>True when <paramref name="text"/> starts with a URI scheme (RFC 3986: a letter, then letters,
-    /// digits, <c>+</c>, <c>-</c> or <c>.</c>, then <c>:</c>). A single letter is a Windows drive, not a scheme.</summary>
-    private static bool HasUriScheme(string text)
-    {
-        int colon = text.IndexOf(':');
-        if (colon < 2 || !IsAsciiLetter(text[0]))
-            return false;
-        for (int i = 1; i < colon; i++)
-        {
-            char c = text[i];
-            if (!(IsAsciiLetter(c) || c is >= '0' and <= '9' || c is '+' or '-' or '.'))
-                return false;
-        }
-
-        return true;
-    }
-
-    private static bool IsAsciiLetter(char c) => c is >= 'a' and <= 'z' or >= 'A' and <= 'Z';
 
     /// <summary>
     /// Spec: <c>pathOrInlineDv = "&lt;random prefix (optional)&gt;&lt;z85-encoded uuid&gt;"</c> (the uuid is

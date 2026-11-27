@@ -236,7 +236,9 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         return prefix._segments.Length;
     }
 
-    private StringComparison SegmentComparison =>
+    /// <summary>How this location's path segments compare: case-insensitively for a <c>file</c> location on Windows,
+    /// as its file system compares names, and ordinally everywhere else.</summary>
+    internal StringComparison SegmentComparison =>
         IsFile && IsWindows ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
 
     private bool AuthorityEquals(StorageLocation other) =>

@@ -75,7 +75,8 @@ internal static class CompactionExecutor
         WrittenFileLedger? written = null,
         int maxConcurrentReads = 1,
         long maxBufferedReadBytes = long.MaxValue,
-        EngineeredWood.Memory.MemoryBudget? memoryBudget = null)
+        EngineeredWood.Memory.MemoryBudget? memoryBudget = null,
+        StorageResolver? resolver = null)
     {
         // Select small files as compaction candidates and group them BY PARTITION: a data file belongs to
         // exactly ONE partition (its add.partitionValues), so each group must compact independently. Mixing
@@ -123,7 +124,10 @@ internal static class CompactionExecutor
         // "reconciled" to all-NULL children and every nested value in the compacted file was lost.
         var targetSchema = SchemaConverter.ToArrowSchema(ColumnMapping.ToPhysicalSchema(tableSchema, mappingMode));
 
-        var dvReader = new DeletionVectors.DeletionVectorReader(fs);
+        var dvReader = new DeletionVectors.DeletionVectorReader(fs, resolver);
+        // A source's add.path may be an absolute location, inside the table or not; the compacted file is written
+        // under the table either way.
+        var files = new DeltaFileLocator(fs, resolver);
         var actions = new List<DeltaAction>();
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         bool assignRowIds = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
@@ -142,7 +146,7 @@ internal static class CompactionExecutor
         foreach (var group in groups)
         {
             (bool compacted, nextRowId) = await CompactGroupAsync(
-                fs, snapshot, options, parquetOptions, parquetReadOptions, group, targetSchema, mappingMode,
+                files, snapshot, options, parquetOptions, parquetReadOptions, group, targetSchema, mappingMode,
                 dvReader, actions, now, assignRowIds, nextRowId, materialize, matRowIdName, matRowVerName,
                 dataFileWriter, dataFileReader, cancellationToken, written, statsSelection,
                 maxConcurrentReads, maxBufferedReadBytes, memoryBudget).ConfigureAwait(false);
@@ -187,7 +191,7 @@ internal static class CompactionExecutor
     /// writer has not taken yet, as a table scan does; with 1, one after another.
     /// </summary>
     private static IAsyncEnumerable<SourceBatch> ReadGroupAsync(
-        ITableFileSystem fs,
+        DeltaFileLocator files,
         IReadOnlyList<AddFile> group,
         DeletionVectors.DeletionVectorReader dvReader,
         ParquetReadOptions parquetReadOptions,
@@ -200,12 +204,12 @@ internal static class CompactionExecutor
         CancellationToken cancellationToken)
     {
         if (maxConcurrentReads <= 1 || group.Count == 1)
-            return SeriallyAsync(fs, group, dvReader, parquetReadOptions, dataFileReader, snapshot, mappingMode, cancellationToken);
+            return SeriallyAsync(files, group, dvReader, parquetReadOptions, dataFileReader, snapshot, mappingMode, cancellationToken);
 
         return OrderedScan.RunAsync(
             UnitsAsync(group),
             (addFile, reservation, ct) => ReadSourceAsync(
-                fs, addFile, dvReader, parquetReadOptions, dataFileReader, snapshot, mappingMode, reservation, ct),
+                files, addFile, dvReader, parquetReadOptions, dataFileReader, snapshot, mappingMode, reservation, ct),
             static b => RollingDataFileWriter.EstimatedBytes(b.Batch),
             static b => b.Batch.Dispose(),
             maxConcurrentReads,
@@ -214,7 +218,7 @@ internal static class CompactionExecutor
     }
 
     private static async IAsyncEnumerable<SourceBatch> SeriallyAsync(
-        ITableFileSystem fs,
+        DeltaFileLocator files,
         IReadOnlyList<AddFile> group,
         DeletionVectors.DeletionVectorReader dvReader,
         ParquetReadOptions parquetReadOptions,
@@ -226,7 +230,7 @@ internal static class CompactionExecutor
         foreach (var addFile in group)
         {
             await foreach (var batch in ReadSourceAsync(
-                               fs, addFile, dvReader, parquetReadOptions, dataFileReader, snapshot, mappingMode,
+                               files, addFile, dvReader, parquetReadOptions, dataFileReader, snapshot, mappingMode,
                                ScanReservation.None,
                                cancellationToken).ConfigureAwait(false))
             {
@@ -250,7 +254,7 @@ internal static class CompactionExecutor
     /// them all), and each later one what the batch before it measured, as a scan's file does.
     /// </summary>
     private static async IAsyncEnumerable<SourceBatch> ReadSourceAsync(
-        ITableFileSystem fs,
+        DeltaFileLocator files,
         AddFile addFile,
         DeletionVectors.DeletionVectorReader dvReader,
         ParquetReadOptions parquetReadOptions,
@@ -275,19 +279,21 @@ internal static class CompactionExecutor
             {
                 rawBatches = DeltaTable.Reserving(
                     InFileOrder(dataFileReader.ReadAsync(
-                        EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), null, cancellationToken), cancellationToken),
+                        files.ResolveInTable(addFile.Path, nameof(DeltaTableOptions.DataFileReader)), null,
+                        cancellationToken), cancellationToken),
                     reservation, cancellationToken);
             }
             else
             {
                 // The size from the action: no HEAD before the footer (#722).
+                var located = files.Resolve(addFile.Path);
                 file = await KnownLengthRandomAccessFile.OpenAsync(
-                        fs, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), addFile.Size, cancellationToken)
+                        located.FileSystem, located.Path, addFile.Size, cancellationToken)
                     .ConfigureAwait(false);
                 reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
                 // The footer first, so that a size the log records wrongly says so (the reader caches it).
                 _ = await DataFileFooter.ReadAsync(
-                        reader, file, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
+                        reader, file, located.Path, cancellationToken)
                     .ConfigureAwait(false);
                 // Widened byte/short columns read as their stored INT32 (#839), before the first read, and before
                 // the estimate, which sizes each column by the type the read gives it (#849 review).
@@ -345,7 +351,7 @@ internal static class CompactionExecutor
     }
 
     private static async ValueTask<(bool Compacted, long NextRowId)> CompactGroupAsync(
-        ITableFileSystem fs,
+        DeltaFileLocator files,
         DeltaSnapshot snapshot,
         CompactionOptions options,
         ParquetWriteOptions parquetOptions,
@@ -374,10 +380,19 @@ internal static class CompactionExecutor
         // sources' directory. The add keeps the ENCODED prefix (reused verbatim from a source path, so it
         // is never double-encoded); the physical write path is the decoded form. Empty for an
         // unpartitioned table (files at the table root).
+        // A source outside the table (a shallow clone's) has no directory here: the first source that does gives it,
+        // and a group with none is written at the table root, never beside another table's files. The partition
+        // values, not the directory, are what every reader takes the partition from.
+        var fs = files.Table;
         string encodedDir = "";
-        int dirSlash = group[0].Path.LastIndexOf('/');
-        if (dirSlash >= 0)
-            encodedDir = group[0].Path.Substring(0, dirSlash + 1);
+        foreach (var source in group)
+        {
+            if (files.EncodedDirectoryForRewrite(source.Path) is { } sourceDir)
+            {
+                encodedDir = sourceDir;
+                break;
+            }
+        }
         string physicalDir = EngineeredWood.DeltaLake.DeltaPath.Decode(encodedDir).TrimEnd('/');
 
         // IcebergCompat stores the partition values in the data file too. The sources' copies are dropped with the
@@ -405,7 +420,7 @@ internal static class CompactionExecutor
             // maxConcurrentReads ahead (each open, deletion vector and decode is round trips against an object
             // store), but their batches arrive here in group order, so what is written is what a serial read wrote.
             await foreach (var source in ReadGroupAsync(
-                               fs, group, dvReader, parquetReadOptions, dataFileReader, snapshot, mappingMode,
+                               files, group, dvReader, parquetReadOptions, dataFileReader, snapshot, mappingMode,
                                maxConcurrentReads, maxBufferedReadBytes, memoryBudget, cancellationToken).ConfigureAwait(false))
             {
                 var (batch, batchStartRow, deletedRows) = (source.Batch, source.FirstRow, source.DeletedRows);

@@ -10,7 +10,7 @@ namespace EngineeredWood.IO.Local;
 /// Uses <see cref="LocalRandomAccessFile"/> and <see cref="LocalSequentialFile"/>
 /// for file handle operations.
 /// </summary>
-public sealed class LocalTableFileSystem : ITableFileSystem
+public sealed class LocalTableFileSystem : ITableFileSystem, ILocatedFileSystem
 {
     private readonly string _rootPath;
     private readonly BufferAllocator? _allocator;

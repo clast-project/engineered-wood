@@ -144,6 +144,15 @@ public static class DeltaErrorCodes
     /// </remarks>
     public const string UnsupportedActionType = "DELTA_UNSUPPORTED_ACTION_TYPE";
 
+    /// <summary>
+    /// An action's file path (<c>add</c>, <c>remove</c> or <c>cdc</c>) names no file EW will read: an absolute path
+    /// that is not a valid URI, a location <see cref="EngineeredWood.IO.StorageLocation"/> refuses, or a rooted path
+    /// with no scheme, which engines resolve differently.
+    /// </summary>
+    /// <remarks>No delta-spark equivalent: Spark fails such a path with a <c>URISyntaxException</c> or reads it on its
+    /// default file system.</remarks>
+    public const string InvalidFilePath = "DELTA_INVALID_FILE_PATH";
+
     // ── Deletion vectors ──
 
     /// <summary>
