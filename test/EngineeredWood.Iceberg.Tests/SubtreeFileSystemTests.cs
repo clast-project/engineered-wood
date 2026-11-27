@@ -60,6 +60,8 @@ public sealed class SubtreeFileSystemTests : IDisposable
     [InlineData("")]
     [InlineData(".")]
     [InlineData("db/..")]
+    [InlineData("./")]
+    [InlineData("db/../")]
     public async Task ListingTheSubtreeRoot_StaysInside(string prefix)
     {
         File.WriteAllText(Path.Combine(_root, "wh-secret.txt"), "OUT");

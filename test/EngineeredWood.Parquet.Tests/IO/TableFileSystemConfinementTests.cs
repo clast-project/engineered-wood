@@ -156,6 +156,10 @@ public sealed class TableFileSystemConfinementTests : IDisposable
     [Theory]
     [InlineData("sub/.")]
     [InlineData("sub/x/..")]
+    [InlineData("sub/./")]
+    [InlineData("sub/.//")]
+    [InlineData("sub/x/../")]
+    [InlineData("sub/")]
     public async Task Local_ListingADirectoryByDotSegments_ListsThatDirectory(string prefix)
     {
         File.WriteAllText(Path.Combine(_root, "sub", "a.txt"), "A");

@@ -117,7 +117,10 @@ public sealed class LocalTableFileSystem : ITableFileSystem, ILocatedFileSystem
     /// directory however <see cref="Path.GetFullPath(string)"/> spells it.</summary>
     private static bool EndsWithDotSegment(string prefix)
     {
+        // A trailing separator ("sub/./") does not end the dot segment before it.
         int end = prefix.Length;
+        while (end > 0 && (prefix[end - 1] == '/' || prefix[end - 1] == Path.DirectorySeparatorChar))
+            end--;
         int start = end;
         while (start > 0 && prefix[start - 1] != '/' && prefix[start - 1] != Path.DirectorySeparatorChar)
             start--;

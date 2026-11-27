@@ -54,6 +54,21 @@ public class RootRelativePathTests
         RootRelativePath.ThrowIfEscapesRoot(path.TrimStart('\\'), backslashSeparates: false);
     }
 
+    /// <summary>Under the Windows reading a drive path is rooted, absolute or drive-relative (<c>C:x</c> resolves
+    /// against that drive's working directory). Without it, it is an ordinary name.</summary>
+    [Theory]
+    [InlineData("C:/x")]
+    [InlineData(@"C:\x")]
+    [InlineData("C:x")]
+    [InlineData("c:")]
+    [InlineData("z:../x")]
+    public void DrivePath_IsRefused_WhenBackslashSeparates(string path)
+    {
+        Assert.Throws<ArgumentException>(() => RootRelativePath.ThrowIfEscapesRoot(path, backslashSeparates: true));
+        if (path.IndexOf("..", StringComparison.Ordinal) < 0)
+            RootRelativePath.ThrowIfEscapesRoot(path, backslashSeparates: false);
+    }
+
     /// <summary>A mixed-separator path can stay inside under one reading of <c>\</c> and climb out under the other,
     /// which is why a wrapper that does not know its backend checks both.</summary>
     [Fact]

@@ -22,7 +22,9 @@ public static class RootRelativePath
 {
     /// <summary>
     /// <para>Refuses a path a dot-collapsing file system (a local directory, or a wrapper over one) would resolve
-    /// outside its root: a rooted path or absolute URI, or one whose <c>..</c> segments climb above the root at any point, even
+    /// outside its root: a rooted path or absolute URI (when <paramref name="backslashSeparates"/>, also a Windows drive
+    /// path, absolute <c>C:/x</c> or drive-relative <c>C:x</c>, which <c>Path.Combine</c> does not keep under the
+    /// root), or one whose <c>..</c> segments climb above the root at any point, even
     /// when later segments come back down (<c>../root/x</c>). <c>.</c> and <c>..</c> that stay inside are
     /// allowed, and collapse.</para>
     /// </summary>
@@ -39,7 +41,7 @@ public static class RootRelativePath
         if (path.Length == 0)
             return;
 
-        if (IsSeparator(path[0], backslashSeparates) || IsUri(path))
+        if (IsSeparator(path[0], backslashSeparates) || IsUri(path) || (backslashSeparates && StartsWithDrive(path)))
             throw Rooted(path);
 
         int depth = 0;
@@ -106,6 +108,11 @@ public static class RootRelativePath
 
         return key;
     }
+
+    /// <summary>A Windows drive, absolute (<c>C:\x</c>) or drive-relative (<c>C:x</c>, MEASURED to resolve against
+    /// that drive's working directory). A longer name before the colon (<c>db.t:v1</c>) is not one.</summary>
+    private static bool StartsWithDrive(string path) =>
+        path.Length >= 2 && path[1] == ':' && ((uint)((path[0] | 0x20) - 'a') <= 'z' - 'a');
 
     private static bool IsSeparator(char c, bool backslashSeparates) => c == '/' || (backslashSeparates && c == '\\');
 
