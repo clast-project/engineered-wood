@@ -606,10 +606,9 @@ under-deletes; it cannot lose data. Spark and delta-rs do sweep it; see
 **Absolute file paths (shallow clones) and vacuum.** An `add`, `remove` or
 `cdc` path may be an absolute URI, and a `storageType: "p"` deletion vector
 always is. Vacuum places each against the table's own location: one inside
-the table is kept like a relative one, one outside is never deleted (the
-sweep lists only the table), and a removed file outside the table is
-reported in `VacuumResult.FilesOutsideTable` rather than deleted, since it
-may be the clone source's. When the table's file system does not say where
+the table is kept like a relative one, and one outside is never deleted or
+reported (the sweep lists only the table, and a file a clone stopped using
+may still be its source's). When the table's file system does not say where
 it is rooted (`ILocatedFileSystem`; every built-in backend does, a custom
 wrapper may not), an absolute path cannot be placed, and vacuum throws
 `NotSupportedException` rather than guess. delta-spark differs in one case:

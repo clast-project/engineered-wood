@@ -24,15 +24,4 @@ public sealed record VacuumResult
     /// interval checkpoint) is defined in terms of a committed version and has to be given one.
     /// </remarks>
     public long? LastCommittedVersion { get; init; }
-
-    /// <summary>
-    /// <para>The <c>remove</c> paths, as the log spells them, of files the table no longer references that lie outside
-    /// the table's location and are past the retention period. Vacuum lists and deletes only files under the table,
-    /// so these were left in place: a file named by absolute location may be another table's (the source of a
-    /// shallow clone), and deleting it is its owner's call.</para>
-    /// <para>Only tombstones the snapshot still holds are seen, so a file removed long enough ago that its tombstone
-    /// has expired is not reported. Nor is one whose <c>remove</c> has no <c>deletionTimestamp</c> (it is optional):
-    /// it is not known to be past retention.</para>
-    /// </summary>
-    public IReadOnlyList<string> FilesOutsideTable { get; init; } = [];
 }

@@ -4,8 +4,6 @@
 using System.Text.Json.Nodes;
 using Apache.Arrow;
 using Apache.Arrow.Types;
-using EngineeredWood.DeltaLake.Actions;
-using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Snapshot;
 using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
@@ -69,7 +67,6 @@ public sealed class AbsoluteActionPathTests : IDisposable
         // The keep-set holds them by their path under the root, so a zero-retention vacuum deletes neither.
         var result = await table.VacuumAsync(TimeSpan.Zero);
         Assert.Empty(result.FilesToDelete);
-        Assert.Empty(result.FilesOutsideTable);
         Assert.Equal([1, 2, 3, 4, 5, 6], await ReadIdsAsync(table));
     }
 
@@ -136,10 +133,8 @@ public sealed class AbsoluteActionPathTests : IDisposable
         await Task.Delay(20);
         var result = await clone.VacuumAsync(TimeSpan.Zero);
 
-        // Nothing outside the clone is touched, and the source file the clone stopped referencing is reported.
+        // Nothing outside the clone is touched, the source file the clone stopped referencing included.
         Assert.Equal(sourceFiles, DataFiles(_sourceDir));
-        string removed = Assert.Single(result.FilesOutsideTable);
-        Assert.StartsWith(FileUri(_sourceDir), removed);
         Assert.DoesNotContain(result.FilesToDelete, p => p.Contains("source"));
         Assert.Equal([1, 3, 4, 5, 6], await ReadIdsAsync(clone));
 
@@ -149,11 +144,11 @@ public sealed class AbsoluteActionPathTests : IDisposable
     }
 
     /// <summary>
-    /// A deletion-vector DELETE on a source file removes it and adds it back with a vector, under one path: the file is
-    /// still live, so it is not reported as left behind (the snapshot keys files by path AND vector).
+    /// A deletion-vector DELETE on a source file removes it and adds it back with a vector under one path, the vector
+    /// written under the clone. VACUUM keeps the vector and leaves the source alone.
     /// </summary>
     [Fact]
-    public async Task Vacuum_DoesNotReportAFileAVectorDeleteKeptLive()
+    public async Task Vacuum_AfterAVectorDeleteOnASourceFile_KeepsTheVectorAndTheSource()
     {
         await using (var source = await DeltaTable.CreateAsync(
                          new LocalTableFileSystem(_sourceDir), IdSchema, enableDeletionVectors: true))
@@ -161,39 +156,16 @@ public sealed class AbsoluteActionPathTests : IDisposable
             await source.WriteAsync([Ids(1, 2, 3)]);
         }
         CloneLog(_sourceDir, _cloneDir);
+        var sourceFiles = DataFiles(_sourceDir);
 
         await using var clone = await OpenCloneAsync();
         await clone.DeleteAsync(IdEquals(2), RowDeleteMode.DeletionVector);
         Assert.Contains(clone.CurrentSnapshot.Tombstones.Values, t => t.Path.StartsWith("file:", StringComparison.Ordinal));
 
         await Task.Delay(20);
-        var result = await clone.VacuumAsync(TimeSpan.Zero);
-        Assert.Empty(result.FilesOutsideTable);
+        await clone.VacuumAsync(TimeSpan.Zero);
+        Assert.Equal(sourceFiles, DataFiles(_sourceDir));
         Assert.Equal([1, 3], await ReadIdsAsync(clone));
-    }
-
-    /// <summary>
-    /// A <c>remove</c> without a <c>deletionTimestamp</c> (the field is optional) is not known to be past retention, so
-    /// the file it names is not reported, as checkpoint expiry keeps such a tombstone too.
-    /// </summary>
-    [Fact]
-    public async Task Vacuum_DoesNotReportARemoveWithoutADeletionTime()
-    {
-        await WriteSourceAsync([1, 2, 3], [4, 5, 6]);
-        CloneLog(_sourceDir, _cloneDir);
-
-        var cloneFs = new LocalTableFileSystem(_cloneDir);
-        await using var clone = await OpenCloneAsync();
-        var gone = clone.CurrentSnapshot.ActiveFiles.Values.First();
-        await new TransactionLog(cloneFs).WriteCommitAsync(clone.CurrentSnapshot.Version + 1, new DeltaAction[]
-        {
-            new RemoveFile { Path = gone.Path, DataChange = true },
-        });
-        await clone.RefreshAsync();
-        Assert.Contains(clone.CurrentSnapshot.Tombstones.Values, t => t.Path == gone.Path && t.DeletionTimestamp is null);
-
-        var result = await clone.VacuumAsync(TimeSpan.Zero);
-        Assert.Empty(result.FilesOutsideTable);
     }
 
     /// <summary>

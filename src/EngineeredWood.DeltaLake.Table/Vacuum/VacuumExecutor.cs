@@ -66,45 +66,21 @@ internal static class VacuumExecutor
         // On a local Windows table names compare as the file system compares them: an absolute URI keeps its own
         // spelling, and a keep-set that missed the listed spelling of a live file would delete it.
         var keep = new HashSet<string>(files.PathComparer);
-        // The live files outside the table, by location: ActiveFiles is keyed by path AND deletion vector, so a file a
-        // vector DELETE gave a new vector has a tombstone under its old key while it is still live.
-        var liveOutside = new HashSet<StorageLocation>();
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
             // add.path is URL-encoded; decode to the on-disk name before comparing against the listing.
             if (InTable(files, addFile.Path) is { } inTable)
                 keep.Add(inTable);
-            else
-                liveOutside.Add(DeltaFileLocator.AbsoluteLocation(addFile.Path));
             AddDeletionVectorPath(files, keep, addFile.DeletionVector);
         }
 
         // A tombstone's DV is NOT kept — it masked rows in a file no longer part of the table, so it is
-        // exactly the orphaned .bin this rewrite exists to collect. A `p`-type vector is placed like a data file:
-        // inside the table it is collected like any other orphan, outside it is left alone, and where the table's
-        // location is unknown it cannot be placed, so vacuum is refused.
-        //
-        // A removed file outside the table is left in place too, and reported once it is past the retention after
-        // which a file inside would be deleted: it may still be another table's (the source of a shallow clone), so
-        // deleting it is its owner's call, as Iceberg expiry reports such files (ExpireResult.FilesOutsideTable).
-        long cutoffMillis = (DateTimeOffset.UtcNow - retentionPeriod).ToUnixTimeMilliseconds();
-        var outside = new List<string>();
-        var reported = new HashSet<StorageLocation>();
-        foreach (var tombstone in snapshot.Tombstones.Values)
-        {
-            if (tombstone.DeletionVector is { } tombstoneDv && DeletionVectorPath.IsAbsolute(tombstoneDv))
-                _ = InTable(files, DeletionVectorPath.AbsoluteLocation(tombstoneDv), tombstoneDv.PathOrInlineDv);
-            if (!DeltaFileLocator.IsAbsolute(tombstone.Path) || InTable(files, tombstone.Path) is not null)
-                continue;
-            // One file is reported once, and never while the table still reads it. A tombstone with no deletion time
-            // (the field is optional) is not known to be past retention, as checkpoint expiry treats it too
-            // (CheckpointWriter keeps it), so it is not reported.
-            var location = DeltaFileLocator.AbsoluteLocation(tombstone.Path);
-            if (tombstone.DeletionTimestamp is { } deletedAt && deletedAt < cutoffMillis
-                && !liveOutside.Contains(location) && reported.Add(location))
-                outside.Add(tombstone.Path);
-        }
+        // exactly the orphaned .bin this rewrite exists to collect. Nor is a tombstone's data file. Neither needs
+        // placing: what is not live is either under the table, where the sweep may collect it, or outside it, where
+        // nothing is ever deleted. A file outside the table that this table stopped referencing may still be another
+        // table's (the source of a shallow clone), so it is neither deleted nor reported; delta-spark skips it silently
+        // too.
 
         // ── Sweep: everything under the table root, with NO extension filter. ──
         //
@@ -203,7 +179,6 @@ internal static class VacuumExecutor
             FilesToDelete = filesToDelete,
             FilesDeleted = deleted,
             LastCommittedVersion = endVersion,
-            FilesOutsideTable = outside,
         };
     }
 

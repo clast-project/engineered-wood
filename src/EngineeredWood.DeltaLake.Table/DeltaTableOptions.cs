@@ -235,7 +235,7 @@ public sealed record DeltaTableOptions
     /// <para>An absolute location under the table's own root needs no registration when the table's file system says
     /// where it is rooted (<see cref="EngineeredWood.IO.ILocatedFileSystem"/>, which every built-in backend
     /// implements): it is read through the table's file system. Writes always go under the table's root; VACUUM never
-    /// deletes a file outside it (<see cref="VacuumResult.FilesOutsideTable"/>).</para>
+    /// deletes a file outside it.</para>
     /// </summary>
     public EngineeredWood.IO.StorageResolver? StorageResolver { get; init; }
 
