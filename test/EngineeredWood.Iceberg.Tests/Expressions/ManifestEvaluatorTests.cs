@@ -65,7 +65,7 @@ public class ManifestEvaluatorTests : IDisposable
             upper: new() { [1] = LiteralValue.Of(100L) },
             nullCounts: new() { [1] = 0 });
 
-        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+        var result = new Iceberg.Expressions.TableScan(Meta(), TestResolvers.For(_fs))
             .Filter(Ex.Equal("id", 200L))
             .PlanFiles([f]);
 
@@ -80,7 +80,7 @@ public class ManifestEvaluatorTests : IDisposable
             lower: new() { [1] = LiteralValue.Of(10L) },
             upper: new() { [1] = LiteralValue.Of(100L) });
 
-        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+        var result = new Iceberg.Expressions.TableScan(Meta(), TestResolvers.For(_fs))
             .Filter(Ex.Equal("id", 50L))
             .PlanFiles([f]);
 
@@ -92,7 +92,7 @@ public class ManifestEvaluatorTests : IDisposable
     {
         var f = File("a.parquet", 100, nullCounts: new() { [3] = 0 });
 
-        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+        var result = new Iceberg.Expressions.TableScan(Meta(), TestResolvers.For(_fs))
             .Filter(Ex.IsNull("score"))
             .PlanFiles([f]);
 
@@ -105,7 +105,7 @@ public class ManifestEvaluatorTests : IDisposable
     {
         var f = File("a.parquet", 100, nullCounts: new() { [3] = 100 });
 
-        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+        var result = new Iceberg.Expressions.TableScan(Meta(), TestResolvers.For(_fs))
             .Filter(Ex.NotNull("score"))
             .PlanFiles([f]);
 
@@ -121,7 +121,7 @@ public class ManifestEvaluatorTests : IDisposable
             upper: new() { [2] = LiteralValue.Of("dave") },
             nullCounts: new() { [2] = 0 });
 
-        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+        var result = new Iceberg.Expressions.TableScan(Meta(), TestResolvers.For(_fs))
             .Filter(Ex.Equal("name", "zoe"))
             .PlanFiles([f]);
 
@@ -135,7 +135,7 @@ public class ManifestEvaluatorTests : IDisposable
             lower: new() { [1] = LiteralValue.Of(10L) },
             upper: new() { [1] = LiteralValue.Of(20L) });
 
-        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+        var result = new Iceberg.Expressions.TableScan(Meta(), TestResolvers.For(_fs))
             .Filter(Ex.In("id", 1L, 25L))
             .PlanFiles([f]);
 
@@ -149,7 +149,7 @@ public class ManifestEvaluatorTests : IDisposable
             lower: new() { [1] = LiteralValue.Of(10L) },
             upper: new() { [1] = LiteralValue.Of(20L) });
 
-        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+        var result = new Iceberg.Expressions.TableScan(Meta(), TestResolvers.For(_fs))
             .Filter(Ex.In("id", 1L, 15L, 25L))
             .PlanFiles([f]);
 
@@ -162,7 +162,7 @@ public class ManifestEvaluatorTests : IDisposable
         // Conservative: with no stats, can't prove file is empty.
         var f = File("a.parquet", 100);
 
-        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+        var result = new Iceberg.Expressions.TableScan(Meta(), TestResolvers.For(_fs))
             .Filter(Ex.Equal("id", 42L))
             .PlanFiles([f]);
 
@@ -176,7 +176,7 @@ public class ManifestEvaluatorTests : IDisposable
             lower: new() { [1] = LiteralValue.Of(10L) },
             upper: new() { [1] = LiteralValue.Of(100L) });
 
-        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+        var result = new Iceberg.Expressions.TableScan(Meta(), TestResolvers.For(_fs))
             .Filter(Ex.And(
                 Ex.GreaterThan("id", 5L),
                 Ex.LessThan("id", 5L)))

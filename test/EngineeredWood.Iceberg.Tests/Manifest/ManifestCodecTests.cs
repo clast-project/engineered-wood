@@ -137,8 +137,8 @@ public class ManifestCodecTests : IDisposable
         {
             var expected = entries.Where(e => (e.DataFile.Content == FileContent.Data) == (content == ManifestContent.Data)).ToList();
             var path = PathOf($"m-{content}.avro");
-            await ManifestIO.WriteManifestAsync(_fs, path, expected, ManifestWriteOptions.For(table, 1, content));
-            var read = await ManifestIO.ReadManifestAsync(_fs, path);
+            await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), path, expected, ManifestWriteOptions.For(table, 1, content));
+            var read = await ManifestIO.ReadManifestAsync(TestResolvers.Io(_fs), path);
 
             Assert.Equal(expected.Count, read.Count);
             for (int i = 0; i < expected.Count; i++)
@@ -151,7 +151,7 @@ public class ManifestCodecTests : IDisposable
     {
         var table = Table(2);
         var path = PathOf("m.avro");
-        await ManifestIO.WriteManifestAsync(_fs, path,
+        await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), path,
             [new ManifestEntry { Status = ManifestEntryStatus.Added, SnapshotId = 1, DataFile = FullFile("a", 2) }],
             ManifestWriteOptions.For(table, 1, ManifestContent.Data));
 
@@ -181,7 +181,7 @@ public class ManifestCodecTests : IDisposable
     {
         // cf. iceberg-rust #3399: a v2 manifest must not declare v3-only fields.
         var path = PathOf("m.avro");
-        await ManifestIO.WriteManifestAsync(_fs, path,
+        await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), path,
             [new ManifestEntry { Status = ManifestEntryStatus.Added, SnapshotId = 1, DataFile = FullFile("a", 2) }],
             ManifestWriteOptions.For(Table(2), 1, ManifestContent.Data));
         using var stream = File.OpenRead(path);
@@ -196,12 +196,12 @@ public class ManifestCodecTests : IDisposable
     {
         var table = Table(2);
         var path = PathOf("m.avro");
-        await ManifestIO.WriteManifestAsync(_fs, path,
+        await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), path,
             [new ManifestEntry { Status = ManifestEntryStatus.Added, SnapshotId = 1, DataFile = FullFile("a", 2) }],
             ManifestWriteOptions.For(table, 1, ManifestContent.Data));
 
         // Without the spec, the tuple is typed from the Avro schema; the types agree.
-        var raw = Assert.Single(await ManifestIO.ReadManifestAsync(_fs, path));
+        var raw = Assert.Single(await ManifestIO.ReadManifestAsync(TestResolvers.Io(_fs), path));
         Assert.Equal(Tuple(3, 19_675, "x"), raw.DataFile.Partition);
         Assert.True(raw.DataFile.Partition!.TryGetValue(1004, out var key));
         Assert.Equal(Key, key);

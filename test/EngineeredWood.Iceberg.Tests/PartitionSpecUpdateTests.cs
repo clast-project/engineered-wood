@@ -24,7 +24,7 @@ public class PartitionSpecUpdateTests : IDisposable
         _tempDir = Path.Combine(Path.GetTempPath(), $"iceberg-psu-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
         _fs = new LocalTableFileSystem(_tempDir);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -34,7 +34,7 @@ public class PartitionSpecUpdateTests : IDisposable
     }
 
     private TableMetadata CreateTable(PartitionSpec? spec = null) =>
-        TableMetadata.Create(_schema, partitionSpec: spec, location: "table");
+        TableMetadata.Create(_schema, partitionSpec: spec, location: Path.Combine(_tempDir, "table"));
 
     // --- Basic add ---
 
@@ -281,7 +281,7 @@ public class PartitionSpecUpdateTests : IDisposable
 
         // Append files with unpartitioned spec (spec 0)
         var v1 = await _ops.AppendFilesAsync(metadata, [
-            new DataFile { FilePath = "data/old.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
+            new DataFile { FilePath = "s3://bucket/t/data/old.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
         ]);
 
         // Evolve partitioning
@@ -293,18 +293,18 @@ public class PartitionSpecUpdateTests : IDisposable
         var dayField = v2.PartitionSpecs.Single(s => s.SpecId == v2.DefaultSpecId).Fields.Single();
         var partition = new PartitionData([new PartitionValue(dayField.FieldId, dayField.Name, IcebergType.Date, 19_000)]);
         var v3 = await _ops.AppendFilesAsync(v2, [
-            new DataFile { FilePath = "data/new.parquet", RecordCount = 200, FileSizeInBytes = 10000, Partition = partition },
+            new DataFile { FilePath = "s3://bucket/t/data/new.parquet", RecordCount = 200, FileSizeInBytes = 10000, Partition = partition },
         ]);
 
         // Both files should be visible, each with its own spec's tuple
         var allFiles = await _ops.ListDataFilesAsync(v3);
         Assert.Equal(2, allFiles.Count);
-        Assert.Null(allFiles.Single(f => f.FilePath == "data/old.parquet").Partition);
-        Assert.Equal(partition, allFiles.Single(f => f.FilePath == "data/new.parquet").Partition);
+        Assert.Null(allFiles.Single(f => f.FilePath == "s3://bucket/t/data/old.parquet").Partition);
+        Assert.Equal(partition, allFiles.Single(f => f.FilePath == "s3://bucket/t/data/new.parquet").Partition);
 
         // Check manifest list entries have correct spec IDs
         var snapshot = v3.Snapshots.Last();
-        var manifestList = await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList);
+        var manifestList = await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList);
 
         // The newest manifest should use the new spec
         var newestManifest = manifestList.Last();

@@ -21,7 +21,7 @@ public class ManifestRewriteTests : IDisposable
     {
         Directory.CreateDirectory(_dir);
         _fs = new LocalTableFileSystem(_dir);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -35,14 +35,14 @@ public class ManifestRewriteTests : IDisposable
         location: Path.Combine(_dir, "t"), formatVersion: formatVersion);
 
     private static DataFile File(string name, long rows = 10) =>
-        new() { FilePath = $"data/{name}.parquet", RecordCount = rows, FileSizeInBytes = 100 };
+        new() { FilePath = $"s3://bucket/t/data/{name}.parquet", RecordCount = rows, FileSizeInBytes = 100 };
 
     private async Task<List<ManifestEntry>> RawEntriesAsync(TableMetadata md)
     {
         var snapshot = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
         var result = new List<ManifestEntry>();
-        foreach (var mle in await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList))
-            result.AddRange(await ManifestIO.ReadManifestAsync(_fs, mle.ManifestPath));
+        foreach (var mle in await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList))
+            result.AddRange(await ManifestIO.ReadManifestAsync(TestResolvers.Io(_fs), mle.ManifestPath));
         return result;
     }
 
@@ -58,10 +58,10 @@ public class ManifestRewriteTests : IDisposable
 
         // Read through the snapshot, they take the manifest's sequence number.
         var live = Assert.Single(await _ops.ListDataFilesAsync(md));
-        Assert.Equal("data/a.parquet", live.FilePath);
+        Assert.Equal("s3://bucket/t/data/a.parquet", live.FilePath);
         var snapshot = md.Snapshots.Single();
-        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList));
-        var entry = Assert.Single(await ManifestIO.ReadSnapshotManifestAsync(_fs, md, snapshot, mle, default));
+        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList));
+        var entry = Assert.Single(await ManifestIO.ReadSnapshotManifestAsync(TestResolvers.Io(_fs), md, snapshot, mle, default));
         Assert.Equal(1, entry.SequenceNumber);
         Assert.Equal(1, entry.FileSequenceNumber);
     }
@@ -75,7 +75,7 @@ public class ManifestRewriteTests : IDisposable
         md = await _ops.OverwriteFilesAsync(md, [File("a")], []);                    // sequence 3
 
         var raw = await RawEntriesAsync(md);
-        var b = raw.Single(e => e.DataFile.FilePath == "data/b.parquet");
+        var b = raw.Single(e => e.DataFile.FilePath == "s3://bucket/t/data/b.parquet");
         // b moved to a manifest of snapshot 3, so it can no longer inherit: it is EXISTING, with the
         // snapshot and sequence numbers it was added with written out.
         Assert.Equal(ManifestEntryStatus.Existing, b.Status);
@@ -83,22 +83,22 @@ public class ManifestRewriteTests : IDisposable
         Assert.Equal(1, b.SequenceNumber);
         Assert.Equal(1, b.FileSequenceNumber);
 
-        var a = raw.Single(e => e.DataFile.FilePath == "data/a.parquet");
+        var a = raw.Single(e => e.DataFile.FilePath == "s3://bucket/t/data/a.parquet");
         Assert.Equal(ManifestEntryStatus.Deleted, a.Status);
         Assert.Equal(md.CurrentSnapshotId, a.SnapshotId);
         Assert.Equal(1, a.SequenceNumber);
 
         // c's manifest was not touched, so its entry still inherits sequence 2.
-        var c = raw.Single(e => e.DataFile.FilePath == "data/c.parquet");
+        var c = raw.Single(e => e.DataFile.FilePath == "s3://bucket/t/data/c.parquet");
         Assert.Equal(ManifestEntryStatus.Added, c.Status);
         Assert.Null(c.SequenceNumber);
 
         var live = await _ops.ListDataFilesAsync(md);
-        Assert.Equal(["data/b.parquet", "data/c.parquet"], live.Select(f => f.FilePath).OrderBy(p => p));
+        Assert.Equal(["s3://bucket/t/data/b.parquet", "s3://bucket/t/data/c.parquet"], live.Select(f => f.FilePath).OrderBy(p => p));
 
         // The rewritten manifest's counts describe what it now holds.
         var snapshot = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
-        var rewritten = (await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList))
+        var rewritten = (await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList))
             .Single(m => m.AddedSnapshotId == md.CurrentSnapshotId);
         Assert.Equal((0, 1, 1, 0L, 10L, 10L, 1L),
             (rewritten.AddedDataFilesCount, rewritten.ExistingDataFilesCount, rewritten.DeletedDataFilesCount,
@@ -107,7 +107,7 @@ public class ManifestRewriteTests : IDisposable
         // A later rewrite does not carry the DELETED entry forward.
         md = await _ops.OverwriteFilesAsync(md, [File("b")], []);
         Assert.DoesNotContain(await RawEntriesAsync(md),
-            e => e.DataFile.FilePath == "data/a.parquet");
+            e => e.DataFile.FilePath == "s3://bucket/t/data/a.parquet");
     }
 
     [Fact]
@@ -115,18 +115,18 @@ public class ManifestRewriteTests : IDisposable
     {
         var md = await _ops.AppendFilesAsync(NewTable(formatVersion: 3), [File("a"), File("b")]);
         var snapshot = md.Snapshots.Single();
-        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList));
+        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList));
         // As a v3 writer assigns it: this manifest's files take row ids from 100.
-        await ManifestIO.WriteManifestListAsync(_fs, snapshot.ManifestList, [mle with { FirstRowId = 100 }],
+        await ManifestIO.WriteManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList, [mle with { FirstRowId = 100 }],
             new ManifestListWriteOptions { FormatVersion = 3 });
 
         md = await _ops.OverwriteFilesAsync(md, [File("a")], []);
 
         var current = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
-        var rewritten = Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, current.ManifestList));
+        var rewritten = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), current.ManifestList));
         // Iceberg Java clears every file's row id in a committed manifest without one, so it is kept.
         Assert.Equal(100, rewritten.FirstRowId);
-        var b = Assert.Single(await ManifestIO.ReadManifestAsync(_fs, rewritten.ManifestPath),
+        var b = Assert.Single(await ManifestIO.ReadManifestAsync(TestResolvers.Io(_fs), rewritten.ManifestPath),
             e => e.Status != ManifestEntryStatus.Deleted);
         Assert.Equal(110, b.DataFile.FirstRowId);
     }
@@ -136,12 +136,12 @@ public class ManifestRewriteTests : IDisposable
     {
         var md = await _ops.AppendFilesAsync(NewTable(), [File("a")]);
         var snapshot = md.Snapshots.Single();
-        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList));
+        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList));
 
         // Replace the manifest with one holding a field this library does not model.
-        var bytes = await _fs.ReadAllBytesAsync(mle.ManifestPath);
+        var bytes = await TestResolvers.Io(_fs).ReadAllBytesAsync(mle.ManifestPath);
         var withExtra = WithExtraDataFileField(bytes);
-        await _fs.WriteAllBytesAsync(mle.ManifestPath, withExtra);
+        await TestResolvers.Io(_fs).WriteAllBytesAsync(mle.ManifestPath, withExtra);
 
         // Reading is fine; rewriting would drop the field.
         Assert.Single(await _ops.ListDataFilesAsync(md));
@@ -155,21 +155,21 @@ public class ManifestRewriteTests : IDisposable
     {
         var md = await _ops.AppendFilesAsync(NewTable(), [File("a")]);
         var snapshot = md.Snapshots.Single();
-        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList));
+        var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList));
 
         // A manifest-list entry with key metadata: the manifest is encrypted.
         var encryptedList = Path.Combine(_dir, "t", "metadata", "snap-encrypted.avro");
-        await ManifestIO.WriteManifestListAsync(_fs, encryptedList, [mle with { KeyMetadata = [1, 2, 3] }]);
+        await ManifestIO.WriteManifestListAsync(TestResolvers.Io(_fs), encryptedList, [mle with { KeyMetadata = [1, 2, 3] }]);
         var mdEncryptedManifest = md with
         {
             Snapshots = [snapshot with { ManifestList = encryptedList }],
         };
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
-            async () => await new TableScan(mdEncryptedManifest, _fs).PlanFilesAsync());
+            async () => await new TableScan(mdEncryptedManifest, TestResolvers.For(_fs)).PlanFilesAsync());
 
         // A data file with key metadata: the file is encrypted.
-        var entries = await ManifestIO.ReadManifestAsync(_fs, mle.ManifestPath);
-        await ManifestIO.WriteManifestAsync(_fs, mle.ManifestPath,
+        var entries = await ManifestIO.ReadManifestAsync(TestResolvers.Io(_fs), mle.ManifestPath);
+        await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), mle.ManifestPath,
             entries.Select(e => e with { DataFile = e.DataFile with { KeyMetadata = [9] } }).ToList());
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
             async () => await _ops.ListDataFilesAsync(md));

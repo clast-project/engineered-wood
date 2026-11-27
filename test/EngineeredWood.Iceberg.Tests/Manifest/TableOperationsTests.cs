@@ -21,7 +21,7 @@ public class TableOperationsTests : IDisposable
         _warehouse = Path.Combine(Path.GetTempPath(), $"iceberg-ops-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_warehouse);
         _fs = new LocalTableFileSystem(_warehouse);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -44,7 +44,7 @@ public class TableOperationsTests : IDisposable
 
         var file = new DataFile
         {
-            FilePath = "data/file1.parquet",
+            FilePath = "s3://bucket/t/data/file1.parquet",
             RecordCount = 1000,
             FileSizeInBytes = 50000,
         };
@@ -65,7 +65,7 @@ public class TableOperationsTests : IDisposable
         var metadata = CreateTable();
         var file = new DataFile
         {
-            FilePath = "data/file1.parquet",
+            FilePath = "s3://bucket/t/data/file1.parquet",
             RecordCount = 500,
             FileSizeInBytes = 25000,
         };
@@ -74,17 +74,17 @@ public class TableOperationsTests : IDisposable
 
         // Verify manifest list exists
         var snapshot = updated.Snapshots[0];
-        Assert.True(await _fs.ExistsAsync(snapshot.ManifestList));
+        Assert.True(await TestResolvers.Io(_fs).ExistsAsync(snapshot.ManifestList));
 
         // Verify manifest list contents
-        var manifestList = await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList);
+        var manifestList = await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList);
         Assert.Single(manifestList);
         Assert.Equal(1, manifestList[0].AddedDataFilesCount);
 
         // Verify manifest file contents
-        var manifestEntries = await ManifestIO.ReadManifestAsync(_fs, manifestList[0].ManifestPath);
+        var manifestEntries = await ManifestIO.ReadManifestAsync(TestResolvers.Io(_fs), manifestList[0].ManifestPath);
         Assert.Single(manifestEntries);
-        Assert.Equal("data/file1.parquet", manifestEntries[0].DataFile.FilePath);
+        Assert.Equal("s3://bucket/t/data/file1.parquet", manifestEntries[0].DataFile.FilePath);
         Assert.Equal(ManifestEntryStatus.Added, manifestEntries[0].Status);
     }
 
@@ -95,14 +95,14 @@ public class TableOperationsTests : IDisposable
 
         var file1 = new DataFile
         {
-            FilePath = "data/file1.parquet",
+            FilePath = "s3://bucket/t/data/file1.parquet",
             RecordCount = 1000,
             FileSizeInBytes = 50000,
         };
 
         var file2 = new DataFile
         {
-            FilePath = "data/file2.parquet",
+            FilePath = "s3://bucket/t/data/file2.parquet",
             RecordCount = 2000,
             FileSizeInBytes = 100000,
         };
@@ -123,9 +123,9 @@ public class TableOperationsTests : IDisposable
 
         var files = new[]
         {
-            new DataFile { FilePath = "data/a.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
-            new DataFile { FilePath = "data/b.parquet", RecordCount = 200, FileSizeInBytes = 10000 },
-            new DataFile { FilePath = "data/c.parquet", RecordCount = 300, FileSizeInBytes = 15000 },
+            new DataFile { FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
+            new DataFile { FilePath = "s3://bucket/t/data/b.parquet", RecordCount = 200, FileSizeInBytes = 10000 },
+            new DataFile { FilePath = "s3://bucket/t/data/c.parquet", RecordCount = 300, FileSizeInBytes = 15000 },
         };
 
         var updated = await _ops.AppendFilesAsync(metadata, files);
@@ -147,16 +147,16 @@ public class TableOperationsTests : IDisposable
     {
         var metadata = CreateTable();
 
-        var file1 = new DataFile { FilePath = "data/a.parquet", RecordCount = 100, FileSizeInBytes = 5000 };
-        var file2 = new DataFile { FilePath = "data/b.parquet", RecordCount = 200, FileSizeInBytes = 10000 };
+        var file1 = new DataFile { FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 100, FileSizeInBytes = 5000 };
+        var file2 = new DataFile { FilePath = "s3://bucket/t/data/b.parquet", RecordCount = 200, FileSizeInBytes = 10000 };
 
         var after1 = await _ops.AppendFilesAsync(metadata, [file1]);
         var after2 = await _ops.AppendFilesAsync(after1, [file2]);
 
         var dataFiles = await _ops.ListDataFilesAsync(after2);
         Assert.Equal(2, dataFiles.Count);
-        Assert.Contains(dataFiles, f => f.FilePath == "data/a.parquet");
-        Assert.Contains(dataFiles, f => f.FilePath == "data/b.parquet");
+        Assert.Contains(dataFiles, f => f.FilePath == "s3://bucket/t/data/a.parquet");
+        Assert.Contains(dataFiles, f => f.FilePath == "s3://bucket/t/data/b.parquet");
     }
 
     [Fact]
@@ -179,7 +179,7 @@ public class TableOperationsTests : IDisposable
         // Append files
         var file = new DataFile
         {
-            FilePath = "data/events-001.parquet",
+            FilePath = "s3://bucket/t/data/events-001.parquet",
             RecordCount = 5000,
             FileSizeInBytes = 250000,
         };
@@ -194,7 +194,7 @@ public class TableOperationsTests : IDisposable
 
         var dataFiles = await _ops.ListDataFilesAsync(reloaded.Metadata);
         Assert.Single(dataFiles);
-        Assert.Equal("data/events-001.parquet", dataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/events-001.parquet", dataFiles[0].FilePath);
     }
 
     [Fact]
@@ -203,7 +203,7 @@ public class TableOperationsTests : IDisposable
         // Readers must accept such a spec; committing files under it is forbidden.
         var spec = new PartitionSpec(0, [new PartitionField(1, 1000, "z", new UnknownTransform("zorder"), [1, 2])]);
         var metadata = TableMetadata.Create(_schema, spec, location: Path.Combine(_warehouse, "unknown_transform"));
-        var file = new DataFile { FilePath = "data/a.parquet", RecordCount = 1, FileSizeInBytes = 1 };
+        var file = new DataFile { FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 1, FileSizeInBytes = 1 };
 
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(async () => await _ops.AppendFilesAsync(metadata, [file]));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(async () => await _ops.OverwriteFilesAsync(metadata, [], [file]));
@@ -214,16 +214,16 @@ public class TableOperationsTests : IDisposable
     public async Task CurrentSnapshotIdNamingNoSnapshot_IsAnError_NotAnEmptyTable()
     {
         var metadata = await _ops.AppendFilesAsync(CreateTable(),
-            [new DataFile { FilePath = "data/a.parquet", RecordCount = 1, FileSizeInBytes = 1 }]);
+            [new DataFile { FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 1, FileSizeInBytes = 1 }]);
         var dangling = metadata with { Snapshots = [] };
 
         await Assert.ThrowsAsync<InvalidDataException>(
-            async () => await new EngineeredWood.Iceberg.Expressions.TableScan(dangling, _fs).PlanFilesAsync());
+            async () => await new EngineeredWood.Iceberg.Expressions.TableScan(dangling, TestResolvers.For(_fs)).PlanFilesAsync());
         Assert.Throws<InvalidDataException>(
-            () => new EngineeredWood.Iceberg.Expressions.TableScan(dangling, _fs).PlanFiles([]));
+            () => new EngineeredWood.Iceberg.Expressions.TableScan(dangling, TestResolvers.For(_fs)).PlanFiles([]));
         await Assert.ThrowsAsync<InvalidDataException>(async () => await _ops.ListDataFilesAsync(dangling));
 
         // A table with no current snapshot is still empty.
-        Assert.Empty((await new EngineeredWood.Iceberg.Expressions.TableScan(CreateTable(), _fs).PlanFilesAsync()).DataFiles);
+        Assert.Empty((await new EngineeredWood.Iceberg.Expressions.TableScan(CreateTable(), TestResolvers.For(_fs)).PlanFilesAsync()).DataFiles);
     }
 }

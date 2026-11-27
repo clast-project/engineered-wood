@@ -54,7 +54,7 @@ public class DecodedBoundsCorpusTests
     public async Task PlanningPrunesSparkFilesByTheirDecodedBounds()
     {
         var md = Corpus.Metadata("t_bucket");
-        var fs = new CorpusFileSystem(Corpus);
+        var fs = Corpus.FileSystem;
         var files = (await LiveFilesAsync(md)).Where(f => f.Content == FileContent.Data).ToList();
         var schema = md.Schemas.Single(s => s.SchemaId == md.CurrentSchemaId);
         int idField = schema.Fields.Single(f => f.Name == "id").Id;
@@ -65,13 +65,13 @@ public class DecodedBoundsCorpusTests
 
         foreach (var file in files)
         {
-            var result = await new TableScan(md, fs).Filter(Ex.Equal("id", Bound(file.ColumnLowerBounds))).PlanFilesAsync();
+            var result = await new TableScan(md, Corpus.Resolver).Filter(Ex.Equal("id", Bound(file.ColumnLowerBounds))).PlanFilesAsync();
             Assert.Contains(result.DataFiles, f => f.FilePath == file.FilePath);
             Assert.True(result.DataFiles.Count < files.Count, "a point filter prunes some files");
         }
 
         long max = files.Max(f => Bound(f.ColumnUpperBounds));
-        Assert.Empty((await new TableScan(md, fs).Filter(Ex.GreaterThan("id", max)).PlanFilesAsync()).DataFiles);
+        Assert.Empty((await new TableScan(md, Corpus.Resolver).Filter(Ex.GreaterThan("id", max)).PlanFilesAsync()).DataFiles);
     }
 
     private static int Compare(JsonElement metric, string key, IcebergType type, int fieldId,
@@ -90,7 +90,7 @@ public class DecodedBoundsCorpusTests
 
     private static async Task<List<DataFile>> LiveFilesAsync(TableMetadata md)
     {
-        var fs = new CorpusFileSystem(Corpus);
+        var fs = Corpus.FileSystem;
         var current = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
         var result = new List<DataFile>();
         foreach (var mle in await ManifestIO.ReadSnapshotManifestListAsync(fs, md, current, default))

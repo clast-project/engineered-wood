@@ -14,11 +14,13 @@ public sealed class TableOperations
     private readonly ITableFileSystem _fs;
 
     /// <summary>
-    /// Initializes a new instance using the specified file system for reading and writing manifests.
+    /// Initializes a new instance that reads and writes manifests at the absolute locations table metadata names,
+    /// through <paramref name="resolver"/>. New manifests and manifest lists are written under the table's own
+    /// location (<c>&lt;location&gt;/metadata/</c>), so that location must resolve.
     /// </summary>
-    public TableOperations(ITableFileSystem fs)
+    public TableOperations(StorageResolver resolver)
     {
-        _fs = fs;
+        _fs = new LocationFileSystem(resolver);
     }
 
     /// <summary>
@@ -70,11 +72,12 @@ public sealed class TableOperations
         if (filesToAdd.Count > 0)
             ThrowIfSpecNotWritable(current);
         ThrowIfEncryptedFiles(filesToAdd);
+        ThrowIfNotAbsolute(filesToAdd);
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var snapshotId = GenerateSnapshotId();
         var sequenceNumber = current.LastSequenceNumber + 1;
-        var metadataDir = $"{current.Location}/metadata";
+        var metadataDir = MetadataDirectory(current);
 
         var manifestListEntries = new List<ManifestListEntry>();
         var deletedPaths = new HashSet<string>(filesToDelete.Select(FileKey));
@@ -281,11 +284,12 @@ public sealed class TableOperations
         current.ThrowIfNotWritable();
         ThrowIfSpecNotWritable(current);
         ThrowIfEncryptedFiles(files);
+        ThrowIfNotAbsolute(files);
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var snapshotId = GenerateSnapshotId();
         var sequenceNumber = current.LastSequenceNumber + 1;
-        var metadataDir = $"{current.Location}/metadata";
+        var metadataDir = MetadataDirectory(current);
 
         // Read (and check) the manifests to carry forward before writing anything.
         var manifestListEntries = new List<ManifestListEntry>();
@@ -383,6 +387,13 @@ public sealed class TableOperations
 
         return result;
     }
+
+    /// <summary>
+    /// Where a commit writes its manifests and manifest list: <c>&lt;location&gt;/metadata</c>, as an absolute location
+    /// in the table location's own spelling (a bare local path becomes a <c>file:</c> URI), so other engines can read it.
+    /// </summary>
+    private static string MetadataDirectory(TableMetadata metadata) =>
+        StorageLocation.Parse(metadata.Location).Combine("metadata").ToString();
 
     private ValueTask<List<ManifestListEntry>> ReadManifestListAsync(
         TableMetadata metadata, Snapshot snapshot, CancellationToken ct) =>
@@ -531,6 +542,26 @@ public sealed class TableOperations
                 "is not supported.");
     }
 
-    private static string TransformName(Transform transform) =>
+    /// <summary>
+    /// Refuses a file whose location, or the data file a delete file references, is not an absolute location: the
+    /// spec (v1 to v3) makes every file location absolute, and a relative one in a manifest would be read against
+    /// whatever base each engine chose, or not at all.
+    /// </summary>
+    private static void ThrowIfNotAbsolute(IReadOnlyList<DataFile> files)
+    {
+        foreach (var file in files)
+        {
+            if (!StorageLocation.TryParse(file.FilePath, out _))
+                throw new ArgumentException(
+                    $"Cannot add '{file.FilePath}': a file's location must be absolute (s3://..., file:/...).",
+                    nameof(files));
+            if (file.ReferencedDataFile is { } referenced && !StorageLocation.TryParse(referenced, out _))
+                throw new ArgumentException(
+                    $"Cannot add '{file.FilePath}': the data file it references, '{referenced}', must be an absolute " +
+                    "location.", nameof(files));
+        }
+    }
+
+        private static string TransformName(Transform transform) =>
         transform is UnknownTransform u ? u.Name : transform.GetType().Name;
 }

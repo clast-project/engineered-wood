@@ -5,6 +5,7 @@ using System.Text.Json;
 
 using EngineeredWood.Iceberg.Manifest;
 using EngineeredWood.Iceberg.Serialization;
+using EngineeredWood.IO.Local;
 
 namespace EngineeredWood.Iceberg.Tests.Interop;
 
@@ -83,7 +84,7 @@ public sealed class IcebergGoInteropTests : IDisposable
         IcebergGo.Require();
         string metadataLocation = IcebergGo.Scenario(_warehouse, scenario);
         var go = Describe(metadataLocation);
-        var fs = new FileUriFileSystem(_warehouse);
+        var fs = new LocationFileSystem(TestResolvers.For(new LocalTableFileSystem(_warehouse)));
 
         var md = IcebergJsonSerializer.Deserialize<TableMetadata>(
             System.Text.Encoding.UTF8.GetString(fs.ReadAllBytesAsync(metadataLocation).AsTask().GetAwaiter().GetResult()));
@@ -126,7 +127,7 @@ public sealed class IcebergGoInteropTests : IDisposable
     {
         string metadataLocation = IcebergGo.Scenario(_warehouse, scenario);
         var go = Describe(metadataLocation);
-        var fs = new FileUriFileSystem(_warehouse);
+        var fs = new LocationFileSystem(TestResolvers.For(new LocalTableFileSystem(_warehouse)));
         var md = IcebergJsonSerializer.Deserialize<TableMetadata>(
             System.Text.Encoding.UTF8.GetString(await fs.ReadAllBytesAsync(metadataLocation)));
         var snapshot = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
@@ -227,11 +228,11 @@ public sealed class IcebergGoInteropTests : IDisposable
     {
         string metadataLocation = IcebergGo.Scenario(_warehouse, scenario);
         var go = Describe(metadataLocation);
-        var fs = new FileUriFileSystem(_warehouse);
+        var fs = new LocationFileSystem(TestResolvers.For(new LocalTableFileSystem(_warehouse)));
         var md = IcebergJsonSerializer.Deserialize<TableMetadata>(
             System.Text.Encoding.UTF8.GetString(await fs.ReadAllBytesAsync(metadataLocation)));
 
-        var (dataFiles, deleteFiles) = await new TableOperations(fs).ScanFilesAsync(md);
+        var (dataFiles, deleteFiles) = await new TableOperations(fs.Resolver).ScanFilesAsync(md);
 
         var tasks = go.GetProperty("tasks").EnumerateArray().ToList();
         Assert.Equal(
@@ -259,10 +260,10 @@ public sealed class IcebergGoInteropTests : IDisposable
     {
         IcebergGo.Require();
         string metadataLocation = IcebergGo.Scenario(_warehouse, scenario);
-        var fs = new FileUriFileSystem(_warehouse);
+        var fs = new LocationFileSystem(TestResolvers.For(new LocalTableFileSystem(_warehouse)));
         var md = IcebergJsonSerializer.Deserialize<TableMetadata>(
             System.Text.Encoding.UTF8.GetString(await fs.ReadAllBytesAsync(metadataLocation)));
-        var ops = new TableOperations(fs);
+        var ops = new TableOperations(fs.Resolver);
 
         var (before, deletes) = await ops.ScanFilesAsync(md);
         // The victim goes with the delete files that name it (its DV), as the spec requires, so that the

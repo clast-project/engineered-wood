@@ -8,25 +8,109 @@ using EngineeredWood.IO;
 namespace EngineeredWood.Iceberg;
 
 /// <summary>
-/// An <see cref="ICatalog"/> implementation that persists namespace and table metadata
-/// as JSON files on an <see cref="ITableFileSystem"/>, using the Hadoop-style layout
-/// with version-hint files and numbered metadata versions.
+/// <para>An <see cref="ICatalog"/> implementation that persists namespace and table metadata
+/// as JSON files under a warehouse location, using the Hadoop-style layout
+/// with version-hint files and numbered metadata versions.</para>
+/// <para>Every location it writes into table metadata is absolute, under the warehouse (for example
+/// <c>file:///C:/wh/db/t</c> or <c>s3://bucket/wh/db/t</c>), as other engines require. Files a table names
+/// elsewhere are reached through the same <see cref="Resolver"/>.</para>
 /// </summary>
 public sealed class FileSystemCatalog : ICatalog
 {
     private readonly ITableFileSystem _fs;
+    private readonly StorageLocation _warehouse;
 
-    /// <summary>Initializes a new <see cref="FileSystemCatalog"/> backed by the given file system.</summary>
-    /// <param name="fs">The file system used to store catalog metadata.</param>
-    public FileSystemCatalog(ITableFileSystem fs)
+    /// <summary>
+    /// Initializes a catalog over the warehouse at <paramref name="warehouse"/>, which <paramref name="resolver"/>
+    /// must reach (it may be registered there itself or lie under a registered prefix). The catalog's own files
+    /// (metadata versions, version hints, namespace properties) are read and written through the file system the
+    /// warehouse resolves to, as a Hadoop catalog uses one FileIO for its warehouse; a narrower registration, for one
+    /// table's credentials say, serves the files that table names (manifests, data), which are reached through
+    /// <see cref="Resolver"/>. Both must therefore reach the same storage.
+    /// </summary>
+    public FileSystemCatalog(StorageResolver resolver, StorageLocation warehouse)
     {
-        _fs = fs;
+        Resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
+        _warehouse = warehouse ?? throw new ArgumentNullException(nameof(warehouse));
+        var resolved = resolver.Resolve(warehouse);
+        _fs = SubtreeFileSystem.Create(resolved.FileSystem, resolved.Path);
     }
+
+    /// <summary>Initializes a catalog over the local directory <paramref name="fs"/> is rooted at.</summary>
+    public FileSystemCatalog(IO.Local.LocalTableFileSystem fs)
+        : this(new StorageResolver().Register(fs), fs.Location)
+    {
+    }
+
+    /// <summary>Reaches the files the catalog's tables name, for <see cref="Manifest.TableOperations"/> and
+    /// <see cref="Expressions.TableScan"/>.</summary>
+    public StorageResolver Resolver { get; }
+
+    /// <summary>The warehouse location tables are created under.</summary>
+    public StorageLocation Warehouse => _warehouse;
+
+    /// <summary>
+    /// Refuses metadata that names a file by a location that is not absolute: a snapshot's manifest list, or a
+    /// statistics or partition-statistics file. Files outside the table are allowed (after a copy or a migration);
+    /// expiry leaves them in place (<see cref="ExpireResult.FilesOutsideTable"/>).
+    /// </summary>
+    private static void ThrowIfLocationsNotAbsolute(TableMetadata metadata)
+    {
+        if (FirstRelativeFile(metadata) is { } bad)
+            throw new ArgumentException(
+                $"The new metadata names the file '{bad}', which is not an absolute location.", "newMetadata");
+    }
+
+    /// <summary>The first manifest list, statistics or partition-statistics file the metadata names by a location
+    /// that is not absolute, or null.</summary>
+    private static string? FirstRelativeFile(TableMetadata metadata) =>
+        metadata.Snapshots.Select(s => s.ManifestList)
+            .Concat((metadata.Statistics ?? []).Select(s => s.StatisticsPath))
+            .Concat((metadata.PartitionStatistics ?? []).Select(s => s.StatisticsPath))
+            .FirstOrDefault(l => !StorageLocation.TryParse(l, out _));
+
+    /// <summary>The location a table lives at: its path under the warehouse.</summary>
+    private StorageLocation DefaultLocation(TableIdentifier identifier) => _warehouse.Combine(TablePath(identifier));
+
+    /// <summary>
+    /// <see cref="DefaultLocation"/>, for a table about to be created or renamed there. The location is written into
+    /// the metadata as text and parsed by every later read, so it must read back as itself: under a <c>file:</c>
+    /// warehouse a <c>#</c> or <c>?</c> in a name would start a fragment or query.
+    /// </summary>
+    private StorageLocation ReadableLocation(TableIdentifier identifier)
+    {
+        var location = DefaultLocation(identifier);
+        if (!StorageLocation.TryParse(location.ToString(), out var reparsed) || reparsed != location)
+            throw new ArgumentException(
+                $"{identifier} cannot be a table in this catalog: its location, '{location}', would not read back as " +
+                "a storage location.", nameof(identifier));
+        return location;
+    }
+
+    /// <summary>The absolute location of a warehouse-relative path.</summary>
+    private string Absolute(string relativePath) => _warehouse.Combine(relativePath).ToString();
 
     // --- Namespace operations ---
 
-    private static string NamespacePath(Namespace ns) =>
-        string.Join("/", ns.Levels);
+    private static string NamespacePath(Namespace ns)
+    {
+        foreach (var level in ns.Levels)
+            ThrowIfNotOneSegment(level, "namespace level");
+        return string.Join("/", ns.Levels);
+    }
+
+    /// <summary>
+    /// Refuses a namespace level or table name that is not one plain path segment. Each one is a directory under the
+    /// warehouse, so a <c>..</c>, a <c>.</c>, an empty name or a separator would put the files elsewhere: in a
+    /// sibling of the warehouse, still inside the backend's root, where no root check catches it.
+    /// </summary>
+    private static void ThrowIfNotOneSegment(string name, string what)
+    {
+        if (name.Length == 0 || name is "." or ".." || name.IndexOfAny(['/', '\\']) >= 0 || name.Any(char.IsControl))
+            throw new ArgumentException(
+                $"The {what} '{name}' is not a valid name in a file-system catalog: it is a directory under the " +
+                "warehouse, so it cannot be empty, '.' or '..', or hold a '/', a '\\' or a control character.");
+    }
 
     private static string NamespacePropertiesPath(Namespace ns) =>
         $"{NamespacePath(ns)}/.namespace-properties.json";
@@ -170,8 +254,11 @@ public sealed class FileSystemCatalog : ICatalog
     private const string MetadataFileSuffix = ".metadata.json";
     private const string VersionHintFileName = "version-hint.text";
 
-    private static string TablePath(TableIdentifier id) =>
-        $"{NamespacePath(id.Namespace)}/{id.Name}";
+    private static string TablePath(TableIdentifier id)
+    {
+        ThrowIfNotOneSegment(id.Name, "table name");
+        return $"{NamespacePath(id.Namespace)}/{id.Name}";
+    }
 
     private static string MetadataDir(TableIdentifier id) =>
         $"{TablePath(id)}/metadata";
@@ -236,7 +323,16 @@ public sealed class FileSystemCatalog : ICatalog
         if (!await _fs.ExistsAsync(NamespacePropertiesPath(identifier.Namespace), ct).ConfigureAwait(false))
             throw new NoSuchNamespaceException(identifier.Namespace);
 
-        var tableLocation = location ?? TablePath(identifier);
+        // Iceberg locations are absolute: a relative one names no base other engines would agree on. A table lives at
+        // its path under the warehouse and nowhere else, as in Iceberg Java's HadoopCatalog (whose withLocation
+        // refuses any other location): the catalog finds a table by that path.
+        var defaultLocation = ReadableLocation(identifier);
+        if (location is not null && StorageLocation.Parse(location) != defaultLocation)
+            throw new ArgumentException(
+                $"A file-system catalog keeps each table at its path under the warehouse, '{defaultLocation}'; it " +
+                $"cannot create {identifier} at '{location}'.", nameof(location));
+        // Written as a URI even when given as a bare path, so any engine can resolve it.
+        var tableLocation = location is null ? defaultLocation.ToString() : StorageLocation.Parse(location).ToString();
         var metadata = TableMetadata.Create(schema, spec, sortOrder, tableLocation, properties);
         return await CreateAsync(identifier, metadata, ct).ConfigureAwait(false);
     }
@@ -249,12 +345,34 @@ public sealed class FileSystemCatalog : ICatalog
         var path = MetadataFilePath(identifier, version);
         var data = await _fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
         var metadata = IcebergJsonSerializer.Deserialize<TableMetadata>(Encoding.UTF8.GetString(data));
-        return new Table(identifier, metadata, path);
+
+        // A table EngineeredWood wrote before it wrote absolute locations (#963) has a relative one ("db/t"), which
+        // no engine can resolve; refuse it here, by name, rather than return a table every operation then refuses.
+        if (!StorageLocation.TryParse(metadata.Location, out var location))
+            throw new FormatException(
+                $"{identifier}'s metadata gives its location as '{metadata.Location}', which is not an absolute " +
+                "location. Tables written by EngineeredWood before it wrote absolute locations (#963) have a relative " +
+                "one, which no engine can resolve; they cannot be loaded.");
+
+        // What create and commit hold this catalog's tables to, a load holds them to as well, so nothing loaded here
+        // can be renamed or purged into a state a commit would refuse: the table lives at its path under the
+        // warehouse (a purge deletes that path), and the files it names are absolute.
+        if (location != DefaultLocation(identifier))
+            throw new FormatException(
+                $"{identifier}'s metadata gives its location as '{metadata.Location}', but this catalog keeps it at " +
+                $"'{DefaultLocation(identifier)}'; a file-system catalog cannot load a table that lives elsewhere.");
+        if (FirstRelativeFile(metadata) is { } relative)
+            throw new FormatException(
+                $"{identifier}'s metadata names the file '{relative}', which is not an absolute location; tables " +
+                "written by EngineeredWood before it wrote absolute locations (#963) cannot be loaded.");
+        return new Table(identifier, metadata, Absolute(path));
     }
 
     /// <summary>
     /// Drops a table by deleting its metadata directory. With <paramref name="purge"/>, every file under the
-    /// table's directory goes, data included; without it, data files are left in place.
+    /// table's directory goes, data included; without it, data files are left in place. A renamed table's
+    /// manifests and data stay under the directory it was created in (see <see cref="RenameTableAsync"/>), so a
+    /// purge does not reach them (#983).
     /// </summary>
     public async Task DropTableAsync(
         TableIdentifier identifier, bool purge = false, CancellationToken ct = default)
@@ -299,7 +417,7 @@ public sealed class FileSystemCatalog : ICatalog
         var baseVersion = ParseBaseVersion(current);
         var renamed = current.Metadata with
         {
-            Location = TablePath(to),
+            Location = ReadableLocation(to).ToString(),
             MetadataLog = [],
         };
         await CreateAsync(to, renamed, ct).ConfigureAwait(false);
@@ -357,7 +475,30 @@ public sealed class FileSystemCatalog : ICatalog
             throw new CommitFailedException(identifier,
                 "the table was dropped and re-created after the commit's base was loaded.");
 
-        var committed = WithPreviousMetadataLogged(newMetadata, baseTable);
+        // The catalog keeps a table at its path under the warehouse (see CreateTableAsync), and every location in
+        // its metadata is absolute; a commit can change neither.
+        var tableLocation = DefaultLocation(identifier);
+        if (!StorageLocation.TryParse(newMetadata.Location, out var newLocation) || newLocation != tableLocation)
+            throw new ArgumentException(
+                $"The new metadata's location '{newMetadata.Location}' is not {identifier}'s location in this " +
+                $"catalog, '{tableLocation}'; a file-system catalog keeps each table at its path under the warehouse.",
+                nameof(newMetadata));
+        ThrowIfLocationsNotAbsolute(newMetadata);
+
+        // The catalog writes the log itself, of its own version files: each entry is one file in the table's
+        // metadata directory.
+        var metadataDir = tableLocation.Combine("metadata");
+        foreach (var entry in newMetadata.MetadataLog)
+        {
+            if (!StorageLocation.TryParse(entry.MetadataFile, out var logged) || !logged!.IsUnder(metadataDir) ||
+                logged.RelativeTo(metadataDir) is not { Length: > 0 } name || name.IndexOf('/') >= 0)
+                throw new ArgumentException(
+                    $"The new metadata's log names '{entry.MetadataFile}', which is not a file in {identifier}'s " +
+                    $"metadata directory, '{metadataDir}'.", nameof(newMetadata));
+        }
+
+        // Written as a URI even when given as a bare path, as CreateTableAsync writes it.
+        var committed = WithPreviousMetadataLogged(newMetadata with { Location = newLocation!.ToString() }, baseTable);
         var path = MetadataFilePath(identifier, baseVersion + 1);
         var json = IcebergJsonSerializer.Serialize(committed);
 
@@ -367,7 +508,7 @@ public sealed class FileSystemCatalog : ICatalog
                 $"another writer committed version {baseVersion + 1} first.");
 
         await TryWriteVersionHintAsync(identifier, baseVersion + 1).ConfigureAwait(false);
-        return new Table(identifier, committed, path);
+        return new Table(identifier, committed, Absolute(path));
     }
 
     // --- Internal helpers ---
@@ -425,15 +566,19 @@ public sealed class FileSystemCatalog : ICatalog
             throw new TableAlreadyExistsException(identifier);
 
         await TryWriteVersionHintAsync(identifier, 1).ConfigureAwait(false);
-        return new Table(identifier, metadata, path);
+        return new Table(identifier, metadata, Absolute(path));
     }
 
     private int ParseBaseVersion(Table baseTable)
     {
-        var expectedDir = MetadataDir(baseTable.Identifier) + "/";
+        // Compared as locations, so a table loaded by a catalog that spells the warehouse differently (file:/wh and
+        // file:///wh, s3a:// and s3://) commits here too.
+        var expectedDir = _warehouse.Combine(MetadataDir(baseTable.Identifier));
         var location = baseTable.MetadataLocation;
-        if (location is null || !location.StartsWith(expectedDir, StringComparison.Ordinal) ||
-            ParseMetadataVersion(location.Substring(expectedDir.Length)) is not { } version)
+        if (location is null || !StorageLocation.TryParse(location, out var parsed) ||
+            !parsed!.IsUnder(expectedDir) ||
+            parsed.RelativeTo(expectedDir) is not { Length: > 0 } fileName || fileName.IndexOf('/') >= 0 ||
+            ParseMetadataVersion(fileName) is not { } version)
             throw new ArgumentException(
                 $"The base table's metadata location '{location}' is not a version of {baseTable.Identifier} in " +
                 "this catalog; load the table from this catalog before committing to it.",

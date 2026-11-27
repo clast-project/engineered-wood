@@ -44,13 +44,17 @@ public sealed class ExpireSnapshots
     }
 
     /// <summary>
-    /// Applies the expiration policy, returning updated metadata and the list of deleted files.
-    /// When a file system is provided, orphaned manifest files are deleted from storage.
+    /// <para>Applies the expiration policy, returning updated metadata and the files no longer referenced.</para>
+    /// <para>When a resolver is provided, those files are deleted from storage, but only those under the table's own
+    /// location: a manifest the metadata names elsewhere (another table's, after a migration or a shallow copy)
+    /// may still be another table's, so it is left in place and reported in
+    /// <see cref="ExpireResult.FilesOutsideTable"/>, as Delta's VACUUM touches only files under its table.</para>
     /// </summary>
     public async ValueTask<ExpireResult> ApplyAsync(
-        TableMetadata metadata, ITableFileSystem? fs = null,
+        TableMetadata metadata, StorageResolver? resolver = null,
         CancellationToken ct = default)
     {
+        ITableFileSystem? fs = resolver is null ? null : new LocationFileSystem(resolver);
         // Expiry rewrites the table's metadata and deletes its files, so it is a write: refuse an encrypted
         // table up front, whatever would be expired and whether or not a file system is given.
         metadata.ThrowIfNotWritable();
@@ -100,9 +104,10 @@ public sealed class ExpireSnapshots
         var expiredIds = new HashSet<long>(expired.Select(s => s.SnapshotId));
         var keptSnapshots = allSnapshots.Where(s => !expiredIds.Contains(s.SnapshotId)).ToList();
 
-        // Collect files referenced by kept snapshots
-        var keptManifestLists = new HashSet<string>(keptSnapshots.Select(s => s.ManifestList));
-        var keptManifestPaths = new HashSet<string>();
+        // Collect files referenced by kept snapshots. Files are compared as locations, not strings: two snapshots
+        // can name one manifest in two spellings (file:/t/m.avro and file:///t/m.avro, s3a:// and s3://).
+        var keptManifestLists = new HashSet<string>(keptSnapshots.Select(s => s.ManifestList), LocationComparer.Instance);
+        var keptManifestPaths = new HashSet<string>(LocationComparer.Instance);
 
         if (fs is not null)
         {
@@ -118,14 +123,16 @@ public sealed class ExpireSnapshots
             }
         }
 
-        // Delete files only referenced by expired snapshots
+        // Delete files only referenced by expired snapshots, each once however many expired snapshots name it.
         var deletedFiles = new List<string>();
+        var candidates = new HashSet<string>(LocationComparer.Instance);
 
         foreach (var snap in expired)
         {
             if (!keptManifestLists.Contains(snap.ManifestList))
             {
-                deletedFiles.Add(snap.ManifestList);
+                if (candidates.Add(snap.ManifestList))
+                    deletedFiles.Add(snap.ManifestList);
 
                 if (fs is not null && await fs.ExistsAsync(snap.ManifestList, ct).ConfigureAwait(false))
                 {
@@ -135,20 +142,32 @@ public sealed class ExpireSnapshots
                     ManifestIO.ThrowIfEncryptedManifest(entries, snap, "its snapshots cannot be expired");
                     foreach (var e in entries)
                     {
-                        if (!keptManifestPaths.Contains(e.ManifestPath))
+                        if (!keptManifestPaths.Contains(e.ManifestPath) && candidates.Add(e.ManifestPath))
                             deletedFiles.Add(e.ManifestPath);
                     }
                 }
             }
         }
 
-        // Perform deletions
+        // Perform deletions, under the table's location only.
+        var outside = new List<string>();
+        var outsideSet = new HashSet<string>(StringComparer.Ordinal);
         if (fs is not null)
         {
+            var tableLocation = StorageLocation.Parse(metadata.Location);
             foreach (var file in deletedFiles)
             {
+                if (!StorageLocation.Parse(file).IsUnder(tableLocation))
+                {
+                    outside.Add(file);
+                    outsideSet.Add(file);
+                    continue;
+                }
+
                 await fs.DeleteAsync(file, ct).ConfigureAwait(false);
             }
+
+            deletedFiles.RemoveAll(outsideSet.Contains);
         }
 
         // Fix parent references in kept snapshots
@@ -175,11 +194,39 @@ public sealed class ExpireSnapshots
             LastUpdatedMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         };
 
-        return new ExpireResult(updatedMetadata, deletedFiles);
+        return new ExpireResult(updatedMetadata, deletedFiles) { FilesOutsideTable = outside };
     }
 }
 
 /// <summary>
-/// The result of a snapshot expiration operation, containing the updated metadata and paths of deleted files.
+/// The result of a snapshot expiration operation, containing the updated metadata and paths of deleted files
+/// (without a resolver, the files that would be deleted).
 /// </summary>
-public sealed record ExpireResult(TableMetadata Metadata, IReadOnlyList<string> DeletedFiles);
+public sealed record ExpireResult(TableMetadata Metadata, IReadOnlyList<string> DeletedFiles)
+{
+    /// <summary>
+    /// Files no longer referenced that lie outside the table's location, and so were left in place.
+    /// </summary>
+    public IReadOnlyList<string> FilesOutsideTable { get; init; } = [];
+}
+
+/// <summary>
+/// Compares file references as storage locations, so one file named in two spellings is one file. A reference that
+/// is not a location (a relative path in an old table) is compared as text.
+/// </summary>
+internal sealed class LocationComparer : IEqualityComparer<string>
+{
+    public static readonly LocationComparer Instance = new();
+
+    public bool Equals(string? x, string? y)
+    {
+        if (x is null || y is null)
+            return x is null && y is null;
+        bool px = StorageLocation.TryParse(x, out var lx);
+        bool py = StorageLocation.TryParse(y, out var ly);
+        return px && py ? lx == ly : !px && !py && string.Equals(x, y, StringComparison.Ordinal);
+    }
+
+    public int GetHashCode(string obj) =>
+        StorageLocation.TryParse(obj, out var location) ? location!.GetHashCode() : StringComparer.Ordinal.GetHashCode(obj);
+}

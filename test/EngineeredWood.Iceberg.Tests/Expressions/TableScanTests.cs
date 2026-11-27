@@ -26,7 +26,7 @@ public class TableScanTests : IDisposable
         _tempDir = Path.Combine(Path.GetTempPath(), $"iceberg-scan-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
         _fs = new LocalTableFileSystem(_tempDir);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -41,7 +41,7 @@ public class TableScanTests : IDisposable
         // File 1: ids 1-100, region a-m, scores 0-50
         new()
         {
-            FilePath = "data/file1.parquet", RecordCount = 100, FileSizeInBytes = 50000,
+            FilePath = "s3://bucket/t/data/file1.parquet", RecordCount = 100, FileSizeInBytes = 50000,
             NullValueCounts = new Dictionary<int, long> { [1] = 0, [2] = 0, [3] = 0 },
             ColumnLowerBounds = new Dictionary<int, LiteralValue>
                 { [1] = LiteralValue.Of(1L), [2] = LiteralValue.Of("a"), [3] = LiteralValue.Of(0.0) },
@@ -51,7 +51,7 @@ public class TableScanTests : IDisposable
         // File 2: ids 101-200, region n-z, scores 50-100
         new()
         {
-            FilePath = "data/file2.parquet", RecordCount = 100, FileSizeInBytes = 50000,
+            FilePath = "s3://bucket/t/data/file2.parquet", RecordCount = 100, FileSizeInBytes = 50000,
             NullValueCounts = new Dictionary<int, long> { [1] = 0, [2] = 0, [3] = 0 },
             ColumnLowerBounds = new Dictionary<int, LiteralValue>
                 { [1] = LiteralValue.Of(101L), [2] = LiteralValue.Of("n"), [3] = LiteralValue.Of(50.0) },
@@ -61,7 +61,7 @@ public class TableScanTests : IDisposable
         // File 3: ids 201-300, region a-z, all nulls for score
         new()
         {
-            FilePath = "data/file3.parquet", RecordCount = 100, FileSizeInBytes = 50000,
+            FilePath = "s3://bucket/t/data/file3.parquet", RecordCount = 100, FileSizeInBytes = 50000,
             NullValueCounts = new Dictionary<int, long> { [1] = 0, [2] = 0, [3] = 100 },
             ColumnLowerBounds = new Dictionary<int, LiteralValue>
                 { [1] = LiteralValue.Of(201L), [2] = LiteralValue.Of("a") },
@@ -76,7 +76,7 @@ public class TableScanTests : IDisposable
     [Fact]
     public async Task NoFilter_ReturnsAllFiles()
     {
-        var result = new TableScan(CreateMetadata(), _fs)
+        var result = new TableScan(CreateMetadata(), TestResolvers.For(_fs))
             .PlanFiles(_testFiles);
         Assert.Equal(3, result.FilesMatched);
         Assert.Equal(0, result.FilesSkipped);
@@ -85,31 +85,31 @@ public class TableScanTests : IDisposable
     [Fact]
     public async Task Filter_Eq_PrunesFiles()
     {
-        var result = new TableScan(CreateMetadata(), _fs)
+        var result = new TableScan(CreateMetadata(), TestResolvers.For(_fs))
             .Filter(Ex.Equal("id", 50L))
             .PlanFiles(_testFiles);
 
         Assert.Equal(1, result.FilesMatched);
         Assert.Equal(2, result.FilesSkipped);
-        Assert.Equal("data/file1.parquet", result.DataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/file1.parquet", result.DataFiles[0].FilePath);
     }
 
     [Fact]
     public async Task Filter_Gt_PrunesFiles()
     {
-        var result = new TableScan(CreateMetadata(), _fs)
+        var result = new TableScan(CreateMetadata(), TestResolvers.For(_fs))
             .Filter(Ex.GreaterThan("id", 200L))
             .PlanFiles(_testFiles);
 
         Assert.Equal(1, result.FilesMatched);
         Assert.Equal(2, result.FilesSkipped);
-        Assert.Equal("data/file3.parquet", result.DataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/file3.parquet", result.DataFiles[0].FilePath);
     }
 
     [Fact]
     public async Task Filter_Lt_PrunesFiles()
     {
-        var result = new TableScan(CreateMetadata(), _fs)
+        var result = new TableScan(CreateMetadata(), TestResolvers.For(_fs))
             .Filter(Ex.LessThan("id", 50L))
             .PlanFiles(_testFiles);
 
@@ -120,7 +120,7 @@ public class TableScanTests : IDisposable
     [Fact]
     public async Task Filter_String_PrunesFiles()
     {
-        var result = new TableScan(CreateMetadata(), _fs)
+        var result = new TableScan(CreateMetadata(), TestResolvers.For(_fs))
             .Filter(Ex.Equal("region", "xyz"))
             .PlanFiles(_testFiles);
 
@@ -132,32 +132,32 @@ public class TableScanTests : IDisposable
     [Fact]
     public async Task Filter_And_NarrowsResults()
     {
-        var result = new TableScan(CreateMetadata(), _fs)
+        var result = new TableScan(CreateMetadata(), TestResolvers.For(_fs))
             .Filter(Ex.GreaterThanOrEqual("id", 101L))
             .Filter(Ex.LessThanOrEqual("id", 200L))
             .PlanFiles(_testFiles);
 
         Assert.Equal(1, result.FilesMatched);
         Assert.Equal(2, result.FilesSkipped);
-        Assert.Equal("data/file2.parquet", result.DataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/file2.parquet", result.DataFiles[0].FilePath);
     }
 
     [Fact]
     public async Task Filter_IsNull_PrunesFiles()
     {
-        var result = new TableScan(CreateMetadata(), _fs)
+        var result = new TableScan(CreateMetadata(), TestResolvers.For(_fs))
             .Filter(Ex.IsNull("score"))
             .PlanFiles(_testFiles);
 
         Assert.Equal(1, result.FilesMatched);
         Assert.Equal(2, result.FilesSkipped);
-        Assert.Equal("data/file3.parquet", result.DataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/file3.parquet", result.DataFiles[0].FilePath);
     }
 
     [Fact]
     public async Task Filter_NotNull_PrunesAllNullFiles()
     {
-        var result = new TableScan(CreateMetadata(), _fs)
+        var result = new TableScan(CreateMetadata(), TestResolvers.For(_fs))
             .Filter(Ex.NotNull("score"))
             .PlanFiles(_testFiles);
 
@@ -168,7 +168,7 @@ public class TableScanTests : IDisposable
     [Fact]
     public async Task Filter_In_PrunesFiles()
     {
-        var result = new TableScan(CreateMetadata(), _fs)
+        var result = new TableScan(CreateMetadata(), TestResolvers.For(_fs))
             .Filter(Ex.In("id", 50L, 150L))
             .PlanFiles(_testFiles);
 
@@ -179,7 +179,7 @@ public class TableScanTests : IDisposable
     [Fact]
     public async Task Filter_UnknownColumn_ReturnsAll()
     {
-        var result = new TableScan(CreateMetadata(), _fs)
+        var result = new TableScan(CreateMetadata(), TestResolvers.For(_fs))
             .Filter(Ex.Equal("nonexistent", 1))
             .PlanFiles(_testFiles);
 
@@ -189,7 +189,7 @@ public class TableScanTests : IDisposable
     [Fact]
     public async Task EmptyFiles_ReturnsEmpty()
     {
-        var result = new TableScan(CreateMetadata(), _fs)
+        var result = new TableScan(CreateMetadata(), TestResolvers.For(_fs))
             .Filter(Ex.Equal("id", 1L))
             .PlanFiles([]);
 
@@ -201,11 +201,11 @@ public class TableScanTests : IDisposable
     {
         var metadata = CreateMetadata();
         var after = await _ops.AppendFilesAsync(metadata, [
-            new DataFile { FilePath = "data/v1.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
-            new DataFile { FilePath = "data/v2.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
+            new DataFile { FilePath = "s3://bucket/t/data/v1.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
+            new DataFile { FilePath = "s3://bucket/t/data/v2.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
         ]);
 
-        var result = await new TableScan(after, _fs).PlanFilesAsync();
+        var result = await new TableScan(after, TestResolvers.For(_fs)).PlanFilesAsync();
         Assert.Equal(2, result.FilesMatched);
     }
 
@@ -215,26 +215,26 @@ public class TableScanTests : IDisposable
         var metadata = CreateMetadata();
 
         var after1 = await _ops.AppendFilesAsync(metadata, [
-            new DataFile { FilePath = "data/v1.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
+            new DataFile { FilePath = "s3://bucket/t/data/v1.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
         ]);
         var snap1 = after1.CurrentSnapshotId!.Value;
 
         var after2 = await _ops.AppendFilesAsync(after1, [
-            new DataFile { FilePath = "data/v2.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
+            new DataFile { FilePath = "s3://bucket/t/data/v2.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
         ]);
 
-        var result = await new TableScan(after2, _fs)
+        var result = await new TableScan(after2, TestResolvers.For(_fs))
             .UseSnapshot(snap1)
             .PlanFilesAsync();
 
         Assert.Single(result.DataFiles);
-        Assert.Equal("data/v1.parquet", result.DataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/v1.parquet", result.DataFiles[0].FilePath);
     }
 
     [Fact]
     public async Task ScanResult_ReportsTotalAndSkipped()
     {
-        var result = new TableScan(CreateMetadata(), _fs)
+        var result = new TableScan(CreateMetadata(), TestResolvers.For(_fs))
             .Filter(Ex.Equal("id", 50L))
             .PlanFiles(_testFiles);
 
@@ -261,7 +261,7 @@ public class TableScanTests : IDisposable
         // Top-level s.x in 1-100 (rules out 500); struct s.x in 0-1000.
         new()
         {
-            FilePath = "data/d1.parquet", RecordCount = 10, FileSizeInBytes = 1000,
+            FilePath = "s3://bucket/t/data/d1.parquet", RecordCount = 10, FileSizeInBytes = 1000,
             NullValueCounts = new Dictionary<int, long> { [1] = 0, [12] = 0 },
             ColumnLowerBounds = new Dictionary<int, LiteralValue>
                 { [1] = LiteralValue.Of(1L), [12] = LiteralValue.Of(0L) },
@@ -271,7 +271,7 @@ public class TableScanTests : IDisposable
         // Top-level s.x in 101-200 (rules out 500); no stats for the struct field.
         new()
         {
-            FilePath = "data/d2.parquet", RecordCount = 10, FileSizeInBytes = 1000,
+            FilePath = "s3://bucket/t/data/d2.parquet", RecordCount = 10, FileSizeInBytes = 1000,
             NullValueCounts = new Dictionary<int, long> { [1] = 0 },
             ColumnLowerBounds = new Dictionary<int, LiteralValue> { [1] = LiteralValue.Of(101L) },
             ColumnUpperBounds = new Dictionary<int, LiteralValue> { [1] = LiteralValue.Of(200L) },
@@ -279,7 +279,7 @@ public class TableScanTests : IDisposable
         // Top-level s.x in 400-600 (admits 500).
         new()
         {
-            FilePath = "data/d3.parquet", RecordCount = 10, FileSizeInBytes = 1000,
+            FilePath = "s3://bucket/t/data/d3.parquet", RecordCount = 10, FileSizeInBytes = 1000,
             NullValueCounts = new Dictionary<int, long> { [1] = 0 },
             ColumnLowerBounds = new Dictionary<int, LiteralValue> { [1] = LiteralValue.Of(400L) },
             ColumnUpperBounds = new Dictionary<int, LiteralValue> { [1] = LiteralValue.Of(600L) },
@@ -287,7 +287,7 @@ public class TableScanTests : IDisposable
     ];
 
     private ScanResult PlanDotted(string sql) =>
-        new TableScan(TableMetadata.Create(DottedSchema, location: Path.Combine(_tempDir, "dotted")), _fs)
+        new TableScan(TableMetadata.Create(DottedSchema, location: Path.Combine(_tempDir, "dotted")), TestResolvers.For(_fs))
             .Filter(SparkSqlParser.ParsePredicate(sql))
             .PlanFiles(DottedFiles);
 
@@ -298,7 +298,7 @@ public class TableScanTests : IDisposable
 
         Assert.Equal(1, result.FilesMatched);
         Assert.Equal(2, result.FilesSkipped);
-        Assert.Equal("data/d3.parquet", result.DataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/d3.parquet", result.DataFiles[0].FilePath);
     }
 
     [Fact]

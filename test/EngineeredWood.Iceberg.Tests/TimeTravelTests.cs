@@ -20,7 +20,7 @@ public class TimeTravelTests : IDisposable
         _tempDir = Path.Combine(Path.GetTempPath(), $"iceberg-tt-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
         _fs = new LocalTableFileSystem(_tempDir);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -32,20 +32,20 @@ public class TimeTravelTests : IDisposable
     private async Task<TableMetadata> CreateTableWithSnapshotsAsync(
         Action<long>? onSnap1 = null, Action<long>? onSnap2 = null, Action<long>? onSnap3 = null)
     {
-        var metadata = TableMetadata.Create(_schema, location: "table");
+        var metadata = TableMetadata.Create(_schema, location: Path.Combine(_tempDir, "table"));
 
         var m1 = await _ops.AppendFilesAsync(metadata, [
-            new DataFile { FilePath = "f1.parquet", RecordCount = 100, FileSizeInBytes = 5000 }
+            new DataFile { FilePath = "s3://bucket/t/f1.parquet", RecordCount = 100, FileSizeInBytes = 5000 }
         ]);
         onSnap1?.Invoke(m1.CurrentSnapshotId!.Value);
 
         var m2 = await _ops.AppendFilesAsync(m1, [
-            new DataFile { FilePath = "f2.parquet", RecordCount = 200, FileSizeInBytes = 10000 }
+            new DataFile { FilePath = "s3://bucket/t/f2.parquet", RecordCount = 200, FileSizeInBytes = 10000 }
         ]);
         onSnap2?.Invoke(m2.CurrentSnapshotId!.Value);
 
         var m3 = await _ops.AppendFilesAsync(m2, [
-            new DataFile { FilePath = "f3.parquet", RecordCount = 300, FileSizeInBytes = 15000 }
+            new DataFile { FilePath = "s3://bucket/t/f3.parquet", RecordCount = 300, FileSizeInBytes = 15000 }
         ]);
         onSnap3?.Invoke(m3.CurrentSnapshotId!.Value);
 
@@ -63,7 +63,7 @@ public class TimeTravelTests : IDisposable
         Assert.Equal(snap1, atSnap1.CurrentSnapshotId);
         var files = await _ops.ListDataFilesAsync(atSnap1);
         Assert.Single(files);
-        Assert.Equal("f1.parquet", files[0].FilePath);
+        Assert.Equal("s3://bucket/t/f1.parquet", files[0].FilePath);
     }
 
     [Fact]

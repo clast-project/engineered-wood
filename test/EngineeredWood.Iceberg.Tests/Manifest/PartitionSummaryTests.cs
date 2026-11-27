@@ -22,7 +22,7 @@ public class PartitionSummaryTests : IDisposable
     {
         Directory.CreateDirectory(_dir);
         _fs = new LocalTableFileSystem(_dir);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -69,13 +69,13 @@ public class PartitionSummaryTests : IDisposable
         var md = TableMetadata.Create(TableSchema, Spec, location: Path.Combine(_dir, "t"));
         md = await _ops.AppendFilesAsync(md,
         [
-            File("data/a.parquet", 3, 1420, 19_000, "b", 0.0),
-            File("data/b.parquet", 7, -500, 18_000, "�", -0.0),
-            File("data/c.parquet", 0, null, 19_500, null, double.NaN),
+            File("s3://bucket/t/data/a.parquet", 3, 1420, 19_000, "b", 0.0),
+            File("s3://bucket/t/data/b.parquet", 7, -500, 18_000, "�", -0.0),
+            File("s3://bucket/t/data/c.parquet", 0, null, 19_500, null, double.NaN),
         ]);
 
         var snapshot = md.Snapshots.Single();
-        var summaries = Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList)).Partitions!;
+        var summaries = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList)).Partitions!;
         Assert.Equal(5, summaries.Count);
 
         void Bounds(int i, IcebergType type, object lower, object upper)
@@ -106,12 +106,12 @@ public class PartitionSummaryTests : IDisposable
         [
             new DataFile
             {
-                FilePath = "data/a.parquet", RecordCount = 1, FileSizeInBytes = 1,
+                FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 1, FileSizeInBytes = 1,
                 Partition = new PartitionData([new PartitionValue(1000, "name", IcebergType.String, null)]),
             },
         ]);
         var summary = Assert.Single(Assert.Single(
-            await ManifestIO.ReadManifestListAsync(_fs, md.Snapshots.Single().ManifestList)).Partitions!);
+            await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), md.Snapshots.Single().ManifestList)).Partitions!);
         Assert.True(summary.ContainsNull);
         Assert.Null(summary.LowerBound);
         Assert.Null(summary.UpperBound);
@@ -127,18 +127,18 @@ public class PartitionSummaryTests : IDisposable
         [
             new DataFile
             {
-                FilePath = "data/a.parquet", RecordCount = 1, FileSizeInBytes = 1,
+                FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 1, FileSizeInBytes = 1,
                 Partition = new PartitionData([new PartitionValue(1000, "key", IcebergType.Uuid, Guid.NewGuid())]),
             },
         ]);
-        Assert.Null(Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, md.Snapshots.Single().ManifestList)).Partitions);
+        Assert.Null(Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), md.Snapshots.Single().ManifestList)).Partitions);
     }
 
     [Fact]
     public async Task UnpartitionedManifests_HaveAnEmptySummaryList()
     {
         var md = TableMetadata.Create(TableSchema, location: Path.Combine(_dir, "p"));
-        md = await _ops.AppendFilesAsync(md, [new DataFile { FilePath = "data/a.parquet", RecordCount = 1, FileSizeInBytes = 1 }]);
-        Assert.Empty(Assert.Single(await ManifestIO.ReadManifestListAsync(_fs, md.Snapshots.Single().ManifestList)).Partitions!);
+        md = await _ops.AppendFilesAsync(md, [new DataFile { FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 1, FileSizeInBytes = 1 }]);
+        Assert.Empty(Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), md.Snapshots.Single().ManifestList)).Partitions!);
     }
 }

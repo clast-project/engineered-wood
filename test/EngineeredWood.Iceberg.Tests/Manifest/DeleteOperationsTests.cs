@@ -21,7 +21,7 @@ public class DeleteOperationsTests : IDisposable
         _warehouse = Path.Combine(Path.GetTempPath(), $"iceberg-del-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_warehouse);
         _fs = new LocalTableFileSystem(_warehouse);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -38,13 +38,13 @@ public class DeleteOperationsTests : IDisposable
     {
         var metadata = CreateTable();
         metadata = await _ops.AppendFilesAsync(metadata, [
-            new DataFile { FilePath = "data/f1.parquet", RecordCount = 1000, FileSizeInBytes = 50000 },
+            new DataFile { FilePath = "s3://bucket/t/data/f1.parquet", RecordCount = 1000, FileSizeInBytes = 50000 },
         ]);
 
         var deleteFile = new DataFile
         {
             Content = FileContent.PositionDeletes,
-            FilePath = "data/f1-deletes.parquet",
+            FilePath = "s3://bucket/t/data/f1-deletes.parquet",
             RecordCount = 10,
             FileSizeInBytes = 500,
         };
@@ -63,7 +63,7 @@ public class DeleteOperationsTests : IDisposable
         var dataFile = new DataFile
         {
             Content = FileContent.Data,
-            FilePath = "data/f.parquet",
+            FilePath = "s3://bucket/t/data/f.parquet",
             RecordCount = 100,
             FileSizeInBytes = 5000,
         };
@@ -76,13 +76,13 @@ public class DeleteOperationsTests : IDisposable
     {
         var metadata = CreateTable();
         metadata = await _ops.AppendFilesAsync(metadata, [
-            new DataFile { FilePath = "data/f1.parquet", RecordCount = 1000, FileSizeInBytes = 50000 },
+            new DataFile { FilePath = "s3://bucket/t/data/f1.parquet", RecordCount = 1000, FileSizeInBytes = 50000 },
         ]);
 
         var posDelete = new DataFile
         {
             Content = FileContent.PositionDeletes,
-            FilePath = "data/pos-del.parquet",
+            FilePath = "s3://bucket/t/data/pos-del.parquet",
             RecordCount = 5,
             FileSizeInBytes = 200,
         };
@@ -90,7 +90,7 @@ public class DeleteOperationsTests : IDisposable
         var eqDelete = new DataFile
         {
             Content = FileContent.EqualityDeletes,
-            FilePath = "data/eq-del.parquet",
+            FilePath = "s3://bucket/t/data/eq-del.parquet",
             RecordCount = 3,
             FileSizeInBytes = 150,
         };
@@ -108,14 +108,14 @@ public class DeleteOperationsTests : IDisposable
     {
         var metadata = CreateTable();
         metadata = await _ops.AppendFilesAsync(metadata, [
-            new DataFile { FilePath = "data/f1.parquet", RecordCount = 1000, FileSizeInBytes = 50000 },
+            new DataFile { FilePath = "s3://bucket/t/data/f1.parquet", RecordCount = 1000, FileSizeInBytes = 50000 },
         ]);
 
         metadata = await _ops.AppendDeleteFilesAsync(metadata, [
             new DataFile
             {
                 Content = FileContent.PositionDeletes,
-                FilePath = "data/del.parquet",
+                FilePath = "s3://bucket/t/data/del.parquet",
                 RecordCount = 5,
                 FileSizeInBytes = 200,
             },
@@ -124,8 +124,8 @@ public class DeleteOperationsTests : IDisposable
         var (dataFiles, deleteFiles) = await _ops.ScanFilesAsync(metadata);
         Assert.Single(dataFiles);
         Assert.Single(deleteFiles);
-        Assert.Equal("data/f1.parquet", dataFiles[0].FilePath);
-        Assert.Equal("data/del.parquet", deleteFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/f1.parquet", dataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/del.parquet", deleteFiles[0].FilePath);
     }
 
     [Fact]
@@ -134,7 +134,7 @@ public class DeleteOperationsTests : IDisposable
         var metadata = CreateTable();
         var originalFile = new DataFile
         {
-            FilePath = "data/original.parquet",
+            FilePath = "s3://bucket/t/data/original.parquet",
             RecordCount = 1000,
             FileSizeInBytes = 50000,
         };
@@ -142,7 +142,7 @@ public class DeleteOperationsTests : IDisposable
 
         var newFile = new DataFile
         {
-            FilePath = "data/rewritten.parquet",
+            FilePath = "s3://bucket/t/data/rewritten.parquet",
             RecordCount = 900,
             FileSizeInBytes = 45000,
         };
@@ -153,7 +153,7 @@ public class DeleteOperationsTests : IDisposable
 
         var dataFiles = await _ops.ListDataFilesAsync(updated);
         Assert.Single(dataFiles);
-        Assert.Equal("data/rewritten.parquet", dataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/rewritten.parquet", dataFiles[0].FilePath);
     }
 
     [Fact]
@@ -161,14 +161,14 @@ public class DeleteOperationsTests : IDisposable
     {
         var metadata = CreateTable();
         metadata = await _ops.AppendFilesAsync(metadata, [
-            new DataFile { FilePath = "data/a.parquet", RecordCount = 500, FileSizeInBytes = 25000 },
-            new DataFile { FilePath = "data/b.parquet", RecordCount = 500, FileSizeInBytes = 25000 },
+            new DataFile { FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 500, FileSizeInBytes = 25000 },
+            new DataFile { FilePath = "s3://bucket/t/data/b.parquet", RecordCount = 500, FileSizeInBytes = 25000 },
         ]);
 
         var updated = await _ops.OverwriteFilesAsync(
             metadata,
-            filesToDelete: [new DataFile { FilePath = "data/a.parquet", RecordCount = 500, FileSizeInBytes = 25000 }],
-            filesToAdd: [new DataFile { FilePath = "data/a-v2.parquet", RecordCount = 400, FileSizeInBytes = 20000 }]);
+            filesToDelete: [new DataFile { FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 500, FileSizeInBytes = 25000 }],
+            filesToAdd: [new DataFile { FilePath = "s3://bucket/t/data/a-v2.parquet", RecordCount = 400, FileSizeInBytes = 20000 }]);
 
         var summary = updated.Snapshots.Last().Summary;
         Assert.Equal("1", summary["deleted-data-files"]);
@@ -181,18 +181,18 @@ public class DeleteOperationsTests : IDisposable
     {
         var metadata = CreateTable();
         metadata = await _ops.AppendFilesAsync(metadata, [
-            new DataFile { FilePath = "data/a.parquet", RecordCount = 500, FileSizeInBytes = 25000 },
-            new DataFile { FilePath = "data/b.parquet", RecordCount = 500, FileSizeInBytes = 25000 },
+            new DataFile { FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 500, FileSizeInBytes = 25000 },
+            new DataFile { FilePath = "s3://bucket/t/data/b.parquet", RecordCount = 500, FileSizeInBytes = 25000 },
         ]);
 
         var updated = await _ops.OverwriteFilesAsync(
             metadata,
-            filesToDelete: [new DataFile { FilePath = "data/a.parquet", RecordCount = 500, FileSizeInBytes = 25000 }],
+            filesToDelete: [new DataFile { FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 500, FileSizeInBytes = 25000 }],
             filesToAdd: []);
 
         var dataFiles = await _ops.ListDataFilesAsync(updated);
         Assert.Single(dataFiles);
-        Assert.Equal("data/b.parquet", dataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/b.parquet", dataFiles[0].FilePath);
     }
 
     [Fact]
@@ -200,19 +200,19 @@ public class DeleteOperationsTests : IDisposable
     {
         var metadata = CreateTable();
         metadata = await _ops.AppendFilesAsync(metadata, [
-            new DataFile { FilePath = "data/f1.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
+            new DataFile { FilePath = "s3://bucket/t/data/f1.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
         ]);
 
         // Verify .avro files were created
         var snapshot = metadata.Snapshots[0];
         Assert.EndsWith(".avro", snapshot.ManifestList);
 
-        var manifestList = await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList);
+        var manifestList = await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList);
         Assert.EndsWith(".avro", manifestList[0].ManifestPath);
 
         // Verify data is readable
         var dataFiles = await _ops.ListDataFilesAsync(metadata);
         Assert.Single(dataFiles);
-        Assert.Equal("data/f1.parquet", dataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/f1.parquet", dataFiles[0].FilePath);
     }
 }

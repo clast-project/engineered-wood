@@ -64,8 +64,8 @@ public class ManifestAvroTests : IDisposable
             }
         };
 
-        await ManifestIO.WriteManifestAsync(_fs, path, entries);
-        var loaded = await ManifestIO.ReadManifestAsync(_fs, path);
+        await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), path, entries);
+        var loaded = await ManifestIO.ReadManifestAsync(TestResolvers.Io(_fs), path);
 
         Assert.Equal(2, loaded.Count);
 
@@ -126,8 +126,8 @@ public class ManifestAvroTests : IDisposable
             }
         };
 
-        await ManifestIO.WriteManifestListAsync(_fs, path, entries);
-        var loaded = await ManifestIO.ReadManifestListAsync(_fs, path);
+        await ManifestIO.WriteManifestListAsync(TestResolvers.Io(_fs), path, entries);
+        var loaded = await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), path);
 
         Assert.Equal(2, loaded.Count);
 
@@ -162,8 +162,8 @@ public class ManifestAvroTests : IDisposable
         };
 
         // Uses Avro because of .avro extension
-        await ManifestIO.WriteManifestAsync(_fs, path, entries);
-        var loaded = await ManifestIO.ReadManifestAsync(_fs, path);
+        await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), path, entries);
+        var loaded = await ManifestIO.ReadManifestAsync(TestResolvers.Io(_fs), path);
 
         Assert.Single(loaded);
         Assert.Equal("data/f.parquet", loaded[0].DataFile.FilePath);
@@ -189,8 +189,8 @@ public class ManifestAvroTests : IDisposable
         };
 
         // Uses JSON because of .json extension
-        await ManifestIO.WriteManifestAsync(_fs, path, entries);
-        var loaded = await ManifestIO.ReadManifestAsync(_fs, path);
+        await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), path, entries);
+        var loaded = await ManifestIO.ReadManifestAsync(TestResolvers.Io(_fs), path);
 
         Assert.Single(loaded);
     }

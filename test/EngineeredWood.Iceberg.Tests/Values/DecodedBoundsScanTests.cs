@@ -6,6 +6,7 @@ using EngineeredWood.Expressions;
 using EngineeredWood.Iceberg.Expressions;
 using EngineeredWood.Iceberg.Manifest;
 using EngineeredWood.Iceberg.Values;
+using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using static EngineeredWood.Iceberg.Tests.Values.JavaSingleValueVectorTests;
 using Ex = EngineeredWood.Iceberg.Expressions.Expressions;
@@ -53,7 +54,7 @@ public class DecodedBoundsScanTests
     private static ScanResult Plan(Predicate filter)
     {
         var metadata = TableMetadata.Create(CurrentSchema, location: "memory://table");
-        return new TableScan(metadata, new LocalTableFileSystem(Path.GetTempPath())).Filter(filter).PlanFiles(Files);
+        return new TableScan(metadata, TestResolvers.For(new LocalTableFileSystem(Path.GetTempPath()))).Filter(filter).PlanFiles(Files);
     }
 
     private static string[] Paths(ScanResult r) => r.DataFiles.Select(f => f.FilePath).ToArray();
@@ -83,7 +84,7 @@ public class DecodedBoundsScanTests
         };
 
         ScanResult Plan(Predicate p) => new TableScan(TableMetadata.Create(schema, location: "memory://table"),
-            new LocalTableFileSystem(Path.GetTempPath())).Filter(p).PlanFiles([file]);
+            new StorageResolver()).Filter(p).PlanFiles([file]);
 
         // The file holds fx = [00 FF] and s = "abcdef".
         Assert.Single(Plan(Cmp("fx", ComparisonOperator.GreaterThan, LiteralValue.Of(new byte[] { 0x00 }))).DataFiles);

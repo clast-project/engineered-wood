@@ -59,8 +59,8 @@ public class ManifestIOTests : IDisposable
             }
         };
 
-        await ManifestIO.WriteManifestAsync(_fs, path, entries);
-        var loaded = await ManifestIO.ReadManifestAsync(_fs, path);
+        await ManifestIO.WriteManifestAsync(TestResolvers.Io(_fs), path, entries);
+        var loaded = await ManifestIO.ReadManifestAsync(TestResolvers.Io(_fs), path);
 
         Assert.Equal(2, loaded.Count);
         Assert.Equal("data/file1.parquet", loaded[0].DataFile.FilePath);
@@ -89,8 +89,8 @@ public class ManifestIOTests : IDisposable
             }
         };
 
-        await ManifestIO.WriteManifestListAsync(_fs, path, entries);
-        var loaded = await ManifestIO.ReadManifestListAsync(_fs, path);
+        await ManifestIO.WriteManifestListAsync(TestResolvers.Io(_fs), path, entries);
+        var loaded = await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), path);
 
         Assert.Single(loaded);
         Assert.Equal("metadata/abc.manifest.json", loaded[0].ManifestPath);

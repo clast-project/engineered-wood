@@ -23,7 +23,7 @@ public class EncryptedTableTests : IDisposable
         _warehouse = Path.Combine(Path.GetTempPath(), $"iceberg-enc-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_warehouse);
         _fs = new LocalTableFileSystem(_warehouse);
-        _ops = new TableOperations(_fs);
+        _ops = new TableOperations(TestResolvers.For(_fs));
     }
 
     public void Dispose()
@@ -34,7 +34,7 @@ public class EncryptedTableTests : IDisposable
 
     private static readonly DataFile File1 = new()
     {
-        FilePath = "data/file1.parquet",
+        FilePath = "s3://bucket/t/data/file1.parquet",
         RecordCount = 10,
         FileSizeInBytes = 100,
     };
@@ -66,7 +66,7 @@ public class EncryptedTableTests : IDisposable
         var md = Encrypt(await TableWithOneSnapshotAsync(), how);
         Assert.True(md.IsEncrypted);
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
-            async () => await new TableScan(md, _fs).PlanFilesAsync());
+            async () => await new TableScan(md, TestResolvers.For(_fs)).PlanFilesAsync());
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
             async () => await _ops.ListDataFilesAsync(md));
     }
@@ -78,12 +78,12 @@ public class EncryptedTableTests : IDisposable
         var md = Encrypt(await TableWithOneSnapshotAsync(), how);
         var before = FilesUnder(md.Location);
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
-            async () => await _ops.AppendFilesAsync(md, [File1 with { FilePath = "data/file2.parquet" }]));
+            async () => await _ops.AppendFilesAsync(md, [File1 with { FilePath = "s3://bucket/t/data/file2.parquet" }]));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
             async () => await _ops.OverwriteFilesAsync(md, [File1], []));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
             async () => await _ops.AppendDeleteFilesAsync(md,
-                [File1 with { FilePath = "data/del.parquet", Content = FileContent.PositionDeletes }]));
+                [File1 with { FilePath = "s3://bucket/t/data/del.parquet", Content = FileContent.PositionDeletes }]));
         Assert.Equal(before, FilesUnder(md.Location));
     }
 
@@ -91,11 +91,11 @@ public class EncryptedTableTests : IDisposable
     public async Task KeyOnAnOlderSnapshotOnly_StillRefusesWrites()
     {
         // Only a historical snapshot is keyed; the current one is not. The table is still encrypted.
-        var md = await _ops.AppendFilesAsync(await TableWithOneSnapshotAsync(), [File1 with { FilePath = "data/file2.parquet" }]);
+        var md = await _ops.AppendFilesAsync(await TableWithOneSnapshotAsync(), [File1 with { FilePath = "s3://bucket/t/data/file2.parquet" }]);
         md = md with { Snapshots = [md.Snapshots[0] with { KeyId = "k1" }, md.Snapshots[1]] };
         var before = FilesUnder(md.Location);
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
-            async () => await _ops.AppendFilesAsync(md, [File1 with { FilePath = "data/file3.parquet" }]));
+            async () => await _ops.AppendFilesAsync(md, [File1 with { FilePath = "s3://bucket/t/data/file3.parquet" }]));
         Assert.Equal(before, FilesUnder(md.Location));
 
         // Reading the unkeyed current snapshot is still fine.
@@ -122,10 +122,10 @@ public class EncryptedTableTests : IDisposable
     public async Task ExpireSnapshots_IsRefused()
     {
         var md = await TableWithOneSnapshotAsync();
-        md = WithTableKey(await _ops.AppendFilesAsync(md, [File1 with { FilePath = "data/file2.parquet" }]));
+        md = WithTableKey(await _ops.AppendFilesAsync(md, [File1 with { FilePath = "s3://bucket/t/data/file2.parquet" }]));
         var oldest = md.Snapshots[0].SnapshotId;
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
-            async () => await new ExpireSnapshots().ExpireSnapshotId(oldest).ApplyAsync(md, _fs));
+            async () => await new ExpireSnapshots().ExpireSnapshotId(oldest).ApplyAsync(md, TestResolvers.For(_fs)));
     }
 
     [Fact]
@@ -133,7 +133,7 @@ public class EncryptedTableTests : IDisposable
     {
         var md = await TableWithOneSnapshotAsync();
         Assert.False(md.IsEncrypted);
-        var result = await new TableScan(md, _fs).PlanFilesAsync();
+        var result = await new TableScan(md, TestResolvers.For(_fs)).PlanFilesAsync();
         Assert.Single(result.DataFiles);
     }
 
@@ -144,7 +144,7 @@ public class EncryptedTableTests : IDisposable
             new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]),
             location: Path.Combine(_warehouse, "empty-scan"), formatVersion: 3));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
-            async () => await new TableScan(md, _fs).PlanFilesAsync());
+            async () => await new TableScan(md, TestResolvers.For(_fs)).PlanFilesAsync());
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
             async () => await _ops.ListDataFilesAsync(md));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
@@ -156,7 +156,7 @@ public class EncryptedTableTests : IDisposable
     public async Task PlanningCallerSuppliedFiles_IsRefused(string how)
     {
         var md = Encrypt(await TableWithOneSnapshotAsync(), how);
-        Assert.Throws<UnsupportedTableFeatureException>(() => new TableScan(md, _fs).PlanFiles([File1]));
+        Assert.Throws<UnsupportedTableFeatureException>(() => new TableScan(md, TestResolvers.For(_fs)).PlanFiles([File1]));
     }
 
     [Theory]
@@ -168,14 +168,14 @@ public class EncryptedTableTests : IDisposable
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
             async () => await new ExpireSnapshots().ExpireOlderThan(0).ApplyAsync(md));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
-            async () => await new ExpireSnapshots().ExpireOlderThan(long.MaxValue).ApplyAsync(md, fs: null));
+            async () => await new ExpireSnapshots().ExpireOlderThan(long.MaxValue).ApplyAsync(md, resolver: null));
     }
 
     [Fact]
     public async Task CherryPick_KeepsTheSourceSnapshotsKey()
     {
         var md = await TableWithOneSnapshotAsync();
-        md = await _ops.AppendFilesAsync(md, [File1 with { FilePath = "data/file2.parquet" }]);
+        md = await _ops.AppendFilesAsync(md, [File1 with { FilePath = "s3://bucket/t/data/file2.parquet" }]);
         var source = md.Snapshots[1];
         md = md with
         {
@@ -190,7 +190,7 @@ public class EncryptedTableTests : IDisposable
         // v3 lineage comes across with the manifest list it describes.
         Assert.Equal((source.FirstRowId, source.AddedRows), (current.FirstRowId, current.AddedRows));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
-            async () => await new TableScan(picked, _fs).PlanFilesAsync());
+            async () => await new TableScan(picked, TestResolvers.For(_fs)).PlanFilesAsync());
     }
 
     [Theory]
@@ -203,16 +203,16 @@ public class EncryptedTableTests : IDisposable
         var before = FilesUnder(md.Location);
 
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
-            async () => await _ops.AppendFilesAsync(md, [File1 with { FilePath = "data/file2.parquet" }]));
+            async () => await _ops.AppendFilesAsync(md, [File1 with { FilePath = "s3://bucket/t/data/file2.parquet" }]));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
             async () => await _ops.AppendDeleteFilesAsync(md,
-                [File1 with { FilePath = "data/del.parquet", Content = FileContent.PositionDeletes }]));
+                [File1 with { FilePath = "s3://bucket/t/data/del.parquet", Content = FileContent.PositionDeletes }]));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
             async () => await _ops.OverwriteFilesAsync(md, [File1], []));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
-            async () => await new ExpireSnapshots().ExpireOlderThan(long.MaxValue).ApplyAsync(md, _fs));
+            async () => await new ExpireSnapshots().ExpireOlderThan(long.MaxValue).ApplyAsync(md, TestResolvers.For(_fs)));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
-            async () => await new TableScan(md, _fs).PlanFilesAsync());
+            async () => await new TableScan(md, TestResolvers.For(_fs)).PlanFilesAsync());
         Assert.Equal(before, FilesUnder(md.Location));
     }
 }
