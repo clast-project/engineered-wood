@@ -68,10 +68,10 @@ public sealed class FileSystemCatalog : ICatalog
     /// </summary>
     private static void ThrowIfNotOneSegment(string name, string what)
     {
-        if (name.Length == 0 || name is "." or ".." || name.IndexOfAny(['/', '\\']) >= 0)
+        if (name.Length == 0 || name is "." or ".." || name.IndexOfAny(['/', '\\']) >= 0 || name.Any(char.IsControl))
             throw new ArgumentException(
                 $"The {what} '{name}' is not a valid name in a file-system catalog: it is a directory under the " +
-                "warehouse, so it cannot be empty, '.' or '..', or hold a '/' or '\\'.");
+                "warehouse, so it cannot be empty, '.' or '..', or hold a '/', a '\\' or a control character.");
     }
 
     private static string NamespacePropertiesPath(Namespace ns) =>
@@ -289,6 +289,13 @@ public sealed class FileSystemCatalog : ICatalog
         // its path under the warehouse and nowhere else, as in Iceberg Java's HadoopCatalog (whose withLocation
         // refuses any other location): the catalog finds, and a purge deletes, a table by that path.
         var defaultLocation = _warehouse.Combine(TablePath(identifier));
+
+        // The location is written into the metadata as text and parsed by every later read, so it must read back as
+        // itself: under a file: warehouse a '#' or '?' in a name would start a fragment or query.
+        if (!StorageLocation.TryParse(defaultLocation.ToString(), out var reparsed) || reparsed != defaultLocation)
+            throw new ArgumentException(
+                $"{identifier} cannot be created in this catalog: its location, '{defaultLocation}', would not read " +
+                "back as a storage location.", nameof(identifier));
         if (location is not null && StorageLocation.Parse(location) != defaultLocation)
             throw new ArgumentException(
                 $"A file-system catalog keeps each table at its path under the warehouse, '{defaultLocation}'; it " +

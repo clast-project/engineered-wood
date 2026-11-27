@@ -156,6 +156,22 @@ public class AbsoluteLocationTests : IDisposable
         Assert.Empty(Directory.GetFiles(metadataDir, "*.avro"));
     }
 
+    /// <summary>A table's location is written into its metadata as text and parsed by every later read, so a name
+    /// that would not read back (a <c>#</c> or <c>?</c> under a <c>file:</c> warehouse starts a fragment or query) is
+    /// refused before anything is written, rather than creating a table no operation can then use.</summary>
+    [Theory]
+    [InlineData("a#b")]
+    [InlineData("a?b")]
+    public async Task ATableWhoseLocationWouldNotReadBackIsRefused(string name)
+    {
+        var catalog = new FileSystemCatalog(new LocalTableFileSystem(_root));
+        await catalog.CreateNamespaceAsync(Namespace.Of("db"));
+        var id = new TableIdentifier(Namespace.Of("db"), name);
+
+        await Assert.ThrowsAsync<ArgumentException>(async () => await catalog.CreateTableAsync(id, _schema));
+        Assert.Empty(Directory.GetDirectories(Path.Combine(_root, "db")));
+    }
+
     /// <summary>Each namespace level and table name is a directory under the warehouse, so one that is not a plain
     /// segment would put files beside it: still inside the backend's root, where no root check would catch it.</summary>
     [Theory]
@@ -163,6 +179,7 @@ public class AbsoluteLocationTests : IDisposable
     [InlineData(".")]
     [InlineData("a/b")]
     [InlineData("a\\b")]
+    [InlineData("a\u0001b")]
     public async Task NamesThatAreNotOneSegmentAreRefused(string name)
     {
         string warehouse = Path.Combine(_root, "lake", "wh");
