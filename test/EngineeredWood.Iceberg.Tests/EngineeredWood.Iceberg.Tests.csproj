@@ -31,6 +31,9 @@
     <!-- The iceberg-go driver's source travels to the test output and is built there on first use
          (Interop/IcebergGo.cs). -->
     <None Update="Interop\iceberg-go\*.go;Interop\iceberg-go\go.mod;Interop\iceberg-go\go.sum" CopyToOutputDirectory="PreserveNewest" />
+    <!-- The DuckDB and pyiceberg drivers (Interop/DuckDbIceberg.cs, Interop/PyIceberg.cs). Not the corpus generators
+         under Interop/spark and Interop/iceberg-go, which tests never run. -->
+    <None Update="Interop\*.py" CopyToOutputDirectory="PreserveNewest" />
     <!-- Committed oracle vectors, read from the test output. The corpus is read in place (Corpus/IcebergCorpus.cs):
          copied under bin/, its deepest paths pass Windows' 260-character limit. -->
     <None Update="TestData\value-codecs\**\*;TestData\java-vectors\**\*" CopyToOutputDirectory="PreserveNewest" />

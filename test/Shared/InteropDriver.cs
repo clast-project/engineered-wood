@@ -444,6 +444,7 @@ internal sealed class InteropDriver
         var candidates = InterpreterOverride is { } exe
             ? new[] { exe }
             : new[] { "python3", "python" };
+        string? timedOut = null;
         foreach (string candidate in candidates)
         {
             try
@@ -459,8 +460,27 @@ internal sealed class InteropDriver
                     psi.EnvironmentVariables[kvp.Key] = kvp.Value;
 
                 using var p = Process.Start(psi)!;
-                string stdout = p.StandardOutput.ReadToEnd();
-                p.WaitForExit(30_000);
+
+                // As in Invoke: drain both pipes on their own threads and bound the wait, so a probe that stalls
+                // (a network download in it, say DuckDB's INSTALL of an extension) is killed and reported rather
+                // than blocking on stdout's EOF forever, and a full stderr pipe cannot wedge it. The bound is the
+                // driver's own command timeout (at least 30s), since such a probe can be slow the first time.
+                var stdoutTask = Task.Factory.StartNew(
+                    () => p.StandardOutput.ReadToEnd(),
+                    CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+                var stderrTask = Task.Factory.StartNew(
+                    () => p.StandardError.ReadToEnd(),
+                    CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+                int timeoutMs = Math.Max(30_000, TimeoutMs);
+                if (!p.WaitForExit(timeoutMs))
+                {
+                    try { p.Kill(); } catch { }
+                    timedOut = $"{candidate}: the probe timed out after {timeoutMs / 1000}s";
+                    continue;
+                }
+
+                string stdout = Drain(stdoutTask);
+                Drain(stderrTask);
                 if (p.ExitCode == 0)
                 {
                     string version = JsonDocument.Parse(stdout).RootElement.GetProperty("v").GetString()!;
@@ -473,6 +493,8 @@ internal sealed class InteropDriver
             }
         }
 
-        return (null, null, $"no python interpreter satisfying `{probeExpression}` on PATH");
+        return (null, null, timedOut is not null
+            ? $"no python interpreter satisfying `{probeExpression}` ({timedOut})"
+            : $"no python interpreter satisfying `{probeExpression}` on PATH");
     }
 }
