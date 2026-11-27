@@ -53,14 +53,30 @@ class _Registered:
     def __init__(self, metadata_location):
         self._dir = tempfile.mkdtemp(prefix="ew_pyiceberg_")
         self._location = metadata_location
+        self._catalog = None
 
     def __enter__(self):
-        catalog = _catalog(self._dir)
-        catalog.create_namespace("ew")
-        return catalog.register_table(("ew", "t"), self._location)
+        try:
+            self._catalog = _catalog(self._dir)
+            self._catalog.create_namespace("ew")
+            return self._catalog.register_table(("ew", "t"), self._location)
+        except BaseException:
+            # __exit__ does not run when __enter__ raises.
+            self._cleanup()
+            raise
 
     def __exit__(self, *exc):
-        shutil.rmtree(self._dir, ignore_errors=True)
+        self._cleanup()
+
+    def _cleanup(self):
+        # Close the catalog first: its SQLite connection keeps catalog.db open, and on Windows an open file
+        # cannot be deleted, so the directory was left behind (MEASURED: hundreds of ew_pyiceberg_* in %TEMP%).
+        try:
+            if self._catalog is not None:
+                self._catalog.close()
+        finally:
+            self._catalog = None
+            shutil.rmtree(self._dir, ignore_errors=True)
 
 
 def _rows(table):
@@ -201,11 +217,15 @@ def cmd_scenario(args):
     """Writes one v2 scenario table into a SQL catalog under `warehouse` and returns its newest metadata
     file's location."""
     catalog = _catalog(args["warehouse"])
-    catalog.create_namespace_if_not_exists("ew")
-    name = args["scenario"]
-    steps = SCENARIOS[name](catalog)
-    table = catalog.load_table(("ew", name))
-    return {"metadata_location": table.metadata_location, "table_location": table.location(), "steps": steps}
+    try:
+        catalog.create_namespace_if_not_exists("ew")
+        name = args["scenario"]
+        steps = SCENARIOS[name](catalog)
+        table = catalog.load_table(("ew", name))
+        return {"metadata_location": table.metadata_location, "table_location": table.location(), "steps": steps}
+    finally:
+        # The warehouse belongs to the test, which deletes it; an open catalog.db would stop that on Windows.
+        catalog.close()
 
 
 def cmd_version(args):
