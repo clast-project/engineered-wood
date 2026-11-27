@@ -151,6 +151,22 @@ public sealed class TableFileSystemConfinementTests : IDisposable
         Assert.Equal(new[] { "inside.txt" }, paths);
     }
 
+    /// <summary>A listing whose last segment is a dot segment lists that directory, not its siblings whose names start
+    /// with its name.</summary>
+    [Theory]
+    [InlineData("sub/.")]
+    [InlineData("sub/x/..")]
+    public async Task Local_ListingADirectoryByDotSegments_ListsThatDirectory(string prefix)
+    {
+        File.WriteAllText(Path.Combine(_root, "sub", "a.txt"), "A");
+        Directory.CreateDirectory(Path.Combine(_root, "sub2"));
+        File.WriteAllText(Path.Combine(_root, "sub2", "b.txt"), "B");
+        var paths = new List<string>();
+        await foreach (var file in Create("local").ListAsync(prefix))
+            paths.Add(file.Path);
+        Assert.Equal(new[] { "sub/a.txt" }, paths);
+    }
+
     private ITableFileSystem Create(string backend) => backend switch
     {
         "local" => new LocalTableFileSystem(_root),

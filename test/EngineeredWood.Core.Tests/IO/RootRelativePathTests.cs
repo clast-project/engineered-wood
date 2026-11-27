@@ -54,6 +54,16 @@ public class RootRelativePathTests
         RootRelativePath.ThrowIfEscapesRoot(path.TrimStart('\\'), backslashSeparates: false);
     }
 
+    /// <summary>A mixed-separator path can stay inside under one reading of <c>\</c> and climb out under the other,
+    /// which is why a wrapper that does not know its backend checks both.</summary>
+    [Fact]
+    public void MixedSeparators_DependOnTheReading()
+    {
+        const string path = @"a\b/../../x";
+        RootRelativePath.ThrowIfEscapesRoot(path, backslashSeparates: true);
+        Assert.Throws<ArgumentException>(() => RootRelativePath.ThrowIfEscapesRoot(path, backslashSeparates: false));
+    }
+
     [Fact]
     public void Null_IsRefused()
     {

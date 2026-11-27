@@ -70,10 +70,12 @@ public sealed class LocalTableFileSystem : ITableFileSystem, ILocatedFileSystem
         else
         {
             string fullPrefix = ResolvePath(prefix);
-            if (fullPrefix.Length == _rootPath.Length)
+            if (fullPrefix.Length == _rootPath.Length || EndsWithDotSegment(prefix))
             {
-                // "." or "a/..": the root itself. Its parent directory is outside the root.
-                directory = _rootPath;
+                // "." or "a/..", or "wh/." from a subtree over this one: a directory, which GetFullPath spells
+                // without a trailing separator. Taken as a file-name prefix it would list the directory's siblings
+                // whose names start with its name, and for the root itself those are outside the root (#962).
+                directory = fullPrefix;
                 searchPattern = "*";
             }
             else
@@ -109,6 +111,17 @@ public sealed class LocalTableFileSystem : ITableFileSystem, ILocatedFileSystem
                 info.Length,
                 new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero));
         }
+    }
+
+    /// <summary>Whether the last segment of <paramref name="prefix"/> is <c>.</c> or <c>..</c>, so that it names a
+    /// directory however <see cref="Path.GetFullPath(string)"/> spells it.</summary>
+    private static bool EndsWithDotSegment(string prefix)
+    {
+        int end = prefix.Length;
+        int start = end;
+        while (start > 0 && prefix[start - 1] != '/' && prefix[start - 1] != Path.DirectorySeparatorChar)
+            start--;
+        return end - start is 1 or 2 && prefix.Substring(start, end - start).Trim('.').Length == 0;
     }
 
     /// <inheritdoc/>

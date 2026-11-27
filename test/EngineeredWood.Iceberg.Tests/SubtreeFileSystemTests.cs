@@ -36,6 +36,7 @@ public sealed class SubtreeFileSystemTests : IDisposable
     [InlineData("db/../../other/x")]
     [InlineData("../wh/db/x")]
     [InlineData("/other/x")]
+    [InlineData(@"db\x/../../other/x")] // inside if '\' separates, out if "db\x" is one name (a POSIX directory)
     public async Task PathLeavingTheSubtree_IsRefused(string path)
     {
         var fs = Subtree();
@@ -51,5 +52,22 @@ public sealed class SubtreeFileSystemTests : IDisposable
         var fs = Subtree();
         Assert.Equal("IN", System.Text.Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("db/x")));
         Assert.Equal("IN", System.Text.Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("db/./x")));
+    }
+
+    /// <summary>A listing of the subtree's root spelled with dot segments lists the subtree, and not the files beside
+    /// it whose names start with its name.</summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData(".")]
+    [InlineData("db/..")]
+    public async Task ListingTheSubtreeRoot_StaysInside(string prefix)
+    {
+        File.WriteAllText(Path.Combine(_root, "wh-secret.txt"), "OUT");
+        Directory.CreateDirectory(Path.Combine(_root, "wh2"));
+        File.WriteAllText(Path.Combine(_root, "wh2", "y"), "OUT");
+        var paths = new List<string>();
+        await foreach (var file in Subtree().ListAsync(prefix))
+            paths.Add(file.Path);
+        Assert.Equal(new[] { "db/x" }, paths);
     }
 }

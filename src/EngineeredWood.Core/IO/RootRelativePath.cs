@@ -28,7 +28,8 @@ public static class RootRelativePath
     /// </summary>
     /// <param name="path">The path relative to the root.</param>
     /// <param name="backslashSeparates">Whether <c>\</c> separates segments, as it does in a Windows path. A
-    /// wrapper that does not know which backend it wraps should pass <see langword="true"/>.</param>
+    /// wrapper that does not know which backend it wraps should check both readings: a path can stay inside under one
+    /// and climb out under the other (<c>a\b/../../x</c>).</param>
     /// <exception cref="ArgumentNullException"><paramref name="path"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException"><paramref name="path"/> is rooted or climbs above the root.</exception>
     public static void ThrowIfEscapesRoot(string path, bool backslashSeparates)
