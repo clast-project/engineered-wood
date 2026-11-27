@@ -35,12 +35,12 @@ public class StorageLocationTests
     [InlineData("s3://bucket/a/b", "s3://Bucket/a/b")]
     [InlineData("s3://bucket/a/b", "s3://bucket/a/B")]
     [InlineData("s3://bucket/a/b", "gs://bucket/a/b")]
-    [InlineData("s3://bucket/a//b", "s3://bucket/a/b")]
     [InlineData("s3://bucket/a%2Fb", "s3://bucket/a/b")]
     [InlineData("s3://bucket/a%20b", "s3://bucket/a b")]
     [InlineData("abfss://c@acct.dfs.core.windows.net/a", "abfss://c@other.dfs.core.windows.net/a")]
     [InlineData("abfss://c@acct.dfs.core.windows.net/a", "abfss://d@acct.dfs.core.windows.net/a")]
     [InlineData("file:/tmp/a%20b", "file:/tmp/a b")]
+    [InlineData("http://example.com/t", "https://example.com/t")]
     public void DifferentObjectsAreNotEqual(string a, string b) =>
         Assert.NotEqual(StorageLocation.Parse(a), StorageLocation.Parse(b));
 
@@ -66,6 +66,83 @@ public class StorageLocationTests
         Assert.False(StorageLocation.TryParse(location, out _));
     }
 
+    /// <summary>The object stores' file systems strip a leading <c>/</c> and turn <c>\</c> into <c>/</c>, so these
+    /// would reach a different key than they name.</summary>
+    [Theory]
+    [InlineData("s3://bucket/a//b")]
+    [InlineData("s3://bucket//x")]
+    [InlineData("s3://bucket/t/a\\b")]
+    [InlineData("gs://bucket/t//x")]
+    [InlineData("abfss://c@acct.dfs.core.windows.net/t/a\\b")]
+    public void ObjectStoreKeysThatDoNotRoundTripAreRefused(string location)
+    {
+        Assert.Throws<NotSupportedException>(() => StorageLocation.Parse(location));
+        Assert.False(StorageLocation.TryParse(location, out _));
+    }
+
+    [Theory]
+    [InlineData("a//b")]
+    [InlineData("a\\b")]
+    public void CombineRefusesObjectStoreKeysThatDoNotRoundTrip(string relative) =>
+        Assert.Throws<NotSupportedException>(() => StorageLocation.Parse("s3://bucket/t").Combine(relative));
+
+    /// <summary>On Windows a <c>\</c> in a file URI separates segments, as the operating system takes it, so a
+    /// <c>..</c> written with it navigates here rather than in the backend, after the prefix check.</summary>
+    [Fact]
+    public void FileUriBackslashesSeparateSegmentsOnWindows()
+    {
+        var table = StorageLocation.Parse("file:///C:/safe/table");
+        var location = StorageLocation.Parse("file:///C:/safe/table/sub\\..\\..\\victim.dv");
+        if (IsWindows)
+        {
+            Assert.Equal(StorageLocation.Parse("C:/safe/victim.dv"), location);
+            Assert.False(location.IsUnder(table));
+        }
+        else
+        {
+            // Elsewhere \ is an ordinary file-name character.
+            Assert.Equal("sub\\..\\..\\victim.dv", location.RelativeTo(table));
+        }
+    }
+
+    /// <summary>Below a root, Windows takes a drive as a new root (<c>Path.Combine("C:/t", "D:/x")</c> is
+    /// <c>D:/x</c>), so a drive anywhere but first would let a path under one location reach another.</summary>
+    [Theory]
+    [InlineData("file:///C:/safe/table/C:/outside/dv.bin")]
+    [InlineData("C:/a/D:/x")]
+    [InlineData("/tmp/C:/x")]
+    [InlineData("file://server/C:/x")]
+    public void DrivesBelowTheRootAreRefused(string location)
+    {
+        Assert.Throws<FormatException>(() => StorageLocation.Parse(location));
+        Assert.Throws<ArgumentException>(() => StorageLocation.Parse("file:///C:/safe/table").Combine("sub/D:/x"));
+    }
+
+    [Fact]
+    public void PercentEncodedUrisAreDecodedSegmentBySegment()
+    {
+        // The structure is read first, so an escaped # or ? is part of a name rather than a delimiter.
+        var dv = StorageLocation.ParsePercentEncoded("file:///tmp/table/a%23b%3Fc/dv%20x.bin");
+        Assert.Equal(StorageLocation.Parse("/tmp/table").Combine("a#b?c/dv x.bin"), dv);
+        Assert.Equal("file:///tmp/table/a%23b%3Fc/dv%20x.bin", dv.ToString());
+        Assert.Equal(
+            StorageLocation.Parse("s3://bucket/t").Combine("a#b"),
+            StorageLocation.ParsePercentEncoded("s3://bucket/t/a%23b"));
+
+        // An unescaped # or ? is still a fragment or query, which no location has.
+        Assert.Throws<FormatException>(() => StorageLocation.ParsePercentEncoded("file:///tmp/table/a#b"));
+    }
+
+    [Theory]
+    [InlineData("s3://bucket/t/%2E%2E/x")]
+    [InlineData("s3://bucket/t/a%2F..%2Fx")]
+    [InlineData("file:///tmp/t/%2E%2E/x")]
+    [InlineData("file:///tmp/t/a%2Fb")]
+    [InlineData("file:///tmp/t/a%5Cb")]
+    [InlineData("file:///tmp/t/a%00b")]
+    public void SegmentsThatDecodeToMoreThanOneSegmentAreRefused(string location) =>
+        Assert.Throws<NotSupportedException>(() => StorageLocation.ParsePercentEncoded(location));
+
     [Fact]
     public void PercentEncodedDotsAreLiteralSegments()
     {
@@ -85,6 +162,9 @@ public class StorageLocationTests
     [InlineData("/tmp/../../x")]
     [InlineData("C:/..")]
     [InlineData("\\\\?\\C:\\x")]
+    [InlineData("\\\\.\\C:\\x")]
+    [InlineData("file://?/C:/x")]
+    [InlineData("file://./C:/x")]
     [InlineData("s3://bucket/a\nb")]
     public void NonLocationsAreRefused(string text)
     {
@@ -155,9 +235,9 @@ public class StorageLocationTests
     [Fact]
     public void CombineKeepsObjectStoreSegmentsVerbatim()
     {
-        var file = StorageLocation.Parse("s3://bucket/t").Combine("a//b%2E/c");
-        Assert.Equal("s3://bucket/t/a//b%2E/c", file.ToString());
-        Assert.Equal("a//b%2E/c", file.RelativeTo(StorageLocation.Parse("s3://bucket/t")));
+        var file = StorageLocation.Parse("s3://bucket/t").Combine("a/b%2E/c#d");
+        Assert.Equal("s3://bucket/t/a/b%2E/c#d", file.ToString());
+        Assert.Equal("a/b%2E/c#d", file.RelativeTo(StorageLocation.Parse("s3://bucket/t")));
     }
 
     [Theory]

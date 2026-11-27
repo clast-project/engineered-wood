@@ -33,6 +33,14 @@ namespace EngineeredWood.IO;
 /// the literal key on its default path. No reading of it is portable, so the refusal is permanent: EW neither reads
 /// nor writes such a location. A <c>%2E%2E</c> segment is not a dot segment; like every <c>%</c>, it is literal.</para>
 ///
+/// <para>An empty segment (<c>s3://b/t//x</c>) or a <c>\</c> in an object-store location is refused too: the object
+/// stores' file systems strip a leading <c>/</c> and turn <c>\</c> into <c>/</c>, so they would read a different key
+/// than the location names.</para>
+///
+/// <para>On Windows a <c>file</c> URI treats <c>\</c> as a separator, as the operating system does (a bare path always
+/// does), and a drive (<c>C:</c>) anywhere but at the start of a local path is refused: below a root, Windows would
+/// take it as a new root.</para>
+///
 /// <para>Equality and hashing use the normalized form, so one location has one identity however it was spelled.
 /// <see cref="ToString"/> keeps the spelling it was given, so a location EW derives from a table's own location is
 /// written back in that table's spelling.</para>
@@ -84,13 +92,29 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
     /// <summary>
     /// Parses an absolute location. Throws <see cref="FormatException"/> for text that is not one (a relative
     /// path, an empty string, a malformed URI) and <see cref="NotSupportedException"/> for a <c>.</c> or <c>..</c>
-    /// segment outside a <c>file</c> location.
+    /// segment, an empty segment or a <c>\</c> outside a <c>file</c> location.
     /// </summary>
     public static StorageLocation Parse(string location)
     {
         if (location is null)
             throw new ArgumentNullException(nameof(location));
-        return ParseCore(location, throwOnError: true)!;
+        return ParseCore(location, decode: false, throwOnError: true)!;
+    }
+
+    /// <summary>
+    /// <para>Parses a location given as a percent-encoded URI, as Delta's absolute deletion-vector paths are. The
+    /// URI's structure (scheme, authority, path, and any query or fragment, which a location cannot have) is read from
+    /// the text as given, and only then is each path segment decoded. So <c>a%23b</c> is the segment <c>a#b</c>, not
+    /// the start of a fragment, as with <c>java.net.URI</c>.</para>
+    /// <para>A segment that decodes to <c>.</c> or <c>..</c>, or to text with a <c>/</c>, a <c>\</c> or a control
+    /// character, is refused (<see cref="NotSupportedException"/>), so a decoded segment can neither navigate nor
+    /// become two. <see cref="ToString"/> keeps the encoded spelling; equality uses the decoded segments.</para>
+    /// </summary>
+    public static StorageLocation ParsePercentEncoded(string location)
+    {
+        if (location is null)
+            throw new ArgumentNullException(nameof(location));
+        return ParseCore(location, decode: true, throwOnError: true)!;
     }
 
     /// <summary>
@@ -98,7 +122,7 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
     /// </summary>
     public static bool TryParse(string? location, out StorageLocation? result)
     {
-        result = location is null ? null : ParseCore(location, throwOnError: false);
+        result = location is null ? null : ParseCore(location, decode: false, throwOnError: false);
         return result is not null;
     }
 
@@ -157,6 +181,11 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
 
             if (IsFile && part.Length == 0)
                 continue;
+            if (!IsFile && (part.Length == 0 || part.IndexOf('\\') >= 0))
+                throw UnreachableKeyRefusal(relativePath);
+            if (IsFile && IsMisplacedDrive(part, segments.Count, _keyAuthority))
+                throw new ArgumentException(
+                    $"'{relativePath}' has a drive segment, which would root it outside '{this}'.", nameof(relativePath));
             segments.Add(part);
         }
 
@@ -243,7 +272,7 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
 
     // ---------------------------------------------------------------- parsing
 
-    private static StorageLocation? ParseCore(string location, bool throwOnError)
+    private static StorageLocation? ParseCore(string location, bool decode, bool throwOnError)
     {
         if (location.Length == 0)
             return Fail(throwOnError, "A storage location cannot be empty.");
@@ -254,7 +283,7 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         }
 
         if (IsDriveLetterPath(location) || location[0] is '/' or '\\')
-            return ParseLocalPath(location, throwOnError);
+            return ParseLocalPath(location, decode, throwOnError);
 
         int schemeLength = SchemeLength(location);
         if (schemeLength == 0)
@@ -264,7 +293,7 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         string scheme = location.Substring(0, schemeLength).ToLowerInvariant();
         string rest = location.Substring(schemeLength + 1);
         if (scheme == "file")
-            return ParseFileUri(location, rest, throwOnError);
+            return ParseFileUri(location, rest, decode, throwOnError);
 
         if (!rest.StartsWith("//", StringComparison.Ordinal))
             return Fail(throwOnError, $"Storage location '{location}' has no authority ('{scheme}://<authority>/...').");
@@ -281,13 +310,29 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         if (text.Length < schemeLength + 3 + authority.Length)
             text = location.Substring(0, schemeLength + 3 + authority.Length);
         string[] segments = SplitPath(path.TrimEnd('/'));
-        foreach (string segment in segments)
+        for (int i = 0; i < segments.Length; i++)
         {
+            string segment = segments[i];
             if (segment is "." or "..")
             {
                 if (throwOnError)
                     throw DotSegmentRefusal(location);
                 return null;
+            }
+
+            if (segment.Length == 0 || segment.IndexOf('\\') >= 0)
+            {
+                if (throwOnError)
+                    throw UnreachableKeyRefusal(location);
+                return null;
+            }
+
+            if (decode)
+            {
+                string? decoded = DecodeSegment(location, segment, throwOnError);
+                if (decoded is null)
+                    return null;
+                segments[i] = decoded;
             }
         }
 
@@ -322,7 +367,7 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
                     return new StorageLocation(text, scheme, "azure", BlobHost(host), segments);
                 }
 
-                return new StorageLocation(text, scheme, "https", host, segments);
+                return new StorageLocation(text, scheme, scheme, host, segments);
             }
 
             default:
@@ -330,7 +375,7 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         }
     }
 
-    private static StorageLocation? ParseFileUri(string location, string rest, bool throwOnError)
+    private static StorageLocation? ParseFileUri(string location, string rest, bool decode, bool throwOnError)
     {
         // file:/C:/x and file:/tmp/x (Hadoop), file:///C:/x and file:///tmp/x (RFC 8089), file://localhost/x,
         // file://server/share/x (UNC). A query or fragment cannot be part of a file location.
@@ -357,33 +402,32 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         if (path.IndexOfAny(['?', '#']) >= 0)
             return Fail(throwOnError, $"File location '{location}' has a query or fragment.");
 
-        // /C:/x is the drive path C:/x.
-        string localPath = path.Length >= 3 && path[0] == '/' && IsDriveLetterPath(path.Substring(1))
-            ? path.Substring(1)
-            : path;
+        // Windows opens a path with \ as it does one with /, so \ separates segments here as it does in a bare path.
+        if (IsWindows)
+            path = path.Replace('\\', '/');
+
+        // /C:/x is the drive path C:/x. Under a server (file://server/C:/x) it stays a segment, which is refused.
+        string localPath;
         if (authority.Length > 0)
-            localPath = "//" + authority + localPath;
-        return BuildFile(location, localPath, throwOnError);
+            localPath = "//" + authority + path;
+        else if (path.Length >= 3 && path[0] == '/' && IsDriveLetterPath(path.Substring(1)))
+            localPath = path.Substring(1);
+        else
+            localPath = path;
+        return BuildFile(location, localPath, decode, throwOnError);
     }
 
-    private static StorageLocation? ParseLocalPath(string location, bool throwOnError)
+    private static StorageLocation? ParseLocalPath(string location, bool decode, bool throwOnError)
     {
         string text = location.Replace('\\', '/');
-        if (text.StartsWith("//", StringComparison.Ordinal))
-        {
-            // \\?\ and \\.\ device paths name things a table format never points at.
-            if (text.StartsWith("//?/", StringComparison.Ordinal) || text.StartsWith("//./", StringComparison.Ordinal))
-                return Fail(throwOnError, $"Device path '{location}' is not a storage location.");
-        }
-
         if (IsDriveLetterPath(text) && (text.Length == 2 || text[2] != '/'))
             return Fail(throwOnError, $"'{location}' is relative to the current directory of drive {text[0]}:.");
-        return BuildFile(null, text, throwOnError);
+        return BuildFile(null, text, decode, throwOnError);
     }
 
     /// <summary>Builds a file location from a <c>/</c>-separated local path: <c>C:/x</c>, <c>//server/share/x</c> or
     /// <c>/x</c>. <paramref name="uriText"/> is the URI it was given as, or null for a bare path.</summary>
-    private static StorageLocation? BuildFile(string? uriText, string localPath, bool throwOnError)
+    private static StorageLocation? BuildFile(string? uriText, string localPath, bool decode, bool throwOnError)
     {
         string authority = "";
         string path = localPath;
@@ -394,6 +438,10 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
             path = slash < 0 ? "" : path.Substring(slash);
             if (authority.Length == 0)
                 return Fail(throwOnError, $"'{uriText ?? localPath}' names no UNC server.");
+
+            // \\?\ and \\.\ device paths (file://?/ and file://./ too) name things a table format never points at.
+            if (authority is "?" or ".")
+                return Fail(throwOnError, $"Device path '{uriText ?? localPath}' is not a storage location.");
         }
 
         var segments = new List<string>();
@@ -402,6 +450,14 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         for (int i = 0; i < parts.Length; i++)
         {
             string part = parts[i];
+            if (decode && part is not ("" or "." or ".."))
+            {
+                string? decoded = DecodeSegment(uriText ?? localPath, part, throwOnError);
+                if (decoded is null)
+                    return null;
+                part = decoded;
+            }
+
             if (part.Length == 0 || part == ".")
                 continue;
             if (part == "..")
@@ -411,6 +467,10 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
                 segments.RemoveAt(segments.Count - 1);
                 continue;
             }
+
+            if (IsMisplacedDrive(part, segments.Count, authority))
+                return Fail(throwOnError,
+                    $"'{uriText ?? localPath}' has a drive segment '{part}' below its root, which would root the path elsewhere.");
 
             segments.Add(part);
             // A drive (C:) or a UNC share is the root: nothing climbs above it.
@@ -439,6 +499,28 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         }
 
         return new StorageLocation(text, "file", "file", authority, segments.ToArray());
+    }
+
+    /// <summary>A drive segment (<c>C:</c>) anywhere but first in a path with no UNC server.</summary>
+    private static bool IsMisplacedDrive(string segment, int index, string authority) =>
+        IsDriveSegment(segment) && (index > 0 || authority.Length > 0);
+
+    /// <summary>One percent-decoded path segment, or a refusal when it decodes to anything but one plain segment.</summary>
+    private static string? DecodeSegment(string location, string segment, bool throwOnError)
+    {
+        if (segment.IndexOf('%') < 0)
+            return segment;
+        string decoded = Uri.UnescapeDataString(segment);
+        bool plain = decoded is not ("" or "." or "..") && decoded.IndexOfAny(['/', '\\']) < 0;
+        foreach (char c in decoded)
+            plain &= !char.IsControl(c);
+        if (plain)
+            return decoded;
+        if (throwOnError)
+            throw new NotSupportedException(
+                $"'{location}' has a segment '{segment}' that decodes to '{decoded}', which is not one plain segment " +
+                "(it is '.' or '..', or has a separator or a control character). EW refuses such locations (#963).");
+        return null;
     }
 
     private static string[] SplitPath(string path) => path.Length == 0 ? [] : path.Split('/');
@@ -493,6 +575,11 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
 
     private static StorageLocation? Fail(bool throwOnError, string message) =>
         throwOnError ? throw new FormatException(message) : null;
+
+    private static NotSupportedException UnreachableKeyRefusal(string path) =>
+        new($"'{path}' has an empty segment or a '\\' in an object-store location. The object stores' file systems " +
+            "strip a leading '/' and turn '\\' into '/', so they would read a different key than it names. EW refuses " +
+            "such locations (#963).");
 
     private static NotSupportedException DotSegmentRefusal(string path) =>
         new($"'{path}' has a '.' or '..' segment in an object-store location. In an object store such a segment " +

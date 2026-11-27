@@ -356,10 +356,14 @@ public class DeletionVectorReaderTests : IDisposable
         Assert.Equal(StorageLocation.Parse(PackedLocation), ex.Location);
     }
 
-    /// <summary>delta-spark refuses a relative <c>p</c> path ("Relative URIs are not supported for DVs").</summary>
+    /// <summary>delta-spark refuses a <c>p</c> path with no scheme ("Relative URIs are not supported for DVs"), a
+    /// rooted one included: it asserts <c>java.net.URI.isAbsolute</c>.</summary>
     [Theory]
     [InlineData(PackedPath)]
     [InlineData("elsewhere/" + PackedPath)]
+    [InlineData("/tmp/" + PackedPath)]
+    [InlineData("C:\\dvs\\" + PackedPath)]
+    [InlineData("C:/dvs/" + PackedPath)]
     public async Task AbsoluteVector_WithARelativePath_IsRefused(string path)
     {
         var fs = new LocalTableFileSystem(_tempDir);
@@ -383,9 +387,24 @@ public class DeletionVectorReaderTests : IDisposable
         Assert.Equal(Vectors[1], bitmap.ToArray());
     }
 
+    /// <summary>The URI's structure is read before its segments are decoded, as <c>java.net.URI</c> does, so an
+    /// escaped <c>#</c> is part of a file name.</summary>
+    [Fact]
+    public async Task AbsoluteVector_EscapedDelimitersAreNameCharacters()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        DeletionVector[] descriptors = await WritePackedFileAsync(fs);
+        await fs.WriteAllBytesAsync("a#b/" + PackedPath, await fs.ReadAllBytesAsync(PackedPath));
+
+        string encoded = StorageLocation.Parse(_tempDir).Combine("a%23b/" + PackedPath).ToString();
+        var bitmap = await Reader(fs).ReadAsync(descriptors[1] with { PathOrInlineDv = encoded });
+        Assert.Equal(Vectors[1], bitmap.ToArray());
+    }
+
     [Theory]
     [InlineData("s3://bucket/t/../dv.bin")]
     [InlineData("s3://bucket/t/%2E%2E/dv.bin")]
+    [InlineData("s3://bucket/t/a%2F..%2F..%2Fdv.bin")]
     public async Task AbsoluteVector_WithAnObjectStoreDotSegment_IsRefused(string path)
     {
         var fs = new LocalTableFileSystem(_tempDir);
