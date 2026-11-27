@@ -463,11 +463,12 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
             if (authority is "?" or ".")
                 return Fail(throwOnError, $"Device path '{uriText ?? localPath}' is not a storage location.");
 
-            // A UNC server is a host name: file://server:80/x and file://user@server/x name no share an OS opens.
-            if (authority.IndexOfAny([':', '@']) >= 0)
+            // A UNC server is a host name: file://server:80/x and file://user@server/x name no share an OS opens,
+            // and in file://serv?er/x or file://server#f a query or fragment would start inside it.
+            if (authority.IndexOfAny([':', '@', '?', '#']) >= 0)
                 return Fail(throwOnError,
                     $"'{uriText ?? localPath}' names the server '{authority}'; a file location's server cannot have a " +
-                    "port or user information.");
+                    "port, user information, a query or a fragment.");
         }
 
         var segments = new List<string>();

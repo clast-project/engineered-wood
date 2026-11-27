@@ -337,6 +337,9 @@ public class StorageLocationTests
     [Theory]
     [InlineData("file://server:80/share/x")]
     [InlineData("file://user@server/share/x")]
+    [InlineData("file://serv?er/share/x")]
+    [InlineData("file://server#f")]
+    [InlineData("file://server#f/share/x")]
     [InlineData("\\\\server:80\\share\\x")]
     public void FileServersWithAPortOrUserInfoAreRefused(string location) =>
         Assert.Throws<FormatException>(() => StorageLocation.Parse(location));
