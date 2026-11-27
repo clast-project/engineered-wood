@@ -25,6 +25,9 @@ public sealed class LocalTableFileSystem : ITableFileSystem
         _allocator = allocator;
     }
 
+    /// <summary>The directory this file system is rooted at, as a storage location.</summary>
+    public StorageLocation Location => StorageLocation.Parse(_rootPath);
+
     /// <summary>
     /// <para>The naming rules of the VOLUME this instance is rooted on, which is the only place in the
     /// codebase where the host operating system is the right thing to ask about.</para>

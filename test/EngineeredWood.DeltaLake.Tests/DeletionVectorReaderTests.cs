@@ -28,6 +28,13 @@ public class DeletionVectorReaderTests : IDisposable
         Directory.CreateDirectory(_tempDir);
     }
 
+    /// <summary>The packed file's absolute location, as a <c>p</c> vector names it: a <c>file:</c> URI.</summary>
+    private string PackedLocation => StorageLocation.Parse(_tempDir).Combine(PackedPath).ToString();
+
+    /// <summary>A reader that reaches <see cref="PackedLocation"/> through a resolver registered for the temp dir.</summary>
+    private DeletionVectorReader Reader(ITableFileSystem fs) =>
+        new(fs, new StorageResolver().Register(StorageLocation.Parse(_tempDir), fs));
+
     public void Dispose()
     {
         if (Directory.Exists(_tempDir))
@@ -57,7 +64,7 @@ public class DeletionVectorReaderTests : IDisposable
             descriptors[i] = new DeletionVector
             {
                 StorageType = "p",
-                PathOrInlineDv = PackedPath,
+                PathOrInlineDv = PackedLocation,
                 Offset = checked((int)file.Position),
                 SizeInBytes = bitmap.Length,
                 Cardinality = Vectors[i].Length,
@@ -84,7 +91,7 @@ public class DeletionVectorReaderTests : IDisposable
     {
         var fs = new RecordingFileSystem(new LocalTableFileSystem(_tempDir));
         DeletionVector[] descriptors = await WritePackedFileAsync(fs);
-        var reader = new DeletionVectorReader(fs);
+        var reader = Reader(fs);
 
         for (int i = 0; i < descriptors.Length; i++)
         {
@@ -110,7 +117,7 @@ public class DeletionVectorReaderTests : IDisposable
         DeletionVector dv = await new DeletionVectorWriter(fs).CreateAsync(positions);
         Assert.Equal("u", dv.StorageType);
 
-        DeletionVectorBitmap bitmap = await new DeletionVectorReader(fs).ReadAsync(dv);
+        DeletionVectorBitmap bitmap = await Reader(fs).ReadAsync(dv);
 
         Assert.Equal(positions, bitmap.ToArray());
         Assert.Single(fs.Ranges);
@@ -126,14 +133,14 @@ public class DeletionVectorReaderTests : IDisposable
         var dv = new DeletionVector
         {
             StorageType = "p",
-            PathOrInlineDv = PackedPath,
+            PathOrInlineDv = PackedLocation,
             Offset = descriptors[0].Offset,
             SizeInBytes = descriptors[0].SizeInBytes - 1,
             Cardinality = descriptors[0].Cardinality,
         };
 
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(
-            async () => await new DeletionVectorReader(fs).ReadAsync(dv));
+            async () => await Reader(fs).ReadAsync(dv));
 
         Assert.Equal(DeltaErrorCodes.InvalidDeletionVector, ex.ErrorCode);
         Assert.Contains("does not match", ex.Message);
@@ -152,14 +159,14 @@ public class DeletionVectorReaderTests : IDisposable
         var dv = new DeletionVector
         {
             StorageType = "p",
-            PathOrInlineDv = PackedPath,
+            PathOrInlineDv = PackedLocation,
             Offset = 0,
             SizeInBytes = bitmap.Length,
             Cardinality = 2,
         };
 
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(
-            async () => await new DeletionVectorReader(fs).ReadAsync(dv));
+            async () => await Reader(fs).ReadAsync(dv));
 
         Assert.Equal(DeltaErrorCodes.InvalidDeletionVector, ex.ErrorCode);
     }
@@ -175,14 +182,14 @@ public class DeletionVectorReaderTests : IDisposable
         await fs.WriteAllBytesAsync(PackedPath, bytes);
 
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(
-            async () => await new DeletionVectorReader(fs).ReadAsync(descriptors[1]));
+            async () => await Reader(fs).ReadAsync(descriptors[1]));
 
         Assert.Equal(DeltaErrorCodes.InvalidDeletionVector, ex.ErrorCode);
         Assert.Contains("checksum", ex.Message);
 
         // Its neighbours are untouched and still read.
-        Assert.Equal(Vectors[0], (await new DeletionVectorReader(fs).ReadAsync(descriptors[0])).ToArray());
-        Assert.Equal(Vectors[2], (await new DeletionVectorReader(fs).ReadAsync(descriptors[2])).ToArray());
+        Assert.Equal(Vectors[0], (await Reader(fs).ReadAsync(descriptors[0])).ToArray());
+        Assert.Equal(Vectors[2], (await Reader(fs).ReadAsync(descriptors[2])).ToArray());
     }
 
     /// <summary>
@@ -203,7 +210,7 @@ public class DeletionVectorReaderTests : IDisposable
         var dv = new DeletionVector
         {
             StorageType = "p",
-            PathOrInlineDv = PackedPath,
+            PathOrInlineDv = PackedLocation,
             Offset = shape switch
             {
                 "straddles the end" => last.Offset,
@@ -215,7 +222,7 @@ public class DeletionVectorReaderTests : IDisposable
         };
 
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(
-            async () => await new DeletionVectorReader(fs).ReadAsync(dv));
+            async () => await Reader(fs).ReadAsync(dv));
 
         Assert.Equal(DeltaErrorCodes.InvalidDeletionVector, ex.ErrorCode);
         Assert.Contains($"exceeds file length {fileLength}", ex.Message);
@@ -233,7 +240,7 @@ public class DeletionVectorReaderTests : IDisposable
         var fs = new RecordingFileSystem(inner) { FailReads = true };
 
         var ex = await Assert.ThrowsAsync<IOException>(
-            async () => await new DeletionVectorReader(fs).ReadAsync(descriptors[0]));
+            async () => await Reader(fs).ReadAsync(descriptors[0]));
 
         Assert.Contains("injected", ex.Message);
         Assert.Equal(1, fs.LengthCalls);
@@ -251,14 +258,14 @@ public class DeletionVectorReaderTests : IDisposable
         var dv = new DeletionVector
         {
             StorageType = "p",
-            PathOrInlineDv = PackedPath,
+            PathOrInlineDv = PackedLocation,
             Offset = offset,
             SizeInBytes = size,
             Cardinality = 1,
         };
 
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(
-            async () => await new DeletionVectorReader(fs).ReadAsync(dv));
+            async () => await Reader(fs).ReadAsync(dv));
 
         Assert.Equal(DeltaErrorCodes.InvalidDeletionVector, ex.ErrorCode);
     }
@@ -336,5 +343,91 @@ public class DeletionVectorReaderTests : IDisposable
 
             public void Dispose() => file.Dispose();
         }
+    }
+
+    [Fact]
+    public async Task AbsoluteVector_WithoutARegisteredLocation_IsRefused()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        DeletionVector[] descriptors = await WritePackedFileAsync(fs);
+
+        var ex = await Assert.ThrowsAsync<UnregisteredStorageLocationException>(
+            async () => await new DeletionVectorReader(fs).ReadAsync(descriptors[0]));
+        Assert.Equal(StorageLocation.Parse(PackedLocation), ex.Location);
+    }
+
+    /// <summary>delta-spark refuses a <c>p</c> path with no scheme ("Relative URIs are not supported for DVs"), a
+    /// rooted one included: it asserts <c>java.net.URI.isAbsolute</c>.</summary>
+    [Theory]
+    [InlineData(PackedPath)]
+    [InlineData("elsewhere/" + PackedPath)]
+    [InlineData("/tmp/" + PackedPath)]
+    [InlineData("C:\\dvs\\" + PackedPath)]
+    [InlineData("C:/dvs/" + PackedPath)]
+    public async Task AbsoluteVector_WithARelativePath_IsRefused(string path)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        DeletionVector[] descriptors = await WritePackedFileAsync(fs);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await Reader(fs).ReadAsync(descriptors[0] with { PathOrInlineDv = path }));
+        Assert.Equal(DeltaErrorCodes.InvalidDeletionVector, ex.ErrorCode);
+    }
+
+    /// <summary>A <c>p</c> path is a URI, so its escapes are decoded, as delta-spark's <c>new Path(new URI(..))</c> does.</summary>
+    [Fact]
+    public async Task AbsoluteVector_PathIsPercentDecoded()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        DeletionVector[] descriptors = await WritePackedFileAsync(fs);
+        await fs.WriteAllBytesAsync("dir with space/" + PackedPath, await fs.ReadAllBytesAsync(PackedPath));
+
+        string encoded = StorageLocation.Parse(_tempDir).Combine("dir%20with%20space/" + PackedPath).ToString();
+        var bitmap = await Reader(fs).ReadAsync(descriptors[1] with { PathOrInlineDv = encoded });
+        Assert.Equal(Vectors[1], bitmap.ToArray());
+    }
+
+    /// <summary>A <c>p</c> path is a URI: a raw <c>?</c> or <c>#</c> starts a query or fragment, which no location
+    /// has, and a malformed escape is no URI at all (<c>java.net.URI</c> refuses it).</summary>
+    [Theory]
+    [InlineData("s3://bucket/t/dv.bin?version=1")]
+    [InlineData("abfss://c@acct.dfs.core.windows.net/t/dv.bin#f")]
+    [InlineData("s3://bucket/t/dv%ZZ.bin")]
+    [InlineData("file:///tmp/t/a b/dv.bin")]
+    public async Task AbsoluteVector_ThatIsNotAWellFormedUri_IsRefused(string path)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        DeletionVector[] descriptors = await WritePackedFileAsync(fs);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await Reader(fs).ReadAsync(descriptors[0] with { PathOrInlineDv = path }));
+        Assert.Equal(DeltaErrorCodes.InvalidDeletionVector, ex.ErrorCode);
+    }
+
+    /// <summary>The URI's structure is read before its segments are decoded, as <c>java.net.URI</c> does, so an
+    /// escaped <c>#</c> is part of a file name.</summary>
+    [Fact]
+    public async Task AbsoluteVector_EscapedDelimitersAreNameCharacters()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        DeletionVector[] descriptors = await WritePackedFileAsync(fs);
+        await fs.WriteAllBytesAsync("a#b/" + PackedPath, await fs.ReadAllBytesAsync(PackedPath));
+
+        string encoded = StorageLocation.Parse(_tempDir).Combine("a%23b/" + PackedPath).ToString();
+        var bitmap = await Reader(fs).ReadAsync(descriptors[1] with { PathOrInlineDv = encoded });
+        Assert.Equal(Vectors[1], bitmap.ToArray());
+    }
+
+    [Theory]
+    [InlineData("s3://bucket/t/../dv.bin")]
+    [InlineData("s3://bucket/t/%2E%2E/dv.bin")]
+    [InlineData("s3://bucket/t/a%2F..%2F..%2Fdv.bin")]
+    public async Task AbsoluteVector_WithAnObjectStoreDotSegment_IsRefused(string path)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        DeletionVector[] descriptors = await WritePackedFileAsync(fs);
+
+        await Assert.ThrowsAsync<NotSupportedException>(
+            async () => await Reader(fs).ReadAsync(descriptors[0] with { PathOrInlineDv = path }));
     }
 }

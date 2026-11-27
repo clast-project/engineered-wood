@@ -3,6 +3,7 @@
 
 using System.Text;
 using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.IO;
 
 namespace EngineeredWood.DeltaLake.DeletionVectors;
 
@@ -35,6 +36,54 @@ internal static class DeletionVectorPath
     /// </summary>
     public static bool IsAbsolute(DeletionVector dv) =>
         string.Equals(dv.StorageType, "p", StringComparison.Ordinal);
+
+    /// <summary>
+    /// <para>The location of an absolute-path (<c>p</c>) vector's file. PROTOCOL.md makes it an absolute path, and
+    /// delta-spark reads it as a URI: <c>DeletionVectorDescriptor.absolutePath</c> asserts
+    /// <c>new URI(pathOrInlineDv).isAbsolute</c> ("Relative URIs are not supported for DVs"), which needs a scheme,
+    /// and then opens <c>new Path(uri)</c>, which decodes the path's escapes (READ FROM the delta-spark 4.0.0 jar's
+    /// bytecode). Both are matched here: a bare path, even a rooted one, is refused, and the URI's structure is read
+    /// before its segments are decoded (<see cref="StorageLocation.ParsePercentEncoded"/>).</para>
+    /// <para>A <c>.</c> or <c>..</c> segment in an object-store location, written or decoded, is refused, as
+    /// <see cref="StorageLocation"/> refuses it everywhere (#963).</para>
+    /// </summary>
+    public static StorageLocation AbsoluteLocation(DeletionVector dv)
+    {
+        string text = dv.PathOrInlineDv;
+        if (!HasUriScheme(text))
+            throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidDeletionVector,
+                $"Deletion vector storage type 'p' must hold an absolute URI, but it holds '{text}'.");
+        try
+        {
+            return StorageLocation.ParsePercentEncoded(text);
+        }
+        catch (FormatException ex)
+        {
+            throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidDeletionVector,
+                $"Deletion vector path '{text}' is not a valid absolute location: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>True when <paramref name="text"/> starts with a URI scheme (RFC 3986: a letter, then letters,
+    /// digits, <c>+</c>, <c>-</c> or <c>.</c>, then <c>:</c>). A single letter is a Windows drive, not a scheme.</summary>
+    private static bool HasUriScheme(string text)
+    {
+        int colon = text.IndexOf(':');
+        if (colon < 2 || !IsAsciiLetter(text[0]))
+            return false;
+        for (int i = 1; i < colon; i++)
+        {
+            char c = text[i];
+            if (!(IsAsciiLetter(c) || c is >= '0' and <= '9' || c is '+' or '-' or '.'))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsAsciiLetter(char c) => c is >= 'a' and <= 'z' or >= 'A' and <= 'Z';
 
     /// <summary>
     /// Spec: <c>pathOrInlineDv = "&lt;random prefix (optional)&gt;&lt;z85-encoded uuid&gt;"</c> (the uuid is

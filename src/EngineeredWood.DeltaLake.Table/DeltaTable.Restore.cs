@@ -8,6 +8,7 @@ using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.DeltaLake.Snapshot;
+using EngineeredWood.IO;
 
 namespace EngineeredWood.DeltaLake.Table;
 
@@ -383,17 +384,26 @@ public sealed partial class DeltaTable
     private async ValueTask EnsureRestoredFilesExistAsync(
         IReadOnlyList<AddFile> files, long version, CancellationToken cancellationToken)
     {
-        var paths = new List<string>(files.Count);
+        // (file system, path, the name the refusal reports)
+        var paths = new List<(ITableFileSystem Fs, string Path, string Name)>(files.Count);
+        var resolver = _options.StorageResolver ?? new StorageResolver();
         foreach (var file in files)
         {
-            paths.Add(DeltaPath.Decode(file.Path));
+            string decoded = DeltaPath.Decode(file.Path);
+            paths.Add((_fs, decoded, decoded));
             if (file.DeletionVector is not { } dv)
                 continue;
-            // An absolute-path vector is read from its path as written, so it is checked the same way.
             if (DeletionVectorPath.GetRelativePath(dv) is { } dvPath)
-                paths.Add(dvPath);
+            {
+                paths.Add((_fs, dvPath, dvPath));
+            }
             else if (DeletionVectorPath.IsAbsolute(dv))
-                paths.Add(dv.PathOrInlineDv);
+            {
+                // An absolute-path vector is checked where it is read from: through the resolver, which refuses a
+                // location nothing is registered for rather than report it missing.
+                var resolved = resolver.Resolve(DeletionVectorPath.AbsoluteLocation(dv));
+                paths.Add((resolved.FileSystem, resolved.Path, dv.PathOrInlineDv));
+            }
         }
 
         var missing = new List<string>();
@@ -401,11 +411,11 @@ public sealed partial class DeltaTable
         {
             var batch = paths.Skip(start).Take(ExistenceChecksInFlight).ToList();
             var exists = await Task.WhenAll(
-                batch.Select(p => _fs.ExistsAsync(p, cancellationToken).AsTask())).ConfigureAwait(false);
+                batch.Select(p => p.Fs.ExistsAsync(p.Path, cancellationToken).AsTask())).ConfigureAwait(false);
             for (int i = 0; i < batch.Count; i++)
             {
                 if (!exists[i])
-                    missing.Add(batch[i]);
+                    missing.Add(batch[i].Name);
             }
         }
 

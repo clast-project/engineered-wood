@@ -92,6 +92,21 @@ public sealed class AzureTableFileSystem : ITableFileSystem, IReadConcurrencyHin
     }
 
     /// <summary>
+    /// The location this file system is rooted at, <c>https://&lt;account&gt;.blob.core.windows.net/&lt;container&gt;/&lt;root&gt;</c>, without the container client's query (a SAS), for registering it with a
+    /// <see cref="StorageResolver"/>. Throws <see cref="NotSupportedException"/> when the root has a <c>.</c>,
+    /// <c>..</c> or empty segment, which a storage location refuses. The root's segments are appended as they are,
+    /// not parsed as URI syntax, so a blob name with a <c>#</c> or <c>?</c> is a root like any other.
+    /// </summary>
+    public StorageLocation Location
+    {
+        get
+        {
+            var container = StorageLocation.Parse(_container.Uri.GetLeftPart(UriPartial.Path));
+            return _rootPrefix.Length == 0 ? container : container.Combine(_rootPrefix.TrimEnd('/'));
+        }
+    }
+
+    /// <summary>
     /// Azure Blob's documented blob-name rules. It accepts far more than Win32 does — MEASURED against
     /// Azurite, <c>&lt; &gt; |</c> and a trailing space all round-trip byte-identically — but it is NOT
     /// unconstrained: the naming rules bar control characters, and state that "no path segments should end

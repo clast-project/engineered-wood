@@ -226,6 +226,15 @@ public sealed record DeltaTableOptions
     public bool WriteVersionChecksums { get; init; } = true;
 
     /// <summary>
+    /// <para>Reaches the files a table names by absolute location rather than by a path under its root: today,
+    /// absolute-path (<c>p</c>) deletion vectors, which Delta allows anywhere. Register a file system for each
+    /// location prefix such files may lie under. Default: none, so a table holding such a vector refuses to read it
+    /// (with <see cref="EngineeredWood.IO.UnregisteredStorageLocationException"/>) rather than reach storage it was
+    /// not given.</para>
+    /// </summary>
+    public EngineeredWood.IO.StorageResolver? StorageResolver { get; init; }
+
+    /// <summary>
     /// Whether a change-feed read may take its schema from the <c>_delta_log/&lt;version&gt;.crc</c>
     /// version checksum at its end version instead of reconstructing that version. Default: false.
     /// </summary>

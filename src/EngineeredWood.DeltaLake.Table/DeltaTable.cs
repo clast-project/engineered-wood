@@ -83,7 +83,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         _dataFileReadOptions = DataFileReadOptions(options.ParquetReadOptions);
         _log = new TransactionLog(fileSystem);
         _checkpointReader = new CheckpointReader(fileSystem);
-        _dvReader = new DeletionVectorReader(fileSystem);
+        _dvReader = new DeletionVectorReader(fileSystem, options.StorageResolver);
         _checkpointWriter = new CheckpointWriter(fileSystem, options.ParquetWriteOptions)
         {
             Format = options.CheckpointFormat,
@@ -6558,6 +6558,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             EffectiveConcurrentRequests, _options.MaxBufferedReadBytes,
             latestVersion: snapshot.Version,
             memoryBudget: _options.MemoryBudget,
+            resolver: _options.StorageResolver,
             cancellationToken: cancellationToken);
 
         // Keep set for the projection, if one was asked for. The feed's own three columns are never dropped

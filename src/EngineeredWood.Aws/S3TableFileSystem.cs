@@ -103,6 +103,14 @@ public sealed class S3TableFileSystem : ITableFileSystem, IReadConcurrencyHint
     }
 
     /// <summary>
+    /// The location this file system is rooted at, <c>s3://&lt;bucket&gt;/&lt;root&gt;</c>, for registering it with a
+    /// <see cref="StorageResolver"/>. Throws <see cref="NotSupportedException"/> when the root has a <c>.</c> or
+    /// <c>..</c> segment, which a storage location refuses.
+    /// </summary>
+    public StorageLocation Location =>
+        StorageLocation.Parse("s3://" + _bucket + (_rootPrefix.Length == 0 ? "" : "/" + _rootPrefix.TrimEnd('/')));
+
+    /// <summary>
     /// S3 constrains object keys the least of the three. Its naming guidance lists
     /// <c>&lt; &gt; | { } ^ % ` [ ] ~ # "</c> and a backslash as "characters to avoid", but every one of
     /// them is legal — MEASURED against gofakes3 with an in-memory backend, all round-trip

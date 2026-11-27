@@ -85,6 +85,7 @@ internal static class CdfReader
         long maxBufferedReadBytes = DefaultMaxBufferedReadBytes,
         long latestVersion = -1,
         EngineeredWood.Memory.MemoryBudget? memoryBudget = null,
+        StorageResolver? resolver = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var versions = await CommitsInRangeAsync(log, startVersion, endVersion, latestVersion, cancellationToken)
@@ -102,7 +103,7 @@ internal static class CdfReader
                 ?? DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName);
 
         // Stateless over the file system — one instance serves every action in the range.
-        var dvReader = new DeletionVectorReader(fs);
+        var dvReader = new DeletionVectorReader(fs, resolver);
 
         // The units come from ONE enumeration, in order. It reads the commits ahead of itself, and under
         // OrderedScan those reads overlap the files already dispatched. Every other request is made by a file's
