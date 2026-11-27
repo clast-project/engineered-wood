@@ -8,6 +8,12 @@ namespace EngineeredWood.IO;
 /// that manage multiple files (e.g., Delta Lake transaction logs).
 /// Implementations handle local filesystems, Azure Blob Storage, S3, etc.
 /// </summary>
+/// <remarks>
+/// Every path is relative to the file system's root, and an implementation must refuse, with an
+/// <see cref="ArgumentException"/>, one that names anything outside it (#962): table formats build these paths from
+/// what they read, so a crafted table must not reach a neighbouring file. <see cref="RootRelativePath"/> has the
+/// checks the built-in implementations use. An absolute location is reached through a <see cref="StorageResolver"/>.
+/// </remarks>
 public interface ITableFileSystem
 {
     /// <summary>

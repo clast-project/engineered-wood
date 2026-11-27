@@ -27,7 +27,19 @@ internal sealed class SubtreeFileSystem : ITableFileSystem
     public static ITableFileSystem Create(ITableFileSystem inner, string root) =>
         root.Length == 0 ? inner : new SubtreeFileSystem(inner, root);
 
-    private string Map(string path) => _prefix + path;
+    /// <summary>
+    /// The inner file system's path for <paramref name="path"/>. Refuses a path that would climb out of the subtree
+    /// (#962): the inner one only keeps paths inside ITS root, which is higher up. The subtree does not know whether
+    /// the inner one splits segments at <c>\</c> (a Windows directory does, a POSIX one does not), so the path must
+    /// stay inside under both readings: <c>a\b/../../x</c> stays inside if <c>\</c> separates, but climbs out if
+    /// <c>a\b</c> is one name. What else the inner one refuses it refuses itself.
+    /// </summary>
+    private string Map(string path)
+    {
+        RootRelativePath.ThrowIfEscapesRoot(path, backslashSeparates: true);
+        RootRelativePath.ThrowIfEscapesRoot(path, backslashSeparates: false);
+        return _prefix + path;
+    }
 
     public PathNameConstraints PathConstraints => _inner.PathConstraints;
 
@@ -35,7 +47,12 @@ internal sealed class SubtreeFileSystem : ITableFileSystem
         string prefix, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         await foreach (var file in _inner.ListAsync(Map(prefix), cancellationToken).ConfigureAwait(false))
-            yield return file with { Path = file.Path.Substring(_prefix.Length) };
+        {
+            // The inner listing is by name prefix, so a file beside the subtree whose name starts with the
+            // subtree's ("wh-x" beside "wh/") is not in the subtree, whatever the inner one returns.
+            if (file.Path.StartsWith(_prefix, StringComparison.Ordinal))
+                yield return file with { Path = file.Path.Substring(_prefix.Length) };
+        }
     }
 
     public ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default) =>

@@ -131,7 +131,7 @@ public sealed class S3TableFileSystem : ITableFileSystem, IReadConcurrencyHint, 
         string prefix,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        string fullPrefix = _rootPrefix + (prefix ?? string.Empty).Replace('\\', '/').TrimStart('/');
+        string fullPrefix = _rootPrefix + RootRelativePath.ToObjectKey(prefix ?? string.Empty);
 
         var request = new ListObjectsV2Request { BucketName = _bucket, Prefix = fullPrefix };
 
@@ -337,7 +337,7 @@ public sealed class S3TableFileSystem : ITableFileSystem, IReadConcurrencyHint, 
     }
 
     private string Resolve(string path) =>
-        _rootPrefix + (path ?? string.Empty).Replace('\\', '/').TrimStart('/');
+        _rootPrefix + RootRelativePath.ToObjectKey(path);
 
     private string ToRelative(string key) =>
         key.Length >= _rootPrefix.Length && key.StartsWith(_rootPrefix, StringComparison.Ordinal)

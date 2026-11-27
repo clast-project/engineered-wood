@@ -114,6 +114,24 @@ public sealed class AbsoluteActionPathTests : IDisposable
         Assert.Equal(DeltaErrorCodes.InvalidFilePath, ex.ErrorCode);
     }
 
+    /// <summary>
+    /// A RELATIVE path that climbs out of the table, plainly or percent-encoded (it is decoded before it reaches the
+    /// file system), is refused by the table's file system instead of reading the neighbouring table (#962). Before
+    /// #962 the local file system read it: MEASURED.
+    /// </summary>
+    [Theory]
+    [InlineData("../source/")]
+    [InlineData("%2E%2E/source/")]
+    [InlineData("sub/../../source/")]
+    public async Task Read_RelativePathClimbingOutOfTheTable_IsRefused(string climb)
+    {
+        await WriteSourceAsync([1, 2, 3]);
+        CloneLog(_sourceDir, _cloneDir, rel => climb + rel);
+
+        await using var clone = await OpenCloneAsync();
+        await Assert.ThrowsAsync<ArgumentException>(async () => await ReadIdsAsync(clone));
+    }
+
     [Fact]
     public async Task Delete_RewritesUnderTheClone_AndVacuumLeavesTheSourceAlone()
     {

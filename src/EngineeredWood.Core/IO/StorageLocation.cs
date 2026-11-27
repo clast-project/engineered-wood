@@ -612,7 +612,7 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
 
     /// <summary>The length of a URI scheme at the start of <paramref name="text"/> (before its <c>:</c>), or 0. A
     /// single letter followed by <c>:</c> is a drive, not a scheme.</summary>
-    private static int SchemeLength(string text)
+    internal static int SchemeLength(string text)
     {
         if (text.Length == 0 || !IsAsciiLetter(text[0]))
             return 0;
@@ -628,7 +628,7 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         return 0;
     }
 
-    private static bool IsDriveLetterPath(string text) =>
+    internal static bool IsDriveLetterPath(string text) =>
         text.Length >= 2 && IsAsciiLetter(text[0]) && text[1] == ':' && (text.Length == 2 || text[2] is '/' or '\\');
 
     private static bool IsDriveSegment(string segment) =>

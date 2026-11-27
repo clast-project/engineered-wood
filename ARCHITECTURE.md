@@ -164,6 +164,13 @@ publishes a file only if the path does not exist. Object stores do this in one c
 and `File.Move`s it without overwrite. A lost race returns `false`, which `TransactionLog.WriteCommitAsync` turns
 into `DeltaConflictException`.
 
+Every path an `ITableFileSystem` is handed is relative to its root and must name something under it (#962),
+because table formats build those paths from what they read. `RootRelativePath` holds the shared checks: the
+local backend collapses `.`/`..` but refuses a path that climbs above the root (even to come back down), a rooted
+path (either separator on Windows, drive letters, UNC, `\\?\`), and anything `GetFullPath` maps outside it
+(`NUL`). The object stores refuse rooted paths and every `.`/`..` segment (#963), since the Azure SDK collapses
+those out of the table before sending. An absolute location goes through `StorageResolver` instead.
+
 **Buffer management** — `BufferAllocator` is an abstract factory for `IMemoryOwner<byte>`;
 `PooledBufferAllocator` rents from `ArrayPool<byte>.Shared` and slices to exact size.
 
