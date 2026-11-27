@@ -21,7 +21,11 @@ public sealed class LocalTableFileSystem : ITableFileSystem, ILocatedFileSystem
     /// </summary>
     public LocalTableFileSystem(string rootPath, BufferAllocator? allocator = null)
     {
-        _rootPath = Path.GetFullPath(rootPath);
+        string full = Path.GetFullPath(rootPath);
+        // Without a trailing separator ("C:\t\" -> "C:\t"), since that is how GetFullPath spells the root when a path
+        // collapses back to it ("sub/.."); a volume root ("C:\", "/") keeps its separator.
+        string trimmed = full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        _rootPath = trimmed.Length == 0 || Path.GetPathRoot(full) == full ? full : trimmed;
         _allocator = allocator;
     }
 
@@ -66,8 +70,17 @@ public sealed class LocalTableFileSystem : ITableFileSystem, ILocatedFileSystem
         else
         {
             string fullPrefix = ResolvePath(prefix);
-            directory = Path.GetDirectoryName(fullPrefix) ?? _rootPath;
-            searchPattern = Path.GetFileName(fullPrefix) + "*";
+            if (fullPrefix.Length == _rootPath.Length)
+            {
+                // "." or "a/..": the root itself. Its parent directory is outside the root.
+                directory = _rootPath;
+                searchPattern = "*";
+            }
+            else
+            {
+                directory = Path.GetDirectoryName(fullPrefix) ?? _rootPath;
+                searchPattern = Path.GetFileName(fullPrefix) + "*";
+            }
         }
 
         if (!Directory.Exists(directory))
@@ -234,8 +247,40 @@ public sealed class LocalTableFileSystem : ITableFileSystem, ILocatedFileSystem
         return default;
     }
 
-    private string ResolvePath(string relativePath) =>
-        Path.GetFullPath(Path.Combine(_rootPath, relativePath.Replace('/', Path.DirectorySeparatorChar)));
+    /// <summary>
+    /// The full path <paramref name="relativePath"/> names under the root, or an <see cref="ArgumentException"/>
+    /// when it names anything else (#962). Dot segments collapse, but may not climb above the root even to come
+    /// back down; a rooted path (either separator on Windows, a drive letter, UNC, <c>\\?\</c>) is refused; and the
+    /// full path is checked to be under the root at the end, which also refuses what Windows maps elsewhere (the
+    /// device name <c>NUL</c> resolves to <c>\\.\NUL</c>, MEASURED on Windows 11).
+    /// </summary>
+    private string ResolvePath(string relativePath)
+    {
+        bool windows = Path.DirectorySeparatorChar == '\\';
+        RootRelativePath.ThrowIfEscapesRoot(relativePath, backslashSeparates: windows);
+
+        string native = relativePath.Replace('/', Path.DirectorySeparatorChar);
+        if (Path.IsPathRooted(native))
+            throw RootRelativePath.Rooted(relativePath); // "C:x": drive-relative, resolved against that drive's cwd
+
+        string fullPath = Path.GetFullPath(Path.Combine(_rootPath, native));
+        if (!IsUnderRoot(fullPath))
+            throw RootRelativePath.Outside(relativePath);
+        return fullPath;
+    }
+
+    private bool IsUnderRoot(string fullPath)
+    {
+        // GetFullPath of the root joined with a relative path starts with the root's own spelling, so an ordinal
+        // comparison is exact here, case-insensitive volume or not.
+        if (!fullPath.StartsWith(_rootPath, StringComparison.Ordinal))
+            return false;
+        if (fullPath.Length == _rootPath.Length)
+            return true;
+        char last = _rootPath[_rootPath.Length - 1];
+        return last == Path.DirectorySeparatorChar || last == Path.AltDirectorySeparatorChar
+            || fullPath[_rootPath.Length] == Path.DirectorySeparatorChar;
+    }
 
     private static string GetRelativePath(string relativeTo, string path)
     {

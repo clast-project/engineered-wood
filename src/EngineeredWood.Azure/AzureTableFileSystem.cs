@@ -128,7 +128,7 @@ public sealed class AzureTableFileSystem : ITableFileSystem, IReadConcurrencyHin
         string prefix,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        string fullPrefix = _rootPrefix + (prefix ?? string.Empty).Replace('\\', '/').TrimStart('/');
+        string fullPrefix = _rootPrefix + RootRelativePath.ToObjectKey(prefix ?? string.Empty);
 
         // Azure returns blobs in lexicographic order of name, satisfying the contract.
         await foreach (BlobItem item in _container
@@ -241,7 +241,7 @@ public sealed class AzureTableFileSystem : ITableFileSystem, IReadConcurrencyHin
     }
 
     private string Resolve(string path) =>
-        _rootPrefix + (path ?? string.Empty).Replace('\\', '/').TrimStart('/');
+        _rootPrefix + RootRelativePath.ToObjectKey(path);
 
     private string ToRelative(string blobName) =>
         blobName.Length >= _rootPrefix.Length && blobName.StartsWith(_rootPrefix, StringComparison.Ordinal)

@@ -27,7 +27,16 @@ internal sealed class SubtreeFileSystem : ITableFileSystem
     public static ITableFileSystem Create(ITableFileSystem inner, string root) =>
         root.Length == 0 ? inner : new SubtreeFileSystem(inner, root);
 
-    private string Map(string path) => _prefix + path;
+    /// <summary>
+    /// The inner file system's path for <paramref name="path"/>. Refuses a path that would climb out of the subtree
+    /// (#962): the inner one only keeps paths inside ITS root, which is higher up. <c>\</c> counts as a separator,
+    /// since the inner one may be a Windows directory; what else the inner one refuses it refuses itself.
+    /// </summary>
+    private string Map(string path)
+    {
+        RootRelativePath.ThrowIfEscapesRoot(path, backslashSeparates: true);
+        return _prefix + path;
+    }
 
     public PathNameConstraints PathConstraints => _inner.PathConstraints;
 

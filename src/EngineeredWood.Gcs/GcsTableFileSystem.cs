@@ -108,7 +108,7 @@ public sealed class GcsTableFileSystem : ITableFileSystem, IReadConcurrencyHint,
         string prefix,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        string fullPrefix = _rootPrefix + (prefix ?? string.Empty).Replace('\\', '/').TrimStart('/');
+        string fullPrefix = _rootPrefix + RootRelativePath.ToObjectKey(prefix ?? string.Empty);
 
         // GCS returns objects in lexicographic order of name, satisfying the contract.
         await foreach (Object obj in _client
@@ -286,7 +286,7 @@ public sealed class GcsTableFileSystem : ITableFileSystem, IReadConcurrencyHint,
     }
 
     private string Resolve(string path) =>
-        _rootPrefix + (path ?? string.Empty).Replace('\\', '/').TrimStart('/');
+        _rootPrefix + RootRelativePath.ToObjectKey(path);
 
     private string ToRelative(string objectName) =>
         objectName.Length >= _rootPrefix.Length && objectName.StartsWith(_rootPrefix, StringComparison.Ordinal)
