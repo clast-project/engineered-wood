@@ -176,6 +176,20 @@ public class StorageLocationTests
             StorageLocation.Parse("file:///tmp/é.bin"), StorageLocation.ParsePercentEncoded("file:///tmp/é.bin"));
     }
 
+    /// <summary>MEASURED on Java 17: <c>java.net.URI</c> accepts brackets around an IPv6 host
+    /// (<c>http://[::1]:10000/...</c>, an Azurite-style endpoint) and refuses them in the path.</summary>
+    [Fact]
+    public void BracketsAreLegalAroundAnIpv6HostOnly()
+    {
+        var dv = StorageLocation.ParsePercentEncoded("http://[::1]:10000/devstoreaccount1/container/dv.bin");
+        Assert.Equal(StorageLocation.Parse("http://[::1]:10000/devstoreaccount1/container/dv.bin"), dv);
+        Assert.True(dv.IsUnder(StorageLocation.Parse("http://[::1]:10000/devstoreaccount1/container")));
+        Assert.Equal(StorageLocation.Parse("s3://[::1]/b/dv.bin"), StorageLocation.ParsePercentEncoded("s3://[::1]/b/dv.bin"));
+
+        Assert.Throws<FormatException>(() => StorageLocation.ParsePercentEncoded("http://[::1]:10000/c/a[1].bin"));
+        Assert.Throws<FormatException>(() => StorageLocation.ParsePercentEncoded("s3://bucket/t/a]b"));
+    }
+
     [Theory]
     [InlineData("s3://bucket/t/%2E%2E/x")]
     [InlineData("s3://bucket/t/a%2F..%2Fx")]

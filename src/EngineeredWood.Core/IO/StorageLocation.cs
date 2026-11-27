@@ -286,8 +286,9 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
                 return Fail(throwOnError, $"Storage location '{location}' contains a control character.");
 
             // A URI cannot hold these ASCII characters raw (RFC 3986; java.net.URI refuses each, MEASURED on Java
-            // 17), so a reader that parses the location as a URI, as delta-spark does, would refuse it.
-            if (decode && c is ' ' or '"' or '<' or '>' or '\\' or '^' or '`' or '{' or '|' or '}' or '[' or ']')
+            // 17), so a reader that parses the location as a URI, as delta-spark does, would refuse it. '[' and ']'
+            // are refused in the path below: around an IPv6 host they are legal.
+            if (decode && c is ' ' or '"' or '<' or '>' or '\\' or '^' or '`' or '{' or '|' or '}')
                 return Fail(throwOnError,
                     $"URI '{location}' contains a raw '{c}', which a URI cannot hold; it must be percent-encoded.");
         }
@@ -318,6 +319,8 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         if (authority.IndexOfAny(['?', '#']) >= 0 ||
             ((decode || scheme is "http" or "https") && path.IndexOfAny(['?', '#']) >= 0))
             return Fail(throwOnError, $"Storage location '{location}' has a query or fragment, which a storage location cannot.");
+        if (decode && path.IndexOfAny(['[', ']']) >= 0)
+            return Fail(throwOnError, RawBracketMessage(location));
 
         string text = location.TrimEnd('/');
         if (text.Length < schemeLength + 3 + authority.Length)
@@ -414,6 +417,8 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
 
         if (path.IndexOfAny(['?', '#']) >= 0)
             return Fail(throwOnError, $"File location '{location}' has a query or fragment.");
+        if (decode && path.IndexOfAny(['[', ']']) >= 0)
+            return Fail(throwOnError, RawBracketMessage(location));
 
         // Windows opens a path with \ as it does one with /, so \ separates segments here as it does in a bare path.
         if (IsWindows)
@@ -626,6 +631,10 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
 
     private static StorageLocation? Fail(bool throwOnError, string message) =>
         throwOnError ? throw new FormatException(message) : null;
+
+    private static string RawBracketMessage(string location) =>
+        $"URI '{location}' has a raw '[' or ']' in its path, which a URI cannot hold there (only around an IPv6 " +
+        "host); it must be percent-encoded.";
 
     private static NotSupportedException UnreachableKeyRefusal(string path) =>
         new($"'{path}' has an empty segment or a '\\' in an object-store location. The object stores' file systems " +
