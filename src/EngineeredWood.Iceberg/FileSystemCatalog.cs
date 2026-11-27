@@ -49,6 +49,21 @@ public sealed class FileSystemCatalog : ICatalog
     /// <summary>The warehouse location tables are created under.</summary>
     public StorageLocation Warehouse => _warehouse;
 
+    /// <summary>
+    /// Refuses metadata that names a file by a location that is not absolute: a snapshot's manifest list, or a
+    /// statistics or partition-statistics file. Files outside the table are allowed (after a copy or a migration);
+    /// expiry leaves them in place (<see cref="ExpireResult.FilesOutsideTable"/>).
+    /// </summary>
+    private static void ThrowIfLocationsNotAbsolute(TableMetadata metadata)
+    {
+        var named = metadata.Snapshots.Select(s => s.ManifestList)
+            .Concat((metadata.Statistics ?? []).Select(s => s.StatisticsPath))
+            .Concat((metadata.PartitionStatistics ?? []).Select(s => s.StatisticsPath));
+        if (named.FirstOrDefault(l => !StorageLocation.TryParse(l, out _)) is { } bad)
+            throw new ArgumentException(
+                $"The new metadata names the file '{bad}', which is not an absolute location.", "newMetadata");
+    }
+
     /// <summary>The location a table lives at: its path under the warehouse.</summary>
     private StorageLocation DefaultLocation(TableIdentifier identifier) => _warehouse.Combine(TablePath(identifier));
 
@@ -325,6 +340,14 @@ public sealed class FileSystemCatalog : ICatalog
         var path = MetadataFilePath(identifier, version);
         var data = await _fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
         var metadata = IcebergJsonSerializer.Deserialize<TableMetadata>(Encoding.UTF8.GetString(data));
+
+        // A table EngineeredWood wrote before it wrote absolute locations (#963) has a relative one ("db/t"), which
+        // no engine can resolve; refuse it here, by name, rather than return a table every operation then refuses.
+        if (!StorageLocation.TryParse(metadata.Location, out _))
+            throw new FormatException(
+                $"{identifier}'s metadata gives its location as '{metadata.Location}', which is not an absolute " +
+                "location. Tables written by EngineeredWood before it wrote absolute locations (#963) have a relative " +
+                "one, which no engine can resolve; they cannot be loaded.");
         return new Table(identifier, metadata, Absolute(path));
     }
 
@@ -443,10 +466,19 @@ public sealed class FileSystemCatalog : ICatalog
                 $"The new metadata's location '{newMetadata.Location}' is not {identifier}'s location in this " +
                 $"catalog, '{tableLocation}'; a file-system catalog keeps each table at its path under the warehouse.",
                 nameof(newMetadata));
-        if (newMetadata.MetadataLog.FirstOrDefault(e => !StorageLocation.TryParse(e.MetadataFile, out _)) is { } bad)
-            throw new ArgumentException(
-                $"The new metadata's log names '{bad.MetadataFile}', which is not an absolute location.",
-                nameof(newMetadata));
+        ThrowIfLocationsNotAbsolute(newMetadata);
+
+        // The catalog writes the log itself, of its own version files: each entry is one file in the table's
+        // metadata directory.
+        var metadataDir = tableLocation.Combine("metadata");
+        foreach (var entry in newMetadata.MetadataLog)
+        {
+            if (!StorageLocation.TryParse(entry.MetadataFile, out var logged) || !logged!.IsUnder(metadataDir) ||
+                logged.RelativeTo(metadataDir) is not { Length: > 0 } name || name.IndexOf('/') >= 0)
+                throw new ArgumentException(
+                    $"The new metadata's log names '{entry.MetadataFile}', which is not a file in {identifier}'s " +
+                    $"metadata directory, '{metadataDir}'.", nameof(newMetadata));
+        }
 
         // Written as a URI even when given as a bare path, as CreateTableAsync writes it.
         var committed = WithPreviousMetadataLogged(newMetadata with { Location = newLocation!.ToString() }, baseTable);

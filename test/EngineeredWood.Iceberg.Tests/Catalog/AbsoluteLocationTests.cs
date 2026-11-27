@@ -138,8 +138,26 @@ public class AbsoluteLocationTests : IDisposable
                 await catalog.CommitTableAsync(table, table.Metadata with { Location = location }));
         }
 
+        foreach (string logged in new[]
+                 {
+                     "db/t/metadata/v0.metadata.json",
+                     StorageLocation.Parse(_root).Combine("other/metadata/v1.metadata.json").ToString(),
+                     "s3://bucket/wh/db/t/metadata/v1.metadata.json",
+                     table.Location + "/metadata/sub/v1.metadata.json",
+                 })
+        {
+            await Assert.ThrowsAsync<ArgumentException>(async () => await catalog.CommitTableAsync(table,
+                table.Metadata with { MetadataLog = [new MetadataLogEntry(0, logged)] }));
+        }
+
+        var appended = await new TableOperations(catalog.Resolver).AppendFilesAsync(table.Metadata, [File(table.Location + "/data/a.parquet")]);
+        var snapshot = appended.Snapshots.Single();
         await Assert.ThrowsAsync<ArgumentException>(async () => await catalog.CommitTableAsync(table,
-            table.Metadata with { MetadataLog = [new MetadataLogEntry(0, "db/t/metadata/v0.metadata.json")] }));
+            appended with { Snapshots = [snapshot with { ManifestList = "db/t/metadata/snap.avro" }] }));
+        await Assert.ThrowsAsync<ArgumentException>(async () => await catalog.CommitTableAsync(table,
+            appended with { Statistics = [new StatisticsFile(snapshot.SnapshotId, "db/t/metadata/s.stats", 1, 1, [])] }));
+        await Assert.ThrowsAsync<ArgumentException>(async () => await catalog.CommitTableAsync(table,
+            appended with { PartitionStatistics = [new PartitionStatisticsFile(snapshot.SnapshotId, "db/t/metadata/p.parquet", 1)] }));
 
         Assert.False(System.IO.File.Exists(Path.Combine(_root, "db", "t", "metadata", "v2.metadata.json")));
         var respelled = "file:/" + table.Location.Substring("file:///".Length);
@@ -150,6 +168,22 @@ public class AbsoluteLocationTests : IDisposable
         var bare = await catalog.CommitTableAsync(committed, committed.Metadata with { Location = Path.Combine(_root, "db", "t") });
         Assert.StartsWith("file:///", bare.Metadata.Location, StringComparison.Ordinal);
         Assert.StartsWith("file:///", (await catalog.LoadTableAsync(table.Identifier)).Metadata.Location, StringComparison.Ordinal);
+    }
+
+    /// <summary>A table whose metadata gives a relative location, as every table EngineeredWood wrote before it
+    /// wrote absolute locations does, is refused when it is loaded, by name, rather than returned for every operation
+    /// to refuse later.</summary>
+    [Fact]
+    public async Task ATableWrittenWithARelativeLocationIsRefusedOnLoad()
+    {
+        var (catalog, table) = await CreateAsync(new FileSystemCatalog(new LocalTableFileSystem(_root)));
+        string v1 = StorageLocation.Parse(table.MetadataLocation!).LocalPath!;
+        string json = System.IO.File.ReadAllText(v1).Replace(table.Location, "db/t");
+        System.IO.File.WriteAllText(v1, json);
+
+        var ex = await Assert.ThrowsAsync<FormatException>(async () => await catalog.LoadTableAsync(table.Identifier));
+        Assert.Contains("db/t", ex.Message, StringComparison.Ordinal);
+        Assert.True(await catalog.TableExistsAsync(table.Identifier));
     }
 
     /// <summary>A rename publishes the destination's location like a create does, so a name whose location would
