@@ -109,8 +109,10 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
     /// <para>A segment that decodes to <c>.</c> or <c>..</c>, or to text with a <c>/</c>, a <c>\</c> or a control
     /// character, is refused (<see cref="NotSupportedException"/>), so a decoded segment can neither navigate nor
     /// become two. A malformed escape (<c>%ZZ</c>, a trailing <c>%</c>) is refused (<see cref="FormatException"/>), as
-    /// <c>java.net.URI</c> refuses it. <see cref="ToString"/> keeps the encoded spelling; equality uses the decoded
-    /// segments.</para>
+    /// <c>java.net.URI</c> refuses it, and so is a raw ASCII character a URI cannot hold (a space, <c>\</c>,
+    /// <c>"</c>, <c>&lt;</c>, <c>&gt;</c>, <c>^</c>, <c>`</c>, <c>{</c>, <c>|</c>, <c>}</c>, <c>[</c>, <c>]</c>), which
+    /// would otherwise mean one file on Windows and another elsewhere. <see cref="ToString"/> keeps the encoded
+    /// spelling; equality uses the decoded segments.</para>
     /// </summary>
     public static StorageLocation ParsePercentEncoded(string location)
     {
@@ -282,6 +284,12 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         {
             if (char.IsControl(c))
                 return Fail(throwOnError, $"Storage location '{location}' contains a control character.");
+
+            // A URI cannot hold these ASCII characters raw (RFC 3986; java.net.URI refuses each, MEASURED on Java
+            // 17), so a reader that parses the location as a URI, as delta-spark does, would refuse it.
+            if (decode && c is ' ' or '"' or '<' or '>' or '\\' or '^' or '`' or '{' or '|' or '}' or '[' or ']')
+                return Fail(throwOnError,
+                    $"URI '{location}' contains a raw '{c}', which a URI cannot hold; it must be percent-encoded.");
         }
 
         if (IsDriveLetterPath(location) || location[0] is '/' or '\\')

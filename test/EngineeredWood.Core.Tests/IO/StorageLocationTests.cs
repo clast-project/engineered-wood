@@ -152,6 +152,30 @@ public class StorageLocationTests
     public void MalformedEscapesAreRefused(string location) =>
         Assert.Throws<FormatException>(() => StorageLocation.ParsePercentEncoded(location));
 
+    /// <summary>MEASURED on Java 17: <c>java.net.URI</c> refuses each of these raw ("Illegal character in path"),
+    /// so delta-spark could not read such a vector. A raw <c>\</c> would also mean one file on Windows and another
+    /// elsewhere. Raw non-ASCII is legal there, and here.</summary>
+    [Theory]
+    [InlineData("file:///tmp/a b/dv.bin")]
+    [InlineData("s3://bucket/t/a b")]
+    [InlineData("file:///tmp/a\\b/dv.bin")]
+    [InlineData("s3://bucket/t/a\\b")]
+    [InlineData("file:///tmp/a[1].bin")]
+    [InlineData("file:///tmp/a|b")]
+    [InlineData("file:///tmp/a^b")]
+    [InlineData("file:///tmp/a\"b")]
+    [InlineData("file:///tmp/a<b>")]
+    [InlineData("file:///tmp/a{b}")]
+    [InlineData("file:///tmp/a`b")]
+    public void CharactersAUriCannotHoldAreRefused(string location)
+    {
+        Assert.Throws<FormatException>(() => StorageLocation.ParsePercentEncoded(location));
+        Assert.Equal(
+            StorageLocation.Parse("file:///tmp/é.bin"), StorageLocation.ParsePercentEncoded("file:///tmp/%C3%A9.bin"));
+        Assert.Equal(
+            StorageLocation.Parse("file:///tmp/é.bin"), StorageLocation.ParsePercentEncoded("file:///tmp/é.bin"));
+    }
+
     [Theory]
     [InlineData("s3://bucket/t/%2E%2E/x")]
     [InlineData("s3://bucket/t/a%2F..%2Fx")]

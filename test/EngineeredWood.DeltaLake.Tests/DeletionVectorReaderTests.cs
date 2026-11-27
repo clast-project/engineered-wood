@@ -393,6 +393,7 @@ public class DeletionVectorReaderTests : IDisposable
     [InlineData("s3://bucket/t/dv.bin?version=1")]
     [InlineData("abfss://c@acct.dfs.core.windows.net/t/dv.bin#f")]
     [InlineData("s3://bucket/t/dv%ZZ.bin")]
+    [InlineData("file:///tmp/t/a b/dv.bin")]
     public async Task AbsoluteVector_ThatIsNotAWellFormedUri_IsRefused(string path)
     {
         var fs = new LocalTableFileSystem(_tempDir);
