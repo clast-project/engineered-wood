@@ -160,11 +160,13 @@ missing tool a failure that names the missing prerequisite:
 
 | Variable | Tier | Set in |
 |---|---|---|
-| `EW_REQUIRE_DELTA_INTEROP` | delta-rs | `build`, nightly |
-| `EW_REQUIRE_DUCKDB_INTEROP` | DuckDB (Delta) | `build`, nightly |
-| `EW_REQUIRE_SPARK_INTEROP` | PySpark | nightly only (`build` has no JDK) |
-| `EW_REQUIRE_PARQUET_READERS_INTEROP` | Parquet readers (DuckDB, DataFusion) | `build` |
-| `EW_REQUIRE_ICEBERG_GO_INTEROP` | iceberg-go | `build` |
+| `EW_REQUIRE_DELTA_INTEROP` | delta-rs | `test`, nightly |
+| `EW_REQUIRE_DUCKDB_INTEROP` | DuckDB (Delta) | `test`, nightly |
+| `EW_REQUIRE_SPARK_INTEROP` | PySpark | nightly only (`test` has no JDK) |
+| `EW_REQUIRE_PARQUET_READERS_INTEROP` | Parquet readers (DuckDB, DataFusion) | `test` |
+| `EW_REQUIRE_ICEBERG_GO_INTEROP` | iceberg-go | `test` |
+| `EW_REQUIRE_ICEBERG_DUCKDB_INTEROP` | DuckDB `iceberg_scan` | `test` |
+| `EW_REQUIRE_ICEBERG_PYICEBERG_INTEROP` | pyiceberg | `test` |
 | `EW_REQUIRE_PARQUET_ALP_ORACLE` | ALP vs. arrow-rs | `parquet-alp-interop` |
 | `EW_REQUIRE_CLOUD_EMULATORS` | Azurite, MinIO, storage-testbench | `cloud-io` |
 | `EW_REQUIRE_VORTEX_VALIDATOR`, `EW_REQUIRE_VORTEX_UPSTREAM_COMPAT` | Vortex | `vortex-interop` |
@@ -234,6 +236,17 @@ $env:EW_ICEBERG_GO_DRIVER = "…\iceberg-go-driver.exe"
 `go.mod` pins iceberg-go **0.8.0 or later**: 0.7.0 brings deleted rows back after a v2→v3 upgrade.
 The driver keeps its tables in a sqlite SQL catalog, because iceberg-go's Hadoop catalog does not
 work on Windows.
+
+Two Python readers join it, as the `test` job installs them: DuckDB's `iceberg_scan` (validated against
+DuckDB 2.0.0, which needs its `iceberg` extension and so, the first time, network access) and pyiceberg
+0.12.0, which reads through a temporary sqlite SQL catalog. Without them those tests skip. They use the
+`python` on PATH unless `EW_ICEBERG_PYTHON` names another interpreter:
+
+```
+py -3.13 -m venv iceberg-py
+iceberg-py\Scripts\pip install duckdb==2.0.0 pyarrow==24.0.0 "pyiceberg[sql-sqlite,pyarrow]==0.12.0"
+$env:EW_ICEBERG_PYTHON = "…\iceberg-py\Scripts\python.exe"
+```
 
 ### Cloud backends
 
