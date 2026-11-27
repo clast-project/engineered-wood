@@ -345,15 +345,29 @@ public class DeletionVectorReaderTests : IDisposable
         }
     }
 
+    /// <summary>A vector outside the table is reached only through a registered location.</summary>
     [Fact]
-    public async Task AbsoluteVector_WithoutARegisteredLocation_IsRefused()
+    public async Task AbsoluteVector_OutsideTheTable_WithoutARegisteredLocation_IsRefused()
+    {
+        DeletionVector[] descriptors = await WritePackedFileAsync(new LocalTableFileSystem(_tempDir));
+        var table = new LocalTableFileSystem(Path.Combine(_tempDir, "table"));
+
+        var ex = await Assert.ThrowsAsync<UnregisteredStorageLocationException>(
+            async () => await new DeletionVectorReader(table).ReadAsync(descriptors[0]));
+        Assert.Equal(StorageLocation.Parse(PackedLocation), ex.Location);
+    }
+
+    /// <summary>A vector under the table's own location is read through the table's file system, which says where it
+    /// is rooted (<see cref="ILocatedFileSystem"/>): no registration is needed.</summary>
+    [Fact]
+    public async Task AbsoluteVector_InsideTheTable_NeedsNoRegistration()
     {
         var fs = new LocalTableFileSystem(_tempDir);
         DeletionVector[] descriptors = await WritePackedFileAsync(fs);
 
-        var ex = await Assert.ThrowsAsync<UnregisteredStorageLocationException>(
-            async () => await new DeletionVectorReader(fs).ReadAsync(descriptors[0]));
-        Assert.Equal(StorageLocation.Parse(PackedLocation), ex.Location);
+        var reader = new DeletionVectorReader(fs);
+        for (int i = 0; i < Vectors.Length; i++)
+            Assert.Equal(Vectors[i], (await reader.ReadAsync(descriptors[i])).ToArray());
     }
 
     /// <summary>delta-spark refuses a <c>p</c> path with no scheme ("Relative URIs are not supported for DVs"), a

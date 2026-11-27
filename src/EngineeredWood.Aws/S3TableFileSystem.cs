@@ -34,7 +34,7 @@ namespace EngineeredWood.IO.Aws;
 /// commit path uses PutObject rather than a copy.)
 /// </para>
 /// </remarks>
-public sealed class S3TableFileSystem : ITableFileSystem, IReadConcurrencyHint
+public sealed class S3TableFileSystem : ITableFileSystem, IReadConcurrencyHint, ILocatedFileSystem
 {
     private readonly IAmazonS3 _client;
     private readonly string _bucket;

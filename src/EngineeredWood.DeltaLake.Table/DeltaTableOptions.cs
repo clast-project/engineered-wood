@@ -226,11 +226,16 @@ public sealed record DeltaTableOptions
     public bool WriteVersionChecksums { get; init; } = true;
 
     /// <summary>
-    /// <para>Reaches the files a table names by absolute location rather than by a path under its root: today,
-    /// absolute-path (<c>p</c>) deletion vectors, which Delta allows anywhere. Register a file system for each
-    /// location prefix such files may lie under. Default: none, so a table holding such a vector refuses to read it
-    /// (with <see cref="EngineeredWood.IO.UnregisteredStorageLocationException"/>) rather than reach storage it was
-    /// not given.</para>
+    /// <para>Reaches the files a table names by absolute location outside its own root: <c>add</c>, <c>remove</c> and
+    /// <c>cdc</c> paths that are absolute URIs (a shallow clone's files, PROTOCOL.md: "a relative path ... or an
+    /// absolute path"), and absolute-path (<c>p</c>) deletion vectors. Register a file system for each location prefix
+    /// such files may lie under. Default: none, so a table naming such a file refuses to read it (with
+    /// <see cref="EngineeredWood.IO.UnregisteredStorageLocationException"/>) rather than reach storage it was not
+    /// given.</para>
+    /// <para>An absolute location under the table's own root needs no registration when the table's file system says
+    /// where it is rooted (<see cref="EngineeredWood.IO.ILocatedFileSystem"/>, which every built-in backend
+    /// implements): it is read through the table's file system. Writes always go under the table's root; VACUUM never
+    /// deletes a file outside it (<see cref="VacuumResult.FilesOutsideTable"/>).</para>
     /// </summary>
     public EngineeredWood.IO.StorageResolver? StorageResolver { get; init; }
 

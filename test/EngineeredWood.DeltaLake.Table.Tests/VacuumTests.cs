@@ -8,6 +8,7 @@ using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Table;
+using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 
 namespace EngineeredWood.DeltaLake.Table.Tests;
@@ -291,17 +292,9 @@ public class VacuumTests : IDisposable
         Assert.NotEmpty(after.FilesToDelete);
     }
 
-    /// <summary>
-    /// Absolute-path (<c>p</c>) vectors cannot be resolved against the table root, so vacuum cannot
-    /// prove they lie outside the directory it is about to sweep. It refuses rather than guessing.
-    /// </summary>
-    [Fact]
-    public async Task Vacuum_AbsolutePathDeletionVector_IsRefused()
+    /// <summary>Gives the table's only file an absolute-path (<c>p</c>) vector at <paramref name="dvLocation"/>.</summary>
+    private static async Task AttachAbsoluteVectorAsync(ITableFileSystem fs, DeltaTable table, string dvLocation)
     {
-        var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdSchema);
-        await table.WriteAsync([IdBatch(1, 2, 3)]);
-
         var addFile = table.CurrentSnapshot.ActiveFiles.Values.Single();
         var log = new TransactionLog(fs);
         await log.WriteCommitAsync(table.CurrentSnapshot.Version + 1, new DeltaAction[]
@@ -317,16 +310,66 @@ public class VacuumTests : IDisposable
                 DeletionVector = new DeletionVector
                 {
                     StorageType = "p",
-                    PathOrInlineDv = "/somewhere/else/deletion_vector_x.bin",
+                    PathOrInlineDv = dvLocation,
                     SizeInBytes = 4,
                     Cardinality = 1,
                 },
             },
         });
         await table.RefreshAsync();
+    }
 
+    /// <summary>
+    /// An absolute-path (<c>p</c>) vector inside the table is placed by its path under the root and kept, as a
+    /// relative (<c>u</c>) one is: deleting it would resurrect every row it masks.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_KeepsAnAbsolutePathDeletionVectorInsideTheTable()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema);
+        await table.WriteAsync([IdBatch(1, 2, 3)]);
+        Directory.CreateDirectory(Path.Combine(_tempDir, "dvs"));
+        File.WriteAllBytes(Path.Combine(_tempDir, "dvs", "deletion_vector_x.bin"), [1, 2, 3, 4]);
+        string dvLocation = fs.Location.Combine("dvs/deletion_vector_x.bin").ToString();
+        await AttachAbsoluteVectorAsync(fs, table, dvLocation);
+
+        var result = await table.VacuumAsync(retentionPeriod: TimeSpan.Zero, dryRun: true);
+        Assert.DoesNotContain("dvs/deletion_vector_x.bin", result.FilesToDelete);
+    }
+
+    /// <summary>
+    /// Where the table's file system does not say where it is rooted, an absolute-path (<c>p</c>) vector cannot be
+    /// placed inside or outside the directory vacuum is about to sweep. It refuses rather than guess.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_AbsolutePathDeletionVector_UnlocatedTable_IsRefused()
+    {
+        var local = new LocalTableFileSystem(_tempDir);
+        await using (var writer = await DeltaTable.CreateAsync(local, IdSchema))
+        {
+            await writer.WriteAsync([IdBatch(1, 2, 3)]);
+            await AttachAbsoluteVectorAsync(local, writer, local.Location.Combine("deletion_vector_x.bin").ToString());
+        }
+
+        await using var table = await DeltaTable.OpenAsync(new DataFileCountingFileSystem(local));
         await Assert.ThrowsAsync<NotSupportedException>(
             async () => await table.VacuumAsync(retentionPeriod: TimeSpan.Zero, dryRun: true));
+    }
+
+    /// <summary>A <c>p</c> vector with no URI scheme names no file (delta-spark refuses it too), so vacuum cannot keep
+    /// it and refuses.</summary>
+    [Fact]
+    public async Task Vacuum_AbsolutePathDeletionVector_WithoutAScheme_IsRefused()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema);
+        await table.WriteAsync([IdBatch(1, 2, 3)]);
+        await AttachAbsoluteVectorAsync(fs, table, "/somewhere/else/deletion_vector_x.bin");
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.VacuumAsync(retentionPeriod: TimeSpan.Zero, dryRun: true));
+        Assert.Equal(DeltaErrorCodes.InvalidDeletionVector, ex.ErrorCode);
     }
 
     /// <summary>

@@ -26,7 +26,7 @@ namespace EngineeredWood.IO.Azure;
 /// or not at all.
 /// </para>
 /// </remarks>
-public sealed class AzureTableFileSystem : ITableFileSystem, IReadConcurrencyHint
+public sealed class AzureTableFileSystem : ITableFileSystem, IReadConcurrencyHint, ILocatedFileSystem
 {
     private readonly BlobContainerClient _container;
     private readonly string _rootPrefix;

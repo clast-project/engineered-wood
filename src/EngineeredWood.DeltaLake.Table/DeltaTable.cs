@@ -25,6 +25,9 @@ namespace EngineeredWood.DeltaLake.Table;
 public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 {
     private readonly ITableFileSystem _fs;
+
+    /// <summary>Finds the file an action path names: under the table root, or anywhere through the resolver.</summary>
+    private readonly DeltaFileLocator _locator;
     private readonly DeltaTableOptions _options;
     private readonly TransactionLog _log;
     private readonly CheckpointReader _checkpointReader;
@@ -80,6 +83,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         _fs = fileSystem;
         _options = options;
+        _locator = new DeltaFileLocator(fileSystem, options.StorageResolver);
         _dataFileReadOptions = DataFileReadOptions(options.ParquetReadOptions);
         _log = new TransactionLog(fileSystem);
         _checkpointReader = new CheckpointReader(fileSystem);
@@ -5273,8 +5277,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var deletedRowTracking = new List<(Int64Array Ids, Int64Array Vers)>();
 
             // The size from the action, so that opening the file asks the store nothing (#722).
+            var located = _locator.Resolve(addFile.Path);
             await using var file = await KnownLengthRandomAccessFile.OpenAsync(
-                    _fs, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), addFile.Size, cancellationToken)
+                    located.FileSystem, located.Path, addFile.Size, cancellationToken)
                 .ConfigureAwait(false);
             using var reader = new Parquet.ParquetFileReader(
                 file, ownsFile: false, _dataFileReadOptions)
@@ -5294,7 +5299,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // from the batches. It decides the whole-file remove, and a short count would turn a partial
             // delete into one.
             var footer = await DataFileFooter.ReadAsync(
-                reader, file, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken).ConfigureAwait(false);
+                reader, file, located.Path, cancellationToken).ConfigureAwait(false);
             long fileRows = 0;
             foreach (var rowGroup in footer.RowGroups)
                 fileRows += rowGroup.NumRows;
@@ -9399,7 +9404,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // the caller may be planning against.
         var active = new HashSet<string>(StringComparer.Ordinal);
         foreach (var add in latest.ActiveFiles.Values)
-            active.Add(EngineeredWood.DeltaLake.DeltaPath.Decode(add.Path)); // add.path is URL-encoded
+        {
+            // add.path is URL-encoded, and may be an absolute location: one inside the table is compared by its path
+            // under the root, and one outside cannot be a file of this table's. Where the table is unknown, an
+            // absolute path cannot be placed, and this throws rather than let a live file be discarded.
+            if (_locator.TableRelativePath(add.Path) is { } inTable)
+                active.Add(inTable);
+        }
 
         var ledger = new WrittenFileLedger();
         foreach (var f in files)
@@ -9853,11 +9864,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>The rows <paramref name="file"/> holds physically, deletion vector or not.</summary>
     private async ValueTask<long> PhysicalRowCountAsync(AddFile file, CancellationToken cancellationToken)
     {
-        string path = EngineeredWood.DeltaLake.DeltaPath.Decode(file.Path);
         long rows = 0;
         if (_options.DataFileReader is { } seam)
         {
-            await foreach (var batch in seam.ReadAsync(path, null, cancellationToken).ConfigureAwait(false))
+            string seamPath = _locator.ResolveInTable(file.Path, nameof(DeltaTableOptions.DataFileReader));
+            await foreach (var batch in seam.ReadAsync(seamPath, null, cancellationToken).ConfigureAwait(false))
             {
                 rows += batch.Length;
                 batch.Dispose();
@@ -9866,10 +9877,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         // The size from the action: no HEAD before the footer, and a wrong one says so (#722).
-        await using var stream = await KnownLengthRandomAccessFile.OpenAsync(_fs, path, file.Size, cancellationToken)
+        var located = _locator.Resolve(file.Path);
+        await using var stream = await KnownLengthRandomAccessFile.OpenAsync(
+                located.FileSystem, located.Path, file.Size, cancellationToken)
             .ConfigureAwait(false);
         using var reader = new Parquet.ParquetFileReader(stream, ownsFile: false, _dataFileReadOptions);
-        var footer = await DataFileFooter.ReadAsync(reader, stream, path, cancellationToken).ConfigureAwait(false);
+        var footer = await DataFileFooter.ReadAsync(reader, stream, located.Path, cancellationToken).ConfigureAwait(false);
         foreach (var rowGroup in footer.RowGroups)
             rows += rowGroup.NumRows;
         return rows;
@@ -11476,18 +11489,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // Reuse the source path's ENCODED prefix verbatim (partition dir) for the add — never re-encode, which would
         // double-encode a non-ASCII partition value — and its DECODED form for the write. A moved group's directory
         // is built as the append path builds it, then encoded once.
+        // A source outside the table (a shallow clone's) gives no directory: the rewrite is written under this table,
+        // in the partition directory the append path would pick, never beside another table's files.
         string encodedDir = "";
-        if (targetPartition is not null)
+        IReadOnlyDictionary<string, string>? partitionForDir = targetPartition;
+        if (partitionForDir is null)
         {
-            string partDir = BuildPartitionPath(targetPartition);
+            if (_locator.EncodedDirectoryForRewrite(source.Path) is { } sourceDir)
+                encodedDir = sourceDir;
+            else
+                partitionForDir = source.PartitionValues;
+        }
+        if (partitionForDir is not null)
+        {
+            string partDir = BuildPartitionPath(partitionForDir);
             if (partDir.Length > 0)
                 encodedDir = DeltaPath.Encode(partDir) + "/";
-        }
-        else
-        {
-            int dirSlash = source.Path.LastIndexOf('/');
-            if (dirSlash >= 0)
-                encodedDir = source.Path.Substring(0, dirSlash + 1);
         }
         string baseName = $"{Guid.NewGuid():N}.parquet";
         string newFileName = EngineeredWood.DeltaLake.DeltaPath.Decode(encodedDir) + baseName;
@@ -13124,7 +13141,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     writeOptions, CompactionReadOptions(writeOptions),
                     cancellationToken, _options.DataFileWriter, _options.DataFileReader, written,
                     maxConcurrentReads: EffectiveConcurrentReads, maxBufferedReadBytes: _options.MaxBufferedReadBytes,
-                    memoryBudget: _options.MemoryBudget)
+                    memoryBudget: _options.MemoryBudget, resolver: _options.StorageResolver)
                     .ConfigureAwait(false);
                 if (plan is not { } compaction)
                     return null;
@@ -13259,7 +13276,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // and a table maintained only by vacuuming can now reach the checkpoint interval. Neither used to
         // happen, and both are what every other commit path already does.
         return await Vacuum.VacuumExecutor.ExecuteAsync(
-            _fs, _log, CurrentSnapshot, retention, dryRun,
+            _locator, _log, CurrentSnapshot, retention, dryRun,
             _options.HideIcebergMetadataDirectory, cancellationToken,
             afterCommit: AfterVacuumCommitAsync, commitProperties: commitProperties,
             maxConcurrentDeletes: EffectiveConcurrentRequests)
@@ -13454,6 +13471,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         /// <summary>The codec seam's reader and the physical columns to ask it for; null for the built-in one.</summary>
         internal IDataFileReader? Seam { get; init; }
         internal IReadOnlyList<string>? SeamColumns { get; init; }
+        /// <summary>The file's path under the table root, which the seam is handed; null for the built-in reader.</summary>
+        internal string? SeamPath { get; init; }
 
         /// <summary>
         /// An exact filter's selected read of this file through the built-in reader (#502): the rows it returns are
@@ -13749,14 +13768,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 PhysicalToLogical = physicalToLogical, LogicalToPhysical = logicalToPhysical,
                 DeletedRows = deletedRows, PartitionColumns = partitionColumns, HasPartitions = hasPartitions,
                 Seam = dataFileReader, SeamColumns = seamColumns,
+                SeamPath = _locator.ResolveInTable(addFile.Path, nameof(DeltaTableOptions.DataFileReader)),
                 SeamConditions = conditions, FilterColumns = returned,
             };
         }
 
         // Open the file and read its Parquet schema for field_id resolution. Its size comes from the action, so
         // the open asks the store nothing: on an object store that was a HEAD per file before its footer (#722).
+        var located = _locator.Resolve(addFile.Path);
         var file = await KnownLengthRandomAccessFile.OpenAsync(
-                _fs, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), addFile.Size, cancellationToken)
+                located.FileSystem, located.Path, addFile.Size, cancellationToken)
             .ConfigureAwait(false);
         ParquetFileReader? reader = null;
         try
@@ -13773,8 +13794,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // needs it, and a scan opens files AHEAD of the one it is planning, so that the footer's round trips
             // overlap the reads in flight. Left to the planner, an unprojected read would fetch each file's footer
             // one after another, on the one thread that plans.
-            await DataFileFooter.ReadAsync(
-                reader, file, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken).ConfigureAwait(false);
+            await DataFileFooter.ReadAsync(reader, file, located.Path, cancellationToken).ConfigureAwait(false);
 
             // A byte/short column the table widened reads as the INT32 it stores, not narrowed and widened back
             // (#839). Before any read: it changes the type every batch carries.
@@ -14168,7 +14188,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     private static IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> SeamSource(
         DataFileRead read, ScanReservation reservation, CancellationToken cancellationToken) =>
         Reserving(InFileOrder(read.Seam!.ReadAsync(
-            EngineeredWood.DeltaLake.DeltaPath.Decode(read.AddFile.Path), read.SeamColumns, cancellationToken),
+            read.SeamPath!, read.SeamColumns, cancellationToken),
             cancellationToken), reservation, cancellationToken);
 
     /// <summary>

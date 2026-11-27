@@ -15,17 +15,19 @@ namespace EngineeredWood.DeltaLake.DeletionVectors;
 public sealed class DeletionVectorReader
 {
     private readonly ITableFileSystem _fs;
-    private readonly StorageResolver _resolver;
+    private readonly DeltaFileLocator _locator;
 
     /// <summary>
-    /// Creates a reader for the table whose root <paramref name="fileSystem"/> is. Absolute-path (<c>p</c>) vectors
-    /// are read through <paramref name="resolver"/>; without one, every such vector is refused with
+    /// Creates a reader for the table whose root <paramref name="fileSystem"/> is. An absolute-path (<c>p</c>) vector
+    /// under the table's own location (when <paramref name="fileSystem"/> says where it is rooted,
+    /// <see cref="ILocatedFileSystem"/>) is read through <paramref name="fileSystem"/>, and any other through
+    /// <paramref name="resolver"/>; without one, such a vector is refused with
     /// <see cref="UnregisteredStorageLocationException"/>.
     /// </summary>
     public DeletionVectorReader(ITableFileSystem fileSystem, StorageResolver? resolver = null)
     {
         _fs = fileSystem;
-        _resolver = resolver ?? new StorageResolver();
+        _locator = new DeltaFileLocator(fileSystem, resolver);
     }
 
     /// <summary>
@@ -87,7 +89,7 @@ public sealed class DeletionVectorReader
     private async ValueTask<DeletionVectorBitmap> ReadAbsoluteFileAsync(
         DeletionVector dv, CancellationToken cancellationToken)
     {
-        var resolved = _resolver.Resolve(DeletionVectorPath.AbsoluteLocation(dv));
+        var resolved = _locator.Resolve(DeletionVectorPath.AbsoluteLocation(dv));
         return await ReadDvFileAsync(resolved.FileSystem, resolved.Path, dv.Offset ?? 0, dv.SizeInBytes, cancellationToken)
             .ConfigureAwait(false);
     }

@@ -33,7 +33,7 @@ internal static class VacuumExecutor
     /// <param name="maxConcurrentDeletes">The physical deletes run at once. Each is one request, and against an
     /// object store one round trip, so deleting one file at a time cost a round trip per file.</param>
     public static async ValueTask<VacuumResult> ExecuteAsync(
-        ITableFileSystem fs,
+        DeltaFileLocator files,
         TransactionLog log,
         DeltaSnapshot snapshot,
         TimeSpan retentionPeriod,
@@ -56,20 +56,42 @@ internal static class VacuumExecutor
         // What each entry must contribute is its DATA path AND its deletion-vector path. Missing the
         // DV path is how a vacuum silently corrupts a table: the .bin disappears, the mask with it,
         // and every row it hid returns as live data with nothing logged anywhere.
+        //
+        // An absolute path (a shallow clone's; PROTOCOL.md: "or an absolute path") is placed against the table's own
+        // location. One inside the table is kept by its path under the root, as delta-spark relativizes it
+        // (VacuumCommandImpl.getRelativePath -> DeltaFileOperations.tryRelativizePath, 4.4.1 bytecode); one outside
+        // is never deleted, since the sweep lists only the table. Where the table's location is unknown an absolute
+        // path cannot be placed, and vacuum is refused rather than guess.
+        var fs = files.Table;
         var keep = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
             // add.path is URL-encoded; decode to the on-disk name before comparing against the listing.
-            keep.Add(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path));
-            AddDeletionVectorPath(keep, addFile.DeletionVector);
+            if (InTable(files, addFile.Path) is { } inTable)
+                keep.Add(inTable);
+            AddDeletionVectorPath(files, keep, addFile.DeletionVector);
         }
 
         // A tombstone's DV is NOT kept — it masked rows in a file no longer part of the table, so it is
-        // exactly the orphaned .bin this rewrite exists to collect. But a `p`-type vector anywhere in
-        // the log still has to be rejected, because we cannot prove it lies outside the sweep.
+        // exactly the orphaned .bin this rewrite exists to collect. A `p`-type vector is placed like a data file:
+        // inside the table it is collected like any other orphan, outside it is left alone, and where the table's
+        // location is unknown it cannot be placed, so vacuum is refused.
+        //
+        // A removed file outside the table is left in place too, and reported once it is past the retention after
+        // which a file inside would be deleted: it may still be another table's (the source of a shallow clone), so
+        // deleting it is its owner's call, as Iceberg expiry reports such files (ExpireResult.FilesOutsideTable).
+        long cutoffMillis = (DateTimeOffset.UtcNow - retentionPeriod).ToUnixTimeMilliseconds();
+        var outside = new List<string>();
         foreach (var tombstone in snapshot.Tombstones.Values)
-            RejectIfAbsolute(tombstone.DeletionVector);
+        {
+            if (tombstone.DeletionVector is { } tombstoneDv && DeletionVectorPath.IsAbsolute(tombstoneDv))
+                _ = InTable(files, DeletionVectorPath.AbsoluteLocation(tombstoneDv), tombstoneDv.PathOrInlineDv);
+            if (!DeltaFileLocator.IsAbsolute(tombstone.Path) || snapshot.ActiveFiles.ContainsKey(tombstone.Path))
+                continue;
+            if (InTable(files, tombstone.Path) is null && (tombstone.DeletionTimestamp ?? 0) < cutoffMillis)
+                outside.Add(tombstone.Path);
+        }
 
         // ── Sweep: everything under the table root, with NO extension filter. ──
         //
@@ -168,40 +190,64 @@ internal static class VacuumExecutor
             FilesToDelete = filesToDelete,
             FilesDeleted = deleted,
             LastCommittedVersion = endVersion,
+            FilesOutsideTable = outside,
         };
     }
 
     /// <summary>
-    /// Adds a deletion vector's backing file to the keep-set. Inline vectors live in the log and have
-    /// no file of their own.
+    /// Adds a deletion vector's backing file to the keep-set. Inline vectors live in the log and have no file of their
+    /// own; an absolute-path (<c>p</c>) one is kept when it lies inside the table.
     /// </summary>
-    private static void AddDeletionVectorPath(HashSet<string> keep, DeletionVector? dv)
+    private static void AddDeletionVectorPath(DeltaFileLocator files, HashSet<string> keep, DeletionVector? dv)
     {
-        RejectIfAbsolute(dv);
-
-        string? path = dv is null ? null : DeletionVectorPath.GetRelativePath(dv);
+        if (dv is null)
+            return;
+        string? path = DeletionVectorPath.IsAbsolute(dv)
+            ? InTable(files, DeletionVectorPath.AbsoluteLocation(dv), dv.PathOrInlineDv)
+            : DeletionVectorPath.GetRelativePath(dv);
         if (path is not null)
             keep.Add(path);
     }
 
-    /// <summary>
-    /// Absolute-path (<c>p</c>) vectors cannot be resolved against the table root from the action
-    /// alone. Vacuum would have to guess whether each one lies inside the directory it is about to
-    /// sweep, and a wrong guess deletes a live deletion vector — silently resurrecting every row it
-    /// masks. Refusing is the only safe answer; EngineeredWood never writes <c>p</c> vectors, so a
-    /// table containing them came from another engine.
-    /// </summary>
-    private static void RejectIfAbsolute(DeletionVector? dv)
+    /// <summary>The path under the table root of the file a URL-encoded action path names, or null when it lies
+    /// outside the table. Refuses vacuum when that cannot be decided (see <see cref="Refusal"/>).</summary>
+    private static string? InTable(DeltaFileLocator files, string encodedPath)
     {
-        if (dv is not null && DeletionVectorPath.IsAbsolute(dv))
+        try
         {
-            throw new NotSupportedException(
-                "This table contains absolute-path deletion vectors (storageType 'p'), whose targets "
-                + "cannot be resolved against the table root. Vacuum cannot prove they lie outside the "
-                + "swept directory, and deleting a live deletion vector would silently resurrect every "
-                + "row it masks. Vacuum is refused for this table.");
+            return files.TableRelativePath(encodedPath);
+        }
+        catch (NotSupportedException ex)
+        {
+            throw Refusal(ex);
         }
     }
+
+    /// <summary>As <see cref="InTable(DeltaFileLocator, string)"/>, for an absolute location.</summary>
+    private static string? InTable(DeltaFileLocator files, StorageLocation location, string name)
+    {
+        try
+        {
+            return files.TableRelativePath(location, name);
+        }
+        catch (NotSupportedException ex)
+        {
+            throw Refusal(ex);
+        }
+    }
+
+    /// <summary>
+    /// An absolute path, a data file's or a <c>p</c> deletion vector's, cannot be placed when the table's file system
+    /// does not say where the table is (<see cref="ILocatedFileSystem"/>). Vacuum would have to guess whether it lies
+    /// inside the directory it is about to sweep, and a wrong guess deletes a live file, or a live deletion vector and
+    /// with it the mask over every row it deletes. Refusing is the only safe answer.
+    /// </summary>
+    private static NotSupportedException Refusal(NotSupportedException inner) =>
+        new("This table names files by absolute location, and its file system does not say where the table is ("
+            + nameof(ILocatedFileSystem) + "), so vacuum cannot prove they lie outside the swept directory: deleting "
+            + "a live data file or deletion vector would lose data or resurrect deleted rows. Vacuum is refused for "
+            + "this table. " + inner.Message,
+            inner);
 
     /// <summary>
     /// Whether vacuum must leave <paramref name="path"/> alone — the HIDDEN-NAME rule, applied to every

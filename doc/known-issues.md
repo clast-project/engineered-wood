@@ -603,10 +603,26 @@ active files and the snapshot does not track `cdc` actions. This
 under-deletes; it cannot lose data. Spark and delta-rs do sweep it; see
 [`vacuum-hidden-directories.md`](vacuum-hidden-directories.md).
 
-**Vacuum refuses tables with absolute-path deletion vectors.** A
-`storageType: "p"` vector cannot be proven to lie outside the swept
-directory, and deleting a live one would resurrect every row it masks, so
-vacuum throws `NotSupportedException`. EW never writes `p` vectors.
+**Absolute file paths (shallow clones) and vacuum.** An `add`, `remove` or
+`cdc` path may be an absolute URI, and a `storageType: "p"` deletion vector
+always is. Vacuum places each against the table's own location: one inside
+the table is kept like a relative one, one outside is never deleted (the
+sweep lists only the table), and a removed file outside the table is
+reported in `VacuumResult.FilesOutsideTable` rather than deleted, since it
+may be the clone source's. When the table's file system does not say where
+it is rooted (`ILocatedFileSystem`; every built-in backend does, a custom
+wrapper may not), an absolute path cannot be placed, and vacuum throws
+`NotSupportedException` rather than guess. delta-spark differs in one case:
+an absolute path on another file system (another bucket) fails its VACUUM
+with `DELTA_FAIL_RELATIVIZE_PATH` unless
+`spark.databricks.delta.vacuum.relativize.ignoreError` is set; EW compares
+locations instead and needs no such switch. EW never writes `p` vectors or
+absolute paths.
+
+**A rooted file path without a scheme is refused.** `/data/x.parquet` or
+`C:/data/x.parquet` in an action fails with `DELTA_INVALID_FILE_PATH`.
+delta-spark opens such a path on its default file system, delta-kernel-rs
+under the table root's bucket, so no reading of it is portable.
 
 ### Correctness / interop issues
 
