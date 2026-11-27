@@ -40,11 +40,12 @@ public sealed class StorageResolver
             if (_registrations.Any(r => r.Prefix == prefix))
                 throw new ArgumentException($"A file system is already registered for '{prefix}'.", nameof(prefix));
 
-            // Longest prefix first, so the first match is the most specific one.
-            _registrations = _registrations
+            // Longest prefix first, so the first match is the most specific one. Published with a release, which
+            // pairs with the readers' Volatile.Read: a reader that sees the new array sees its contents.
+            Volatile.Write(ref _registrations, _registrations
                 .Append(new Registration(prefix, fileSystem))
                 .OrderByDescending(r => r.Prefix.SegmentCount)
-                .ToArray();
+                .ToArray());
         }
 
         return this;

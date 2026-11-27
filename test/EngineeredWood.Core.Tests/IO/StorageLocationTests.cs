@@ -16,6 +16,8 @@ public class StorageLocationTests
     [InlineData("abfss://c@acct.dfs.core.windows.net/a/b", "https://acct.blob.core.windows.net/c/a/b")]
     [InlineData("wasbs://c@acct.blob.core.windows.net/a/b", "https://ACCT.blob.core.windows.net/c/a/b")]
     [InlineData("abfs://c@acct.dfs.core.windows.net/a", "http://acct.blob.core.windows.net/c/a")]
+    [InlineData("abfss://c@acct.dfs.core.chinacloudapi.cn/a", "https://acct.blob.core.chinacloudapi.cn/c/a")]
+    [InlineData("abfss://c@acct.dfs.core.usgovcloudapi.net/a", "https://ACCT.dfs.core.usgovcloudapi.net/c/a")]
     [InlineData("file:/tmp/wh/t", "file:///tmp/wh/t")]
     [InlineData("file:/tmp/wh/t", "file://localhost/tmp/wh/t")]
     [InlineData("file:/tmp/wh/t", "/tmp/wh/t")]
@@ -41,6 +43,9 @@ public class StorageLocationTests
     [InlineData("abfss://c@acct.dfs.core.windows.net/a", "abfss://d@acct.dfs.core.windows.net/a")]
     [InlineData("file:/tmp/a%20b", "file:/tmp/a b")]
     [InlineData("http://example.com/t", "https://example.com/t")]
+    [InlineData("https://service.blob.example.com/c/t", "abfss://c@service.dfs.example.com/t")]
+    [InlineData("https://service.blob.example.com/c/t", "https://service.dfs.example.com/c/t")]
+    [InlineData("https://acct.blob.core.windows.net.example.com/c/t", "abfss://c@acct.dfs.core.windows.net/t")]
     public void DifferentObjectsAreNotEqual(string a, string b) =>
         Assert.NotEqual(StorageLocation.Parse(a), StorageLocation.Parse(b));
 

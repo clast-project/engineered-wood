@@ -548,8 +548,34 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         return all;
     }
 
-    private static bool IsAzureStorageHost(string host) =>
-        host.IndexOf(".blob.", StringComparison.Ordinal) > 0 || host.IndexOf(".dfs.", StringComparison.Ordinal) > 0;
+    /// <summary>The DNS suffixes of Azure Storage's public and sovereign clouds.</summary>
+    private static readonly string[] AzureStorageSuffixes =
+        ["core.windows.net", "core.chinacloudapi.cn", "core.usgovcloudapi.net"];
+
+    /// <summary>True for an Azure Storage blob or DFS endpoint, <c>&lt;account&gt;.(blob|dfs).&lt;cloud suffix&gt;</c>
+    /// (a port allowed), and for nothing else: <c>service.blob.example.com</c> is an ordinary HTTP host.</summary>
+    private static bool IsAzureStorageHost(string host)
+    {
+        int colon = host.IndexOf(':');
+        string name = colon < 0 ? host : host.Substring(0, colon);
+        int dot = name.IndexOf('.');
+        if (dot <= 0)
+            return false;
+        string rest = name.Substring(dot + 1);
+        foreach (string service in new[] { "blob.", "dfs." })
+        {
+            if (!rest.StartsWith(service, StringComparison.Ordinal))
+                continue;
+            string suffix = rest.Substring(service.Length);
+            foreach (string cloud in AzureStorageSuffixes)
+            {
+                if (suffix == cloud)
+                    return true;
+            }
+        }
+
+        return false;
+    }
 
     /// <summary>The blob endpoint of an Azure storage host: <c>account.dfs.core.windows.net</c> becomes
     /// <c>account.blob.core.windows.net</c>. Hosts are case-insensitive, so it is lowercased.</summary>
