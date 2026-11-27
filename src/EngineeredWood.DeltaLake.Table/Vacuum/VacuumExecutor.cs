@@ -63,13 +63,20 @@ internal static class VacuumExecutor
         // is never deleted, since the sweep lists only the table. Where the table's location is unknown an absolute
         // path cannot be placed, and vacuum is refused rather than guess.
         var fs = files.Table;
-        var keep = new HashSet<string>(StringComparer.Ordinal);
+        // On a local Windows table names compare as the file system compares them: an absolute URI keeps its own
+        // spelling, and a keep-set that missed the listed spelling of a live file would delete it.
+        var keep = new HashSet<string>(files.PathComparer);
+        // The live files outside the table, by location: ActiveFiles is keyed by path AND deletion vector, so a file a
+        // vector DELETE gave a new vector has a tombstone under its old key while it is still live.
+        var liveOutside = new HashSet<StorageLocation>();
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
             // add.path is URL-encoded; decode to the on-disk name before comparing against the listing.
             if (InTable(files, addFile.Path) is { } inTable)
                 keep.Add(inTable);
+            else
+                liveOutside.Add(DeltaFileLocator.AbsoluteLocation(addFile.Path));
             AddDeletionVectorPath(files, keep, addFile.DeletionVector);
         }
 
@@ -83,13 +90,16 @@ internal static class VacuumExecutor
         // deleting it is its owner's call, as Iceberg expiry reports such files (ExpireResult.FilesOutsideTable).
         long cutoffMillis = (DateTimeOffset.UtcNow - retentionPeriod).ToUnixTimeMilliseconds();
         var outside = new List<string>();
+        var reported = new HashSet<StorageLocation>();
         foreach (var tombstone in snapshot.Tombstones.Values)
         {
             if (tombstone.DeletionVector is { } tombstoneDv && DeletionVectorPath.IsAbsolute(tombstoneDv))
                 _ = InTable(files, DeletionVectorPath.AbsoluteLocation(tombstoneDv), tombstoneDv.PathOrInlineDv);
-            if (!DeltaFileLocator.IsAbsolute(tombstone.Path) || snapshot.ActiveFiles.ContainsKey(tombstone.Path))
+            if (!DeltaFileLocator.IsAbsolute(tombstone.Path) || InTable(files, tombstone.Path) is not null)
                 continue;
-            if (InTable(files, tombstone.Path) is null && (tombstone.DeletionTimestamp ?? 0) < cutoffMillis)
+            // One file is reported once, and never while the table still reads it.
+            var location = DeltaFileLocator.AbsoluteLocation(tombstone.Path);
+            if ((tombstone.DeletionTimestamp ?? 0) < cutoffMillis && !liveOutside.Contains(location) && reported.Add(location))
                 outside.Add(tombstone.Path);
         }
 

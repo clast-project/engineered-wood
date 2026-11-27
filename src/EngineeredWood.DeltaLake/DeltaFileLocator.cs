@@ -37,7 +37,19 @@ internal sealed class DeltaFileLocator
         Table = table ?? throw new ArgumentNullException(nameof(table));
         _resolver = resolver ?? new StorageResolver();
         TableLocation = LocationOf(table);
+        PathComparer = TableLocation?.SegmentComparison == StringComparison.OrdinalIgnoreCase
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
     }
+
+    /// <summary>
+    /// <para>How two paths under the table root compare as names of one file: case-insensitively for a local table on
+    /// Windows, as its file system compares them, and ordinally everywhere else (an unknown location included).</para>
+    /// <para>A set that decides what must NOT be deleted (VACUUM's keep-set, the discard guard) uses it: a path an
+    /// absolute URI gives keeps the URI's spelling, and on Windows <c>PART.parquet</c> there opens the listed
+    /// <c>part.parquet</c>, so an ordinal set would miss the live file.</para>
+    /// </summary>
+    public StringComparer PathComparer { get; }
 
     /// <summary>The table's file system.</summary>
     public ITableFileSystem Table { get; }

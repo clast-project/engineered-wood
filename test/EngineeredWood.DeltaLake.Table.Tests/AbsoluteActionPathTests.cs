@@ -146,6 +146,56 @@ public sealed class AbsoluteActionPathTests : IDisposable
         Assert.Equal([1, 2, 3, 4, 5, 6], await ReadIdsAsync(source));
     }
 
+    /// <summary>
+    /// A deletion-vector DELETE on a source file removes it and adds it back with a vector, under one path: the file is
+    /// still live, so it is not reported as left behind (the snapshot keys files by path AND vector).
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_DoesNotReportAFileAVectorDeleteKeptLive()
+    {
+        await using (var source = await DeltaTable.CreateAsync(
+                         new LocalTableFileSystem(_sourceDir), IdSchema, enableDeletionVectors: true))
+        {
+            await source.WriteAsync([Ids(1, 2, 3)]);
+        }
+        CloneLog(_sourceDir, _cloneDir);
+
+        await using var clone = await OpenCloneAsync();
+        await clone.DeleteAsync(IdEquals(2), RowDeleteMode.DeletionVector);
+        Assert.Contains(clone.CurrentSnapshot.Tombstones.Values, t => t.Path.StartsWith("file:", StringComparison.Ordinal));
+
+        await Task.Delay(20);
+        var result = await clone.VacuumAsync(TimeSpan.Zero);
+        Assert.Empty(result.FilesOutsideTable);
+        Assert.Equal([1, 3], await ReadIdsAsync(clone));
+    }
+
+    /// <summary>
+    /// On Windows a URI naming <c>PART.parquet</c> opens the file listed as <c>part.parquet</c>: VACUUM's keep-set and the
+    /// discard guard compare as that file system does, or they would delete a live file.
+    /// </summary>
+    [Fact]
+    public async Task Windows_AbsolutePathInADifferentCase_IsStillTheLiveFile()
+    {
+        if (Path.DirectorySeparatorChar != '\\')
+            return; // only a case-insensitive file system has two spellings of one file
+
+        await WriteSourceAsync([1, 2, 3]);
+        RewriteLogInPlace(_sourceDir, rel => FileUri(_sourceDir) + "/" + rel.ToUpperInvariant());
+
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_sourceDir));
+        Assert.Equal([1, 2, 3], await ReadIdsAsync(table));
+        string onDisk = Assert.Single(DataFiles(_sourceDir));
+        Assert.NotEqual(onDisk, onDisk.ToUpperInvariant());
+
+        await Assert.ThrowsAsync<ArgumentException>(async () => await table.DiscardDataFilesAsync(
+            [new WrittenDataFile(onDisk, 1, 3, null, null)]));
+
+        var result = await table.VacuumAsync(TimeSpan.Zero);
+        Assert.Empty(result.FilesToDelete);
+        Assert.Equal([1, 2, 3], await ReadIdsAsync(table));
+    }
+
     [Fact]
     public async Task Vacuum_RefusesWhenTheTableLocationIsUnknown()
     {

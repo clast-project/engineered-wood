@@ -9402,7 +9402,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             .ConfigureAwait(false);
         // Deliberately NOT assigned to _currentSnapshot: discarding files is not a reason to move a snapshot
         // the caller may be planning against.
-        var active = new HashSet<string>(StringComparer.Ordinal);
+        var active = new HashSet<string>(_locator.PathComparer);
         foreach (var add in latest.ActiveFiles.Values)
         {
             // add.path is URL-encoded, and may be an absolute location: one inside the table is compared by its path
