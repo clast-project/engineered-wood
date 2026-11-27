@@ -143,7 +143,29 @@ public class AbsoluteLocationTests : IDisposable
 
         Assert.False(System.IO.File.Exists(Path.Combine(_root, "db", "t", "metadata", "v2.metadata.json")));
         var respelled = "file:/" + table.Location.Substring("file:///".Length);
-        Assert.Equal(respelled, (await catalog.CommitTableAsync(table, table.Metadata with { Location = respelled })).Metadata.Location);
+        var committed = await catalog.CommitTableAsync(table, table.Metadata with { Location = respelled });
+        Assert.Equal(respelled, committed.Metadata.Location);
+
+        // A bare path naming the same place is accepted, and written as the URI other engines resolve.
+        var bare = await catalog.CommitTableAsync(committed, committed.Metadata with { Location = Path.Combine(_root, "db", "t") });
+        Assert.StartsWith("file:///", bare.Metadata.Location, StringComparison.Ordinal);
+        Assert.StartsWith("file:///", (await catalog.LoadTableAsync(table.Identifier)).Metadata.Location, StringComparison.Ordinal);
+    }
+
+    /// <summary>A rename publishes the destination's location like a create does, so a name whose location would
+    /// not read back is refused before anything changes, and the source keeps its name.</summary>
+    [Theory]
+    [InlineData("a#b")]
+    [InlineData("a?b")]
+    public async Task ARenameWhoseLocationWouldNotReadBackIsRefused(string name)
+    {
+        var (catalog, table) = await CreateAsync(new FileSystemCatalog(new LocalTableFileSystem(_root)));
+        var to = new TableIdentifier(Namespace.Of("db"), name);
+
+        await Assert.ThrowsAsync<ArgumentException>(async () => await catalog.RenameTableAsync(table.Identifier, to));
+
+        Assert.True(await catalog.TableExistsAsync(table.Identifier));
+        Assert.Equal([table.Identifier], await catalog.ListTablesAsync(Namespace.Of("db")));
     }
 
     [Fact]

@@ -52,6 +52,21 @@ public sealed class FileSystemCatalog : ICatalog
     /// <summary>The location a table lives at: its path under the warehouse.</summary>
     private StorageLocation DefaultLocation(TableIdentifier identifier) => _warehouse.Combine(TablePath(identifier));
 
+    /// <summary>
+    /// <see cref="DefaultLocation"/>, for a table about to be created or renamed there. The location is written into
+    /// the metadata as text and parsed by every later read, so it must read back as itself: under a <c>file:</c>
+    /// warehouse a <c>#</c> or <c>?</c> in a name would start a fragment or query.
+    /// </summary>
+    private StorageLocation ReadableLocation(TableIdentifier identifier)
+    {
+        var location = DefaultLocation(identifier);
+        if (!StorageLocation.TryParse(location.ToString(), out var reparsed) || reparsed != location)
+            throw new ArgumentException(
+                $"{identifier} cannot be a table in this catalog: its location, '{location}', would not read back as " +
+                "a storage location.", nameof(identifier));
+        return location;
+    }
+
     /// <summary>The absolute location of a warehouse-relative path.</summary>
     private string Absolute(string relativePath) => _warehouse.Combine(relativePath).ToString();
 
@@ -291,14 +306,7 @@ public sealed class FileSystemCatalog : ICatalog
         // Iceberg locations are absolute: a relative one names no base other engines would agree on. A table lives at
         // its path under the warehouse and nowhere else, as in Iceberg Java's HadoopCatalog (whose withLocation
         // refuses any other location): the catalog finds a table by that path.
-        var defaultLocation = DefaultLocation(identifier);
-
-        // The location is written into the metadata as text and parsed by every later read, so it must read back as
-        // itself: under a file: warehouse a '#' or '?' in a name would start a fragment or query.
-        if (!StorageLocation.TryParse(defaultLocation.ToString(), out var reparsed) || reparsed != defaultLocation)
-            throw new ArgumentException(
-                $"{identifier} cannot be created in this catalog: its location, '{defaultLocation}', would not read " +
-                "back as a storage location.", nameof(identifier));
+        var defaultLocation = ReadableLocation(identifier);
         if (location is not null && StorageLocation.Parse(location) != defaultLocation)
             throw new ArgumentException(
                 $"A file-system catalog keeps each table at its path under the warehouse, '{defaultLocation}'; it " +
@@ -369,7 +377,7 @@ public sealed class FileSystemCatalog : ICatalog
         var baseVersion = ParseBaseVersion(current);
         var renamed = current.Metadata with
         {
-            Location = Absolute(TablePath(to)),
+            Location = ReadableLocation(to).ToString(),
             MetadataLog = [],
         };
         await CreateAsync(to, renamed, ct).ConfigureAwait(false);
@@ -440,7 +448,8 @@ public sealed class FileSystemCatalog : ICatalog
                 $"The new metadata's log names '{bad.MetadataFile}', which is not an absolute location.",
                 nameof(newMetadata));
 
-        var committed = WithPreviousMetadataLogged(newMetadata, baseTable);
+        // Written as a URI even when given as a bare path, as CreateTableAsync writes it.
+        var committed = WithPreviousMetadataLogged(newMetadata with { Location = newLocation!.ToString() }, baseTable);
         var path = MetadataFilePath(identifier, baseVersion + 1);
         var json = IcebergJsonSerializer.Serialize(committed);
 
