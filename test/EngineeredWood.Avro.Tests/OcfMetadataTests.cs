@@ -66,6 +66,34 @@ public class OcfMetadataTests
         Assert.Equal("data", Utf8.UTF8.GetString(reader.Metadata["content"]));
     }
 
+    /// <summary>
+    /// The null codec is named in the header, not left to the spec's default. pyiceberg 0.12.0 reads an absent
+    /// <c>avro.codec</c> as <c>gzip</c> and refuses the file, so it could not read EW's manifests (#953).
+    /// </summary>
+    [Fact]
+    public async Task NullCodec_IsNamedInTheHeader()
+    {
+        var ms = new MemoryStream();
+        using (var writer = new AvroWriterBuilder(ArrowSchema).WithCompression(AvroCodec.Null).Build(ms))
+        {
+            writer.Write(Batch());
+        }
+
+        var msAsync = new MemoryStream();
+        await using (var writer = await new AvroWriterBuilder(ArrowSchema).BuildAsync(msAsync))
+        {
+            await writer.WriteAsync(Batch());
+        }
+
+        foreach (var stream in new[] { ms, msAsync })
+        {
+            stream.Position = 0;
+            using var reader = new AvroReaderBuilder().Build(stream);
+            Assert.Equal("null", Utf8.UTF8.GetString(reader.Metadata["avro.codec"]));
+            Assert.Equal(2, reader.ReadNextBatch()!.Length);
+        }
+    }
+
     [Fact]
     public void LaterValue_ReplacesEarlier()
     {
