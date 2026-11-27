@@ -56,13 +56,18 @@ public sealed class FileSystemCatalog : ICatalog
     /// </summary>
     private static void ThrowIfLocationsNotAbsolute(TableMetadata metadata)
     {
-        var named = metadata.Snapshots.Select(s => s.ManifestList)
-            .Concat((metadata.Statistics ?? []).Select(s => s.StatisticsPath))
-            .Concat((metadata.PartitionStatistics ?? []).Select(s => s.StatisticsPath));
-        if (named.FirstOrDefault(l => !StorageLocation.TryParse(l, out _)) is { } bad)
+        if (FirstRelativeFile(metadata) is { } bad)
             throw new ArgumentException(
                 $"The new metadata names the file '{bad}', which is not an absolute location.", "newMetadata");
     }
+
+    /// <summary>The first manifest list, statistics or partition-statistics file the metadata names by a location
+    /// that is not absolute, or null.</summary>
+    private static string? FirstRelativeFile(TableMetadata metadata) =>
+        metadata.Snapshots.Select(s => s.ManifestList)
+            .Concat((metadata.Statistics ?? []).Select(s => s.StatisticsPath))
+            .Concat((metadata.PartitionStatistics ?? []).Select(s => s.StatisticsPath))
+            .FirstOrDefault(l => !StorageLocation.TryParse(l, out _));
 
     /// <summary>The location a table lives at: its path under the warehouse.</summary>
     private StorageLocation DefaultLocation(TableIdentifier identifier) => _warehouse.Combine(TablePath(identifier));
@@ -343,11 +348,23 @@ public sealed class FileSystemCatalog : ICatalog
 
         // A table EngineeredWood wrote before it wrote absolute locations (#963) has a relative one ("db/t"), which
         // no engine can resolve; refuse it here, by name, rather than return a table every operation then refuses.
-        if (!StorageLocation.TryParse(metadata.Location, out _))
+        if (!StorageLocation.TryParse(metadata.Location, out var location))
             throw new FormatException(
                 $"{identifier}'s metadata gives its location as '{metadata.Location}', which is not an absolute " +
                 "location. Tables written by EngineeredWood before it wrote absolute locations (#963) have a relative " +
                 "one, which no engine can resolve; they cannot be loaded.");
+
+        // What create and commit hold this catalog's tables to, a load holds them to as well, so nothing loaded here
+        // can be renamed or purged into a state a commit would refuse: the table lives at its path under the
+        // warehouse (a purge deletes that path), and the files it names are absolute.
+        if (location != DefaultLocation(identifier))
+            throw new FormatException(
+                $"{identifier}'s metadata gives its location as '{metadata.Location}', but this catalog keeps it at " +
+                $"'{DefaultLocation(identifier)}'; a file-system catalog cannot load a table that lives elsewhere.");
+        if (FirstRelativeFile(metadata) is { } relative)
+            throw new FormatException(
+                $"{identifier}'s metadata names the file '{relative}', which is not an absolute location; tables " +
+                "written by EngineeredWood before it wrote absolute locations (#963) cannot be loaded.");
         return new Table(identifier, metadata, Absolute(path));
     }
 

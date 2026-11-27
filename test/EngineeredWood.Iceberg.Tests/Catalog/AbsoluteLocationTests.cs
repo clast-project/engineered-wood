@@ -186,6 +186,34 @@ public class AbsoluteLocationTests : IDisposable
         Assert.True(await catalog.TableExistsAsync(table.Identifier));
     }
 
+    /// <summary>A load holds a table to what create and commit do: its location is its path under the warehouse
+    /// (which is what a purge deletes), and the files it names are absolute. A version that breaks either, from an
+    /// older EngineeredWood or an edit by hand, is refused on load, and so cannot be renamed.</summary>
+    [Fact]
+    public async Task ATableThatLivesElsewhereOrNamesARelativeFileIsRefusedOnLoad()
+    {
+        var (catalog, table) = await CreateAsync(new FileSystemCatalog(new LocalTableFileSystem(_root)));
+        var appended = await new TableOperations(catalog.Resolver).AppendFilesAsync(table.Metadata, [File(table.Location + "/data/a.parquet")]);
+        table = await catalog.CommitTableAsync(table, appended);
+        string current = StorageLocation.Parse(table.MetadataLocation!).LocalPath!;
+        string original = System.IO.File.ReadAllText(current);
+        var renameTo = new TableIdentifier(Namespace.Of("db"), "renamed");
+
+        string elsewhere = original.Replace($"\"location\":\"{table.Location}\"", "\"location\":\"s3://other/t\"");
+        Assert.NotEqual(original, elsewhere);
+        System.IO.File.WriteAllText(current, elsewhere);
+        await Assert.ThrowsAsync<FormatException>(async () => await catalog.LoadTableAsync(table.Identifier));
+        await Assert.ThrowsAsync<FormatException>(async () => await catalog.RenameTableAsync(table.Identifier, renameTo));
+
+        string manifestList = table.Metadata.Snapshots.Single().ManifestList;
+        string relative = original.Replace(manifestList, "db/t/metadata/snap.avro");
+        Assert.NotEqual(original, relative);
+        System.IO.File.WriteAllText(current, relative);
+        await Assert.ThrowsAsync<FormatException>(async () => await catalog.LoadTableAsync(table.Identifier));
+        await Assert.ThrowsAsync<FormatException>(async () => await catalog.RenameTableAsync(table.Identifier, renameTo));
+        Assert.False(await catalog.TableExistsAsync(renameTo));
+    }
+
     /// <summary>A rename publishes the destination's location like a create does, so a name whose location would
     /// not read back is refused before anything changes, and the source keeps its name.</summary>
     [Theory]
