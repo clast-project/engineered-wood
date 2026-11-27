@@ -285,8 +285,15 @@ public sealed class FileSystemCatalog : ICatalog
         if (!await _fs.ExistsAsync(NamespacePropertiesPath(identifier.Namespace), ct).ConfigureAwait(false))
             throw new NoSuchNamespaceException(identifier.Namespace);
 
-        // Iceberg locations are absolute: a relative one names no base other engines would agree on.
-        var tableLocation = location is null ? Absolute(TablePath(identifier)) : StorageLocation.Parse(location).ToString();
+        // Iceberg locations are absolute: a relative one names no base other engines would agree on. A table lives at
+        // its path under the warehouse and nowhere else, as in Iceberg Java's HadoopCatalog (whose withLocation
+        // refuses any other location): the catalog finds, and a purge deletes, a table by that path.
+        var defaultLocation = _warehouse.Combine(TablePath(identifier));
+        if (location is not null && StorageLocation.Parse(location) != defaultLocation)
+            throw new ArgumentException(
+                $"A file-system catalog keeps each table at its path under the warehouse, '{defaultLocation}'; it " +
+                $"cannot create {identifier} at '{location}'.", nameof(location));
+        var tableLocation = location ?? defaultLocation.ToString();
         var metadata = TableMetadata.Create(schema, spec, sortOrder, tableLocation, properties);
         return await CreateAsync(identifier, metadata, ct).ConfigureAwait(false);
     }

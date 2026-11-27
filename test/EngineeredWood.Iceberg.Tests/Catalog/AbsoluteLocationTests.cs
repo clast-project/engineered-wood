@@ -89,12 +89,34 @@ public class AbsoluteLocationTests : IDisposable
     public async Task ATableLocationOutsideEveryRegistrationIsRefused()
     {
         var catalog = new FileSystemCatalog(new LocalTableFileSystem(_root));
-        await catalog.CreateNamespaceAsync(Namespace.Of("db"));
-        var table = await catalog.CreateTableAsync(
-            new TableIdentifier(Namespace.Of("db"), "t"), _schema, location: "s3://bucket/elsewhere/t");
+        var elsewhere = TableMetadata.Create(_schema, location: "s3://bucket/elsewhere/t");
 
         await Assert.ThrowsAsync<UnregisteredStorageLocationException>(async () =>
-            await new TableOperations(catalog.Resolver).AppendFilesAsync(table.Metadata, [File("s3://bucket/elsewhere/t/data/a.parquet")]));
+            await new TableOperations(catalog.Resolver).AppendFilesAsync(elsewhere, [File("s3://bucket/elsewhere/t/data/a.parquet")]));
+    }
+
+    /// <summary>
+    /// A file-system catalog keeps each table at its path under the warehouse, as Iceberg Java's HadoopCatalog does
+    /// (READ FROM 1.12.0's bytecode: <c>HadoopCatalogTableBuilder.withLocation</c> checks that the location is the
+    /// default one): the catalog finds, and a purge deletes, a table by that path, so data anywhere else would
+    /// outlive a purge. Another spelling of the default location is the same location.
+    /// </summary>
+    [Fact]
+    public async Task ATableIsCreatedOnlyAtItsPathUnderTheWarehouse()
+    {
+        var catalog = new FileSystemCatalog(new LocalTableFileSystem(_root));
+        await catalog.CreateNamespaceAsync(Namespace.Of("db"));
+
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await catalog.CreateTableAsync(new TableIdentifier(Namespace.Of("db"), "t"), _schema, location: "s3://bucket/elsewhere/t"));
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await catalog.CreateTableAsync(new TableIdentifier(Namespace.Of("db"), "t"), _schema,
+                location: StorageLocation.Parse(_root).Combine("db/other").ToString()));
+        Assert.False(await catalog.TableExistsAsync(new TableIdentifier(Namespace.Of("db"), "t")));
+
+        string respelled = "file:/" + StorageLocation.Parse(_root).Combine("db/u").ToString().Substring("file:///".Length);
+        var table = await catalog.CreateTableAsync(new TableIdentifier(Namespace.Of("db"), "u"), _schema, location: respelled);
+        Assert.Equal(respelled, table.Location);
     }
 
     [Fact]
