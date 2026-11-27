@@ -117,6 +117,33 @@ public class AbsoluteLocationTests : IDisposable
         string respelled = "file:/" + StorageLocation.Parse(_root).Combine("db/u").ToString().Substring("file:///".Length);
         var table = await catalog.CreateTableAsync(new TableIdentifier(Namespace.Of("db"), "u"), _schema, location: respelled);
         Assert.Equal(respelled, table.Location);
+
+        // A bare path naming the same place is accepted, and written as the URI other engines resolve.
+        var bare = await catalog.CreateTableAsync(new TableIdentifier(Namespace.Of("db"), "v"), _schema,
+            location: Path.Combine(_root, "db", "v"));
+        Assert.StartsWith("file:///", bare.Location, StringComparison.Ordinal);
+        Assert.Equal(StorageLocation.Parse(_root).Combine("db/v"), StorageLocation.Parse(bare.Location));
+    }
+
+    /// <summary>A commit can no more move a table, or log a relative metadata file, than a create can: the
+    /// location stays the table's path under the warehouse, and nothing is written for a refused commit.</summary>
+    [Fact]
+    public async Task ACommitCannotMoveTheTableOrLogARelativeLocation()
+    {
+        var (catalog, table) = await CreateAsync(new FileSystemCatalog(new LocalTableFileSystem(_root)));
+
+        foreach (string location in new[] { "db/t", "s3://bucket/elsewhere/t", StorageLocation.Parse(_root).Combine("db/other").ToString() })
+        {
+            await Assert.ThrowsAsync<ArgumentException>(async () =>
+                await catalog.CommitTableAsync(table, table.Metadata with { Location = location }));
+        }
+
+        await Assert.ThrowsAsync<ArgumentException>(async () => await catalog.CommitTableAsync(table,
+            table.Metadata with { MetadataLog = [new MetadataLogEntry(0, "db/t/metadata/v0.metadata.json")] }));
+
+        Assert.False(System.IO.File.Exists(Path.Combine(_root, "db", "t", "metadata", "v2.metadata.json")));
+        var respelled = "file:/" + table.Location.Substring("file:///".Length);
+        Assert.Equal(respelled, (await catalog.CommitTableAsync(table, table.Metadata with { Location = respelled })).Metadata.Location);
     }
 
     [Fact]

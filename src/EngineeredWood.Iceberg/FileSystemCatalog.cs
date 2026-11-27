@@ -49,6 +49,9 @@ public sealed class FileSystemCatalog : ICatalog
     /// <summary>The warehouse location tables are created under.</summary>
     public StorageLocation Warehouse => _warehouse;
 
+    /// <summary>The location a table lives at: its path under the warehouse.</summary>
+    private StorageLocation DefaultLocation(TableIdentifier identifier) => _warehouse.Combine(TablePath(identifier));
+
     /// <summary>The absolute location of a warehouse-relative path.</summary>
     private string Absolute(string relativePath) => _warehouse.Combine(relativePath).ToString();
 
@@ -287,8 +290,8 @@ public sealed class FileSystemCatalog : ICatalog
 
         // Iceberg locations are absolute: a relative one names no base other engines would agree on. A table lives at
         // its path under the warehouse and nowhere else, as in Iceberg Java's HadoopCatalog (whose withLocation
-        // refuses any other location): the catalog finds, and a purge deletes, a table by that path.
-        var defaultLocation = _warehouse.Combine(TablePath(identifier));
+        // refuses any other location): the catalog finds a table by that path.
+        var defaultLocation = DefaultLocation(identifier);
 
         // The location is written into the metadata as text and parsed by every later read, so it must read back as
         // itself: under a file: warehouse a '#' or '?' in a name would start a fragment or query.
@@ -300,7 +303,8 @@ public sealed class FileSystemCatalog : ICatalog
             throw new ArgumentException(
                 $"A file-system catalog keeps each table at its path under the warehouse, '{defaultLocation}'; it " +
                 $"cannot create {identifier} at '{location}'.", nameof(location));
-        var tableLocation = location ?? defaultLocation.ToString();
+        // Written as a URI even when given as a bare path, so any engine can resolve it.
+        var tableLocation = location is null ? defaultLocation.ToString() : StorageLocation.Parse(location).ToString();
         var metadata = TableMetadata.Create(schema, spec, sortOrder, tableLocation, properties);
         return await CreateAsync(identifier, metadata, ct).ConfigureAwait(false);
     }
@@ -318,7 +322,9 @@ public sealed class FileSystemCatalog : ICatalog
 
     /// <summary>
     /// Drops a table by deleting its metadata directory. With <paramref name="purge"/>, every file under the
-    /// table's directory goes, data included; without it, data files are left in place.
+    /// table's directory goes, data included; without it, data files are left in place. A renamed table's
+    /// manifests and data stay under the directory it was created in (see <see cref="RenameTableAsync"/>), so a
+    /// purge does not reach them (#983).
     /// </summary>
     public async Task DropTableAsync(
         TableIdentifier identifier, bool purge = false, CancellationToken ct = default)
@@ -420,6 +426,19 @@ public sealed class FileSystemCatalog : ICatalog
         if (await ReadTableUuidAsync(identifier, current, ct).ConfigureAwait(false) != baseTable.Metadata.TableUuid)
             throw new CommitFailedException(identifier,
                 "the table was dropped and re-created after the commit's base was loaded.");
+
+        // The catalog keeps a table at its path under the warehouse (see CreateTableAsync), and every location in
+        // its metadata is absolute; a commit can change neither.
+        var tableLocation = DefaultLocation(identifier);
+        if (!StorageLocation.TryParse(newMetadata.Location, out var newLocation) || newLocation != tableLocation)
+            throw new ArgumentException(
+                $"The new metadata's location '{newMetadata.Location}' is not {identifier}'s location in this " +
+                $"catalog, '{tableLocation}'; a file-system catalog keeps each table at its path under the warehouse.",
+                nameof(newMetadata));
+        if (newMetadata.MetadataLog.FirstOrDefault(e => !StorageLocation.TryParse(e.MetadataFile, out _)) is { } bad)
+            throw new ArgumentException(
+                $"The new metadata's log names '{bad.MetadataFile}', which is not an absolute location.",
+                nameof(newMetadata));
 
         var committed = WithPreviousMetadataLogged(newMetadata, baseTable);
         var path = MetadataFilePath(identifier, baseVersion + 1);

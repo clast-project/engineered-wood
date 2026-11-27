@@ -786,7 +786,9 @@ unreadable. Gaps:
   removes the source's version files and hint. The renamed table's manifests
   and data stay under the old path and are still referenced from there. A
   table later created under the old name and dropped with `purge` deletes
-  them.
+  them, and dropping the renamed table with `purge` leaves them behind:
+  `purge` deletes the table's directory rather than the files its metadata
+  references, as Iceberg Java's purge does (#983).
 
 ### Correctness / interop issues
 
