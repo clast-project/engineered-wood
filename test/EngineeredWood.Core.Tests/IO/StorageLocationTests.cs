@@ -310,10 +310,36 @@ public class StorageLocationTests
     {
         var table = StorageLocation.Parse("file:///tmp/wh/t");
         Assert.Equal(StorageLocation.Parse("/tmp/wh/t/b"), table.Combine("a/../b"));
-        Assert.Equal(StorageLocation.Parse("/tmp/wh/t/b"), table.Combine(".\\b"));
         Assert.Throws<ArgumentException>(() => table.Combine("../x"));
         Assert.Throws<ArgumentException>(() => table.Combine("a/../../x"));
     }
+
+    /// <summary>A <c>\</c> means in <see cref="StorageLocation.Combine"/> what it means in a parsed file URI and to
+    /// the local file system: a separator on Windows, a file-name character elsewhere.</summary>
+    [Fact]
+    public void CombineTreatsBackslashesAsAParsedFileUriDoes()
+    {
+        var table = StorageLocation.Parse("file:///tmp/wh/t");
+        Assert.Equal(StorageLocation.Parse("file:///tmp/wh/t/a\\b"), table.Combine("a\\b"));
+        Assert.Equal(StorageLocation.Parse("file:///tmp/wh/t/.\\b"), table.Combine(".\\b"));
+        if (IsWindows)
+        {
+            Assert.Equal(StorageLocation.Parse("/tmp/wh/t/a/b"), table.Combine("a\\b"));
+            Assert.Throws<ArgumentException>(() => table.Combine("a\\..\\..\\x"));
+        }
+        else
+        {
+            Assert.Equal(["a\\b"], table.Combine("a\\b").RelativeTo(table).Split('/'));
+        }
+    }
+
+    /// <summary>A UNC server is a host name; a port or user information names no share an OS opens.</summary>
+    [Theory]
+    [InlineData("file://server:80/share/x")]
+    [InlineData("file://user@server/share/x")]
+    [InlineData("\\\\server:80\\share\\x")]
+    public void FileServersWithAPortOrUserInfoAreRefused(string location) =>
+        Assert.Throws<FormatException>(() => StorageLocation.Parse(location));
 
     [Theory]
     [InlineData("/etc/passwd")]

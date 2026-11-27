@@ -160,7 +160,9 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
                 $"'{relativePath}' is absolute; parse it as a location rather than combining it with '{this}'.",
                 nameof(relativePath));
 
-        string rel = IsFile ? relativePath.Replace('\\', '/') : relativePath;
+        // In a file location \ separates segments where the operating system takes it so (Windows), as in a parsed
+        // file URI; elsewhere it is a file-name character.
+        string rel = IsFile && IsWindows ? relativePath.Replace('\\', '/') : relativePath;
         rel = rel.TrimEnd('/');
         if (rel.Length == 0)
             return this;
@@ -460,6 +462,12 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
             // \\?\ and \\.\ device paths (file://?/ and file://./ too) name things a table format never points at.
             if (authority is "?" or ".")
                 return Fail(throwOnError, $"Device path '{uriText ?? localPath}' is not a storage location.");
+
+            // A UNC server is a host name: file://server:80/x and file://user@server/x name no share an OS opens.
+            if (authority.IndexOfAny([':', '@']) >= 0)
+                return Fail(throwOnError,
+                    $"'{uriText ?? localPath}' names the server '{authority}'; a file location's server cannot have a " +
+                    "port or user information.");
         }
 
         var segments = new List<string>();
