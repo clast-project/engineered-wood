@@ -387,6 +387,22 @@ public class DeletionVectorReaderTests : IDisposable
         Assert.Equal(Vectors[1], bitmap.ToArray());
     }
 
+    /// <summary>A <c>p</c> path is a URI: a raw <c>?</c> or <c>#</c> starts a query or fragment, which no location
+    /// has, and a malformed escape is no URI at all (<c>java.net.URI</c> refuses it).</summary>
+    [Theory]
+    [InlineData("s3://bucket/t/dv.bin?version=1")]
+    [InlineData("abfss://c@acct.dfs.core.windows.net/t/dv.bin#f")]
+    [InlineData("s3://bucket/t/dv%ZZ.bin")]
+    public async Task AbsoluteVector_ThatIsNotAWellFormedUri_IsRefused(string path)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        DeletionVector[] descriptors = await WritePackedFileAsync(fs);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await Reader(fs).ReadAsync(descriptors[0] with { PathOrInlineDv = path }));
+        Assert.Equal(DeltaErrorCodes.InvalidDeletionVector, ex.ErrorCode);
+    }
+
     /// <summary>The URI's structure is read before its segments are decoded, as <c>java.net.URI</c> does, so an
     /// escaped <c>#</c> is part of a file name.</summary>
     [Fact]

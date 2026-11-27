@@ -129,9 +129,23 @@ public class StorageLocationTests
             StorageLocation.Parse("s3://bucket/t").Combine("a#b"),
             StorageLocation.ParsePercentEncoded("s3://bucket/t/a%23b"));
 
-        // An unescaped # or ? is still a fragment or query, which no location has.
+        // An unescaped # or ? is still a fragment or query, which no location has, whatever the scheme.
         Assert.Throws<FormatException>(() => StorageLocation.ParsePercentEncoded("file:///tmp/table/a#b"));
+        Assert.Throws<FormatException>(() => StorageLocation.ParsePercentEncoded("s3://bucket/dv?version=1"));
+        Assert.Throws<FormatException>(() => StorageLocation.ParsePercentEncoded("abfss://c@acct.dfs.core.windows.net/dv#f"));
+
+        // Parse, which reads no URI syntax in an object-store key, keeps them as key characters.
+        Assert.Equal("dv?version=1", StorageLocation.Parse("s3://bucket/dv?version=1").RelativeTo(StorageLocation.Parse("s3://bucket")));
     }
+
+    /// <summary>java.net.URI refuses a malformed escape; <c>Uri.UnescapeDataString</c> would keep it as text.</summary>
+    [Theory]
+    [InlineData("file:///tmp/dv%ZZ.bin")]
+    [InlineData("file:///tmp/dv%2")]
+    [InlineData("s3://bucket/t/dv%")]
+    [InlineData("s3://bucket/t/%G0/dv.bin")]
+    public void MalformedEscapesAreRefused(string location) =>
+        Assert.Throws<FormatException>(() => StorageLocation.ParsePercentEncoded(location));
 
     [Theory]
     [InlineData("s3://bucket/t/%2E%2E/x")]

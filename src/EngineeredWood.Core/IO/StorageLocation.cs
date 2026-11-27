@@ -108,7 +108,9 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
     /// the start of a fragment, as with <c>java.net.URI</c>.</para>
     /// <para>A segment that decodes to <c>.</c> or <c>..</c>, or to text with a <c>/</c>, a <c>\</c> or a control
     /// character, is refused (<see cref="NotSupportedException"/>), so a decoded segment can neither navigate nor
-    /// become two. <see cref="ToString"/> keeps the encoded spelling; equality uses the decoded segments.</para>
+    /// become two. A malformed escape (<c>%ZZ</c>, a trailing <c>%</c>) is refused (<see cref="FormatException"/>), as
+    /// <c>java.net.URI</c> refuses it. <see cref="ToString"/> keeps the encoded spelling; equality uses the decoded
+    /// segments.</para>
     /// </summary>
     public static StorageLocation ParsePercentEncoded(string location)
     {
@@ -303,7 +305,10 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         string path = slash < 0 ? "" : rest.Substring(slash + 1);
         if (authority.Length == 0)
             return Fail(throwOnError, $"Storage location '{location}' has an empty authority.");
-        if (authority.IndexOfAny(['?', '#']) >= 0 || (scheme is "http" or "https" && path.IndexOfAny(['?', '#']) >= 0))
+        // In http(s), and in any location read as a URI, ? and # start a query and a fragment; elsewhere they are
+        // ordinary key characters.
+        if (authority.IndexOfAny(['?', '#']) >= 0 ||
+            ((decode || scheme is "http" or "https") && path.IndexOfAny(['?', '#']) >= 0))
             return Fail(throwOnError, $"Storage location '{location}' has a query or fragment, which a storage location cannot.");
 
         string text = location.TrimEnd('/');
@@ -510,6 +515,16 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
     {
         if (segment.IndexOf('%') < 0)
             return segment;
+
+        // Uri.UnescapeDataString leaves a malformed escape (%ZZ, a trailing %) as text; java.net.URI refuses it.
+        for (int i = segment.IndexOf('%'); i >= 0; i = segment.IndexOf('%', i + 1))
+        {
+            if (i + 2 >= segment.Length || !IsHexDigit(segment[i + 1]) || !IsHexDigit(segment[i + 2]))
+                return throwOnError
+                    ? throw new FormatException($"'{location}' has a malformed percent-escape in its segment '{segment}'.")
+                    : null;
+        }
+
         string decoded = Uri.UnescapeDataString(segment);
         bool plain = decoded is not ("" or "." or "..") && decoded.IndexOfAny(['/', '\\']) < 0;
         foreach (char c in decoded)
@@ -570,6 +585,8 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
         segment.Length == 2 && IsAsciiLetter(segment[0]) && segment[1] == ':';
 
     private static bool IsDriveSegment(string[] segments) => segments.Length > 0 && IsDriveSegment(segments[0]);
+
+    private static bool IsHexDigit(char c) => c is >= '0' and <= '9' or >= 'a' and <= 'f' or >= 'A' and <= 'F';
 
     private static bool IsAsciiLetter(char c) => c is >= 'a' and <= 'z' or >= 'A' and <= 'Z';
 
