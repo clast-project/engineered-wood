@@ -144,7 +144,8 @@ public sealed class IcebergReaderInteropTests : IDisposable
         PyIceberg.Require();
         reader.Require();
         string metadata = PyIceberg.Scenario(Path.Combine(_warehouse, "py"), scenario);
-        var before = IcebergReader.PyIcebergReader.Scan(metadata, rowLineage: false).Canonical();
+        var beforeScan = IcebergReader.PyIcebergReader.Scan(metadata, rowLineage: false);
+        var before = beforeScan.Canonical();
 
         var (rewritten, victim) = await RemoveLastDataFileAsync(metadata);
         Assert.Equal(2, (await ReadMetadataAsync(FileSystem(), rewritten)).FormatVersion);
@@ -158,7 +159,9 @@ public sealed class IcebergReaderInteropTests : IDisposable
         foreach (var row in victimRows)
             Assert.True(expected.Remove(row), $"The removed file's row {row} is not among the table's rows.");
 
-        Assert.Equal(expected, reader.Scan(rewritten, rowLineage: false).Canonical());
+        var after = reader.Scan(rewritten, rowLineage: false);
+        Assert.Equal(beforeScan.Schema, after.Schema);
+        Assert.Equal(expected, after.Canonical());
     }
 
     /// <summary>
@@ -190,9 +193,10 @@ public sealed class IcebergReaderInteropTests : IDisposable
 
         Assert.Equal(2, table.Metadata.FormatVersion);
         Assert.Equal(files.Count, table.Metadata.Snapshots.Count);
-        Assert.Equal(
-            IcebergReader.PyIcebergReader.Scan(source, rowLineage: false).Canonical(),
-            reader.Scan(table.MetadataLocation!, rowLineage: false).Canonical());
+        var expected = IcebergReader.PyIcebergReader.Scan(source, rowLineage: false);
+        var actual = reader.Scan(table.MetadataLocation!, rowLineage: false);
+        Assert.Equal(expected.Schema, actual.Schema);
+        Assert.Equal(expected.Canonical(), actual.Canonical());
     }
 
     // --- helpers ---
@@ -255,6 +259,7 @@ public sealed class IcebergReaderInteropTests : IDisposable
         var actual = reader.Scan(metadataLocation, lineage);
 
         Assert.Equal(expected.Columns.OrderBy(c => c, StringComparer.Ordinal), actual.Columns.OrderBy(c => c, StringComparer.Ordinal));
+        Assert.Equal(expected.Schema, actual.Schema);
         if (lineage)
             Assert.Contains("_row_id", actual.Columns);
         Assert.Equal(expected.Canonical(), actual.Canonical());
