@@ -133,7 +133,8 @@ public sealed class IcebergReaderInteropTests : IDisposable
 
     /// <summary>
     /// EW removes one data file from a pyiceberg v2 table. Every reader then reads the rows pyiceberg read before,
-    /// less exactly the removed file's, from manifests EW wrote in the v2 layout.
+    /// less exactly the removed file's, from manifests EW wrote in the v2 layout. The removed file's rows are read
+    /// through a second rewrite that keeps only that file, so they are read in the table's current schema.
     /// </summary>
     [SkippableTheory]
     [MemberData(nameof(AllReadersOnPyIcebergScenarios))]
@@ -148,9 +149,16 @@ public sealed class IcebergReaderInteropTests : IDisposable
         var (rewritten, victim) = await RemoveLastDataFileAsync(metadata);
         Assert.Equal(2, (await ReadMetadataAsync(FileSystem(), rewritten)).FormatVersion);
 
-        var after = reader.Scan(rewritten, rowLineage: false).Canonical();
-        Assert.All(after, row => Assert.Contains(row, before));
-        Assert.Equal(before.Count - victim.RecordCount, after.Count);
+        string victimOnly = await RemoveDataFilesAsync(metadata, f => f.FilePath != victim.FilePath);
+        var victimRows = IcebergReader.PyIcebergReader.Scan(victimOnly, rowLineage: false).Canonical();
+        Assert.Equal(victim.RecordCount, victimRows.Count);
+
+        // before - victimRows, as multisets.
+        var expected = before.ToList();
+        foreach (var row in victimRows)
+            Assert.True(expected.Remove(row), $"The removed file's row {row} is not among the table's rows.");
+
+        Assert.Equal(expected, reader.Scan(rewritten, rowLineage: false).Canonical());
     }
 
     /// <summary>
@@ -213,15 +221,30 @@ public sealed class IcebergReaderInteropTests : IDisposable
     {
         var fs = FileSystem();
         var md = await ReadMetadataAsync(fs, metadataLocation);
+        var (data, _) = await new TableOperations(fs.Resolver).ScanFilesAsync(md);
+        var victim = data.OrderBy(f => f.FilePath, StringComparer.Ordinal).Last();
+        return (await RemoveDataFilesAsync(metadataLocation, f => f.FilePath == victim.FilePath), victim);
+    }
+
+    /// <summary>EW's overwrite of the table at <paramref name="metadataLocation"/> that removes the data files
+    /// <paramref name="remove"/> picks, with the delete files that reference them, written as a new metadata file
+    /// beside the original.</summary>
+    private async Task<string> RemoveDataFilesAsync(string metadataLocation, Func<DataFile, bool> remove)
+    {
+        var fs = FileSystem();
+        var md = await ReadMetadataAsync(fs, metadataLocation);
         var ops = new TableOperations(fs.Resolver);
         var (data, deletes) = await ops.ScanFilesAsync(md);
-        var victim = data.OrderBy(f => f.FilePath, StringComparer.Ordinal).Last();
-        var victimDeletes = deletes.Where(d => d.ReferencedDataFile == victim.FilePath).ToList();
+        var removed = data.Where(remove).ToList();
+        var paths = new HashSet<string>(removed.Select(f => f.FilePath), StringComparer.Ordinal);
+        var removedDeletes = deletes.Where(d => d.ReferencedDataFile is { } r && paths.Contains(r)).ToList();
+        if (removed.Count == 0)
+            return metadataLocation;
 
-        var updated = await ops.OverwriteFilesAsync(md, [victim, .. victimDeletes], []);
+        var updated = await ops.OverwriteFilesAsync(md, [.. removed, .. removedDeletes], []);
         string location = $"{md.Location}/metadata/ew-{Guid.NewGuid():N}.metadata.json";
         await fs.WriteAllBytesAsync(location, Encoding.UTF8.GetBytes(IcebergJsonSerializer.Serialize(updated)));
-        return (location, victim);
+        return location;
     }
 
     /// <summary>Asserts the two readers report the same columns and the same rows.</summary>

@@ -31,8 +31,9 @@ internal static class DuckDbIceberg
 
     private static readonly InteropDriver Driver = new(
         scriptName: "duckdb_iceberg_driver.py",
-        // Loading the extension is part of the probe: a DuckDB that cannot install it cannot run the tier.
-        probeExpression: "import duckdb, json; "
+        // Loading the extension is part of the probe: a DuckDB that cannot install it cannot run the tier. So is
+        // pyarrow, which every scan's result goes through (to_arrow_table).
+        probeExpression: "import duckdb, pyarrow, json; "
             + "assert tuple(int(x) for x in duckdb.__version__.split('.')[:2]) >= (2, 0), 'DuckDB 2.0 or later'; "
             + "c = duckdb.connect(); c.execute('INSTALL iceberg'); c.execute('LOAD iceberg'); "
             + "print(json.dumps({'v': duckdb.__version__}))",
