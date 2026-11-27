@@ -57,13 +57,14 @@ internal sealed class OcfWriterAsync : IAsyncDisposable
 
         // Metadata map
         var schemaJson = AvroSchemaWriter.ToJson(schema);
+        // avro.codec is written even for the null codec. The spec reads an absent key as "null", but pyiceberg
+        // (0.12.0, avro/file.py) reads it as "gzip" and then refuses the file, so a manifest written without it
+        // is unreadable there. fastavro and Avro Java with an explicit null codec write "null" too (measured, #953).
         var entries = new Dictionary<string, byte[]>
         {
             ["avro.schema"] = System.Text.Encoding.UTF8.GetBytes(schemaJson),
+            ["avro.codec"] = System.Text.Encoding.UTF8.GetBytes(AvroCompression.CodecName(_codec)),
         };
-
-        if (_codec != AvroCodec.Null)
-            entries["avro.codec"] = System.Text.Encoding.UTF8.GetBytes(AvroCompression.CodecName(_codec));
 
         if (metadata != null)
         {
