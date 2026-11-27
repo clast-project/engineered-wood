@@ -4,6 +4,8 @@
 using System.Text.Json.Nodes;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Snapshot;
 using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
@@ -168,6 +170,30 @@ public sealed class AbsoluteActionPathTests : IDisposable
         var result = await clone.VacuumAsync(TimeSpan.Zero);
         Assert.Empty(result.FilesOutsideTable);
         Assert.Equal([1, 3], await ReadIdsAsync(clone));
+    }
+
+    /// <summary>
+    /// A <c>remove</c> without a <c>deletionTimestamp</c> (the field is optional) is not known to be past retention, so
+    /// the file it names is not reported, as checkpoint expiry keeps such a tombstone too.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_DoesNotReportARemoveWithoutADeletionTime()
+    {
+        await WriteSourceAsync([1, 2, 3], [4, 5, 6]);
+        CloneLog(_sourceDir, _cloneDir);
+
+        var cloneFs = new LocalTableFileSystem(_cloneDir);
+        await using var clone = await OpenCloneAsync();
+        var gone = clone.CurrentSnapshot.ActiveFiles.Values.First();
+        await new TransactionLog(cloneFs).WriteCommitAsync(clone.CurrentSnapshot.Version + 1, new DeltaAction[]
+        {
+            new RemoveFile { Path = gone.Path, DataChange = true },
+        });
+        await clone.RefreshAsync();
+        Assert.Contains(clone.CurrentSnapshot.Tombstones.Values, t => t.Path == gone.Path && t.DeletionTimestamp is null);
+
+        var result = await clone.VacuumAsync(TimeSpan.Zero);
+        Assert.Empty(result.FilesOutsideTable);
     }
 
     /// <summary>

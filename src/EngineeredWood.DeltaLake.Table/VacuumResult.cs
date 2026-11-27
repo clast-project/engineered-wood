@@ -31,7 +31,8 @@ public sealed record VacuumResult
     /// so these were left in place: a file named by absolute location may be another table's (the source of a
     /// shallow clone), and deleting it is its owner's call.</para>
     /// <para>Only tombstones the snapshot still holds are seen, so a file removed long enough ago that its tombstone
-    /// has expired is not reported.</para>
+    /// has expired is not reported. Nor is one whose <c>remove</c> has no <c>deletionTimestamp</c> (it is optional):
+    /// it is not known to be past retention.</para>
     /// </summary>
     public IReadOnlyList<string> FilesOutsideTable { get; init; } = [];
 }

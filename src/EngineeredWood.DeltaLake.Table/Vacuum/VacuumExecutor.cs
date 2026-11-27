@@ -97,9 +97,12 @@ internal static class VacuumExecutor
                 _ = InTable(files, DeletionVectorPath.AbsoluteLocation(tombstoneDv), tombstoneDv.PathOrInlineDv);
             if (!DeltaFileLocator.IsAbsolute(tombstone.Path) || InTable(files, tombstone.Path) is not null)
                 continue;
-            // One file is reported once, and never while the table still reads it.
+            // One file is reported once, and never while the table still reads it. A tombstone with no deletion time
+            // (the field is optional) is not known to be past retention, as checkpoint expiry treats it too
+            // (CheckpointWriter keeps it), so it is not reported.
             var location = DeltaFileLocator.AbsoluteLocation(tombstone.Path);
-            if ((tombstone.DeletionTimestamp ?? 0) < cutoffMillis && !liveOutside.Contains(location) && reported.Add(location))
+            if (tombstone.DeletionTimestamp is { } deletedAt && deletedAt < cutoffMillis
+                && !liveOutside.Contains(location) && reported.Add(location))
                 outside.Add(tombstone.Path);
         }
 
