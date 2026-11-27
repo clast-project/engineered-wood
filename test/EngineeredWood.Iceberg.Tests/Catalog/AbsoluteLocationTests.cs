@@ -107,7 +107,74 @@ public class AbsoluteLocationTests : IDisposable
 
         var relative = TableMetadata.Create(_schema, location: "db/t");
         await Assert.ThrowsAsync<FormatException>(async () =>
-            await new TableOperations(catalog.Resolver).AppendFilesAsync(relative, [File("db/t/data/a.parquet")]));
+            await new TableOperations(catalog.Resolver).AppendFilesAsync(relative, [File("s3://bucket/db/t/data/a.parquet")]));
+    }
+
+    /// <summary>The spec (v1 to v3) makes every file location absolute; a relative one would be read against
+    /// whatever base each engine chose. It is refused before anything is written.</summary>
+    [Fact]
+    public async Task ARelativeFileLocationIsRefused()
+    {
+        var (catalog, table) = await CreateAsync(new FileSystemCatalog(new LocalTableFileSystem(_root)));
+        var ops = new TableOperations(catalog.Resolver);
+        string metadataDir = Path.Combine(_root, "db", "t", "metadata");
+
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await ops.AppendFilesAsync(table.Metadata, [File("data/a.parquet")]));
+
+        var dv = File(table.Location + "/data/dv.puffin") with
+        {
+            Content = FileContent.PositionDeletes, FileFormat = FileFormat.Puffin,
+            ReferencedDataFile = "data/a.parquet", ContentOffset = 4, ContentSizeInBytes = 10,
+        };
+        await Assert.ThrowsAsync<ArgumentException>(async () => await ops.AppendDeleteFilesAsync(table.Metadata, [dv]));
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await ops.OverwriteFilesAsync(table.Metadata, [], [File("data/a.parquet")]));
+
+        Assert.Empty(Directory.GetFiles(metadataDir, "*.avro"));
+    }
+
+    /// <summary>Each namespace level and table name is a directory under the warehouse, so one that is not a plain
+    /// segment would put files beside it: still inside the backend's root, where no root check would catch it.</summary>
+    [Theory]
+    [InlineData("..")]
+    [InlineData(".")]
+    [InlineData("a/b")]
+    [InlineData("a\\b")]
+    public async Task NamesThatAreNotOneSegmentAreRefused(string name)
+    {
+        string warehouse = Path.Combine(_root, "lake", "wh");
+        var resolver = new StorageResolver().Register(new LocalTableFileSystem(_root));
+        var catalog = new FileSystemCatalog(resolver, StorageLocation.Parse(warehouse));
+        await catalog.CreateNamespaceAsync(Namespace.Of("db"));
+
+        await Assert.ThrowsAsync<ArgumentException>(async () => await catalog.CreateNamespaceAsync(Namespace.Of(name)));
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await catalog.UpdateNamespacePropertiesAsync(Namespace.Of(name, "sibling"), updates: new Dictionary<string, string> { ["k"] = "v" }));
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await catalog.CreateTableAsync(new TableIdentifier(Namespace.Of("db"), name), _schema));
+
+        Assert.Empty(Directory.GetFiles(Path.Combine(_root, "lake"), "*", SearchOption.TopDirectoryOnly));
+        Assert.Equal([Path.Combine(_root, "lake", "wh")], Directory.GetDirectories(Path.Combine(_root, "lake")));
+    }
+
+    /// <summary>Two spellings of one warehouse (<c>file:///</c> and <c>file:/</c>) are one warehouse: a table loaded
+    /// through one catalog commits through the other.</summary>
+    [Fact]
+    public async Task ATableCommitsThroughAnotherSpellingOfItsWarehouse()
+    {
+        var resolver = new StorageResolver().Register(new LocalTableFileSystem(_root));
+        var warehouse = StorageLocation.Parse(_root);
+        var (catalog, table) = await CreateAsync(new FileSystemCatalog(resolver, warehouse));
+        string other = "file:/" + warehouse.ToString().Substring("file:///".Length);
+        Assert.NotEqual(warehouse.ToString(), other);
+        var otherCatalog = new FileSystemCatalog(resolver, StorageLocation.Parse(other));
+
+        var appended = await new TableOperations(resolver).AppendFilesAsync(table.Metadata, [File(table.Location + "/data/a.parquet")]);
+        var committed = await otherCatalog.CommitTableAsync(table, appended);
+
+        Assert.Single(committed.Metadata.Snapshots);
+        Assert.Single((await catalog.LoadTableAsync(table.Identifier)).Metadata.Snapshots);
     }
 
     [Fact]
@@ -150,6 +217,38 @@ public class AbsoluteLocationTests : IDisposable
         Assert.Contains(foreignList, result.FilesOutsideTable);
         Assert.DoesNotContain(foreignList, result.DeletedFiles);
         Assert.True(System.IO.File.Exists(StorageLocation.Parse(foreignList).LocalPath));
+    }
+
+    /// <summary>
+    /// A kept snapshot can name a manifest list or manifest in another spelling than an expired one does (one engine
+    /// writes <c>file:/</c>, another <c>file:///</c>): it is one file, and expiry keeps it.
+    /// </summary>
+    [Fact]
+    public async Task ExpiryKeepsAFileAKeptSnapshotNamesInAnotherSpelling()
+    {
+        var fs = new LocalTableFileSystem(_root);
+        var resolver = TestResolvers.For(fs);
+        var ops = new TableOperations(resolver);
+        var md = TableMetadata.Create(_schema, location: Path.Combine(_root, "t"));
+        md = await ops.AppendFilesAsync(md, [File(StorageLocation.Parse(_root).Combine("t/data/a.parquet").ToString())]);
+        var first = md.Snapshots.Single();
+        Assert.StartsWith("file:///", first.ManifestList, StringComparison.Ordinal);
+
+        // The same snapshot again, its manifest list spelled file:/ rather than file:///.
+        var respelled = first with
+        {
+            SnapshotId = first.SnapshotId + 1,
+            ParentSnapshotId = first.SnapshotId,
+            ManifestList = "file:/" + first.ManifestList.Substring("file:///".Length),
+        };
+        md = md with { Snapshots = [first, respelled], CurrentSnapshotId = respelled.SnapshotId };
+
+        var result = await new ExpireSnapshots().ExpireSnapshotId(first.SnapshotId).ApplyAsync(md, resolver);
+
+        Assert.Empty(result.DeletedFiles);
+        Assert.True(System.IO.File.Exists(StorageLocation.Parse(first.ManifestList).LocalPath));
+        var manifests = await ManifestIO.ReadManifestListAsync(new LocationFileSystem(resolver), respelled.ManifestList);
+        Assert.All(manifests, m => Assert.True(System.IO.File.Exists(StorageLocation.Parse(m.ManifestPath).LocalPath)));
     }
 
     /// <summary>

@@ -57,7 +57,7 @@ public class ManifestSafetyTests : IDisposable
         var spec = new PartitionSpec(0, [new PartitionField(1, 1000, "id-bucket", Transform.Bucket(4))]);
         var md = TableMetadata.Create(schema, spec, location: Path.Combine(_dir, "t"));
         var tuple = new PartitionData([new PartitionValue(1000, "id-bucket", IcebergType.Int, 3)]);
-        md = await _ops.AppendFilesAsync(md, [File("data/a.parquet", tuple)]);
+        md = await _ops.AppendFilesAsync(md, [File("s3://bucket/t/data/a.parquet", tuple)]);
 
         var snapshot = md.Snapshots.Single();
         var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList));
@@ -113,23 +113,23 @@ public class ManifestSafetyTests : IDisposable
     {
         var md = TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]),
             location: Path.Combine(_dir, "dv"), formatVersion: 3);
-        md = await _ops.AppendFilesAsync(md, [File("data/a.parquet"), File("data/b.parquet")]);
+        md = await _ops.AppendFilesAsync(md, [File("s3://bucket/t/data/a.parquet"), File("s3://bucket/t/data/b.parquet")]);
         DataFile Dv(string target, long offset) => new()
         {
-            Content = FileContent.PositionDeletes, FilePath = "data/dvs.puffin", FileFormat = FileFormat.Puffin,
+            Content = FileContent.PositionDeletes, FilePath = "s3://bucket/t/data/dvs.puffin", FileFormat = FileFormat.Puffin,
             RecordCount = 1, FileSizeInBytes = 200, ReferencedDataFile = target,
             ContentOffset = offset, ContentSizeInBytes = 30,
         };
-        md = await _ops.AppendDeleteFilesAsync(md, [Dv("data/a.parquet", 4), Dv("data/b.parquet", 40)]);
+        md = await _ops.AppendDeleteFilesAsync(md, [Dv("s3://bucket/t/data/a.parquet", 4), Dv("s3://bucket/t/data/b.parquet", 40)]);
 
-        md = await _ops.OverwriteFilesAsync(md, [File("data/a.parquet"), Dv("data/a.parquet", 4)], []);
+        md = await _ops.OverwriteFilesAsync(md, [File("s3://bucket/t/data/a.parquet"), Dv("s3://bucket/t/data/a.parquet", 4)], []);
 
         var dv = Assert.Single(await _ops.ListDeleteFilesAsync(md));
-        Assert.Equal(("data/b.parquet", 40L), (dv.ReferencedDataFile, dv.ContentOffset!.Value));
+        Assert.Equal(("s3://bucket/t/data/b.parquet", 40L), (dv.ReferencedDataFile, dv.ContentOffset!.Value));
 
         // A DV named without its offset is not one the table holds.
         await Assert.ThrowsAsync<CommitValidationException>(
-            async () => await _ops.OverwriteFilesAsync(md, [Dv("data/b.parquet", 40) with { ContentOffset = null }], []));
+            async () => await _ops.OverwriteFilesAsync(md, [Dv("s3://bucket/t/data/b.parquet", 40) with { ContentOffset = null }], []));
     }
 
     [Fact]
@@ -137,20 +137,20 @@ public class ManifestSafetyTests : IDisposable
     {
         var md = TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]),
             location: Path.Combine(_dir, "sum"), formatVersion: 3);
-        md = await _ops.AppendFilesAsync(md, [File("data/a.parquet"), File("data/b.parquet")]);   // 20 rows
+        md = await _ops.AppendFilesAsync(md, [File("s3://bucket/t/data/a.parquet"), File("s3://bucket/t/data/b.parquet")]);   // 20 rows
         var dv = new DataFile
         {
-            Content = FileContent.PositionDeletes, FilePath = "data/dvs.puffin", FileFormat = FileFormat.Puffin,
-            RecordCount = 3, FileSizeInBytes = 200, ReferencedDataFile = "data/a.parquet", ContentOffset = 4, ContentSizeInBytes = 30,
+            Content = FileContent.PositionDeletes, FilePath = "s3://bucket/t/data/dvs.puffin", FileFormat = FileFormat.Puffin,
+            RecordCount = 3, FileSizeInBytes = 200, ReferencedDataFile = "s3://bucket/t/data/a.parquet", ContentOffset = 4, ContentSizeInBytes = 30,
         };
-        var posDelete = new DataFile { Content = FileContent.PositionDeletes, FilePath = "data/pos.parquet", RecordCount = 2, FileSizeInBytes = 50 };
-        var eqDelete = new DataFile { Content = FileContent.EqualityDeletes, FilePath = "data/eq.parquet", RecordCount = 1, FileSizeInBytes = 50, EqualityIds = [1] };
+        var posDelete = new DataFile { Content = FileContent.PositionDeletes, FilePath = "s3://bucket/t/data/pos.parquet", RecordCount = 2, FileSizeInBytes = 50 };
+        var eqDelete = new DataFile { Content = FileContent.EqualityDeletes, FilePath = "s3://bucket/t/data/eq.parquet", RecordCount = 1, FileSizeInBytes = 50, EqualityIds = [1] };
         md = await _ops.AppendDeleteFilesAsync(md, [dv, posDelete, eqDelete]);
         // Delete files leave the row count where it was.
         Assert.Equal("20", md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId).Summary["total-records"]);
 
         // The caller's record count is not what is counted: the table's own entry is.
-        md = await _ops.OverwriteFilesAsync(md, [File("data/a.parquet") with { RecordCount = 999 }, dv, posDelete, eqDelete], []);
+        md = await _ops.OverwriteFilesAsync(md, [File("s3://bucket/t/data/a.parquet") with { RecordCount = 999 }, dv, posDelete, eqDelete], []);
 
         var summary = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId).Summary;
         Assert.Equal("1", summary["deleted-data-files"]);
@@ -164,7 +164,7 @@ public class ManifestSafetyTests : IDisposable
         Assert.Equal("1", summary["removed-equality-deletes"]);
 
         // A data-only overwrite writes none of the delete-file keys.
-        md = await _ops.OverwriteFilesAsync(md, [File("data/b.parquet")], []);
+        md = await _ops.OverwriteFilesAsync(md, [File("s3://bucket/t/data/b.parquet")], []);
         var plain = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId).Summary;
         Assert.Equal("0", plain["total-records"]);
         Assert.DoesNotContain(plain.Keys, k => k.StartsWith("removed-", StringComparison.Ordinal));
@@ -175,14 +175,14 @@ public class ManifestSafetyTests : IDisposable
     {
         var md = await _ops.AppendFilesAsync(
             TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]), location: Path.Combine(_dir, "tot")),
-            [File("data/a.parquet")]);
+            [File("s3://bucket/t/data/a.parquet")]);
         // Another writer's snapshot without a total-records.
         var snap = md.Snapshots.Single();
         md = md with { Snapshots = [snap with { Summary = new Dictionary<string, string> { ["operation"] = "append" } }] };
 
-        md = await _ops.AppendFilesAsync(md, [File("data/b.parquet")]);
+        md = await _ops.AppendFilesAsync(md, [File("s3://bucket/t/data/b.parquet")]);
         Assert.False(md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId).Summary.ContainsKey("total-records"));
-        md = await _ops.OverwriteFilesAsync(md, [File("data/a.parquet")], []);
+        md = await _ops.OverwriteFilesAsync(md, [File("s3://bucket/t/data/a.parquet")], []);
         Assert.False(md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId).Summary.ContainsKey("total-records"));
     }
 
@@ -224,7 +224,7 @@ public class ManifestSafetyTests : IDisposable
     public async Task AddingAnEncryptedFile_IsRefused_AndWritesNothing()
     {
         var md = TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]), location: Path.Combine(_dir, "k"));
-        var encrypted = File("data/a.parquet") with { KeyMetadata = [1, 2] };
+        var encrypted = File("s3://bucket/t/data/a.parquet") with { KeyMetadata = [1, 2] };
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(async () => await _ops.AppendFilesAsync(md, [encrypted]));
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(async () => await _ops.AppendDeleteFilesAsync(md,
             [encrypted with { Content = FileContent.PositionDeletes }]));
@@ -237,7 +237,7 @@ public class ManifestSafetyTests : IDisposable
     {
         var md = await _ops.AppendFilesAsync(
             TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]), location: Path.Combine(_dir, "j")),
-            [File("data/a.parquet")]);
+            [File("s3://bucket/t/data/a.parquet")]);
         var snapshot = md.Snapshots.Single();
         var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList));
         var jsonList = Path.Combine(md.Location, "metadata", "snap-json.json");
@@ -246,7 +246,7 @@ public class ManifestSafetyTests : IDisposable
 
         var before = FilesUnder(md.Location);
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
-            async () => await _ops.AppendFilesAsync(md, [File("data/b.parquet")]));
+            async () => await _ops.AppendFilesAsync(md, [File("s3://bucket/t/data/b.parquet")]));
         Assert.Equal(before, FilesUnder(md.Location));
     }
 
@@ -254,8 +254,8 @@ public class ManifestSafetyTests : IDisposable
     public async Task ExpiringATableWithAnEncryptedManifest_IsRefused()
     {
         var md = TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]), location: Path.Combine(_dir, "x"));
-        md = await _ops.AppendFilesAsync(md, [File("data/a.parquet")]);
-        md = await _ops.AppendFilesAsync(md, [File("data/b.parquet")]);
+        md = await _ops.AppendFilesAsync(md, [File("s3://bucket/t/data/a.parquet")]);
+        md = await _ops.AppendFilesAsync(md, [File("s3://bucket/t/data/b.parquet")]);
         var current = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
         var list = await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), current.ManifestList);
         await ManifestIO.WriteManifestListAsync(TestResolvers.Io(_fs), current.ManifestList, [list[0] with { KeyMetadata = [1] }, .. list.Skip(1)]);
@@ -269,14 +269,14 @@ public class ManifestSafetyTests : IDisposable
     {
         var md = await _ops.AppendFilesAsync(
             TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]), location: Path.Combine(_dir, "e")),
-            [File("data/a.parquet")]);
+            [File("s3://bucket/t/data/a.parquet")]);
         var snapshot = md.Snapshots.Single();
         var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList));
         await ManifestIO.WriteManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList, [mle with { KeyMetadata = [1] }]);
 
         var before = FilesUnder(md.Location);
         await Assert.ThrowsAsync<UnsupportedTableFeatureException>(
-            async () => await _ops.AppendFilesAsync(md, [File("data/b.parquet")]));
+            async () => await _ops.AppendFilesAsync(md, [File("s3://bucket/t/data/b.parquet")]));
         Assert.Equal(before, FilesUnder(md.Location));
     }
 
@@ -285,7 +285,7 @@ public class ManifestSafetyTests : IDisposable
     {
         var md = await _ops.AppendFilesAsync(
             TableMetadata.Create(new Schema(0, [new NestedField(1, "id", IcebergType.Long, true)]), location: Path.Combine(_dir, "u")),
-            [File("data/a.parquet")]);
+            [File("s3://bucket/t/data/a.parquet")]);
         var snapshot = md.Snapshots.Single();
         var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList));
 
@@ -303,7 +303,7 @@ public class ManifestSafetyTests : IDisposable
         // Reading still works; a commit, which writes the next list from this one, refuses.
         Assert.Single(await _ops.ListDataFilesAsync(md));
         var ex = await Assert.ThrowsAsync<NotSupportedException>(
-            async () => await _ops.AppendFilesAsync(md, [File("data/b.parquet")]));
+            async () => await _ops.AppendFilesAsync(md, [File("s3://bucket/t/data/b.parquet")]));
         Assert.Contains("future_field", ex.Message);
     }
 
@@ -331,7 +331,7 @@ public class ManifestSafetyTests : IDisposable
         var spec = new PartitionSpec(0, [new PartitionField(2, 1000, "g_void", Transform.Void)]);
         var md = TableMetadata.Create(schema, spec, location: Path.Combine(_dir, "geo"), formatVersion: 3);
         var tuple = new PartitionData([new PartitionValue(1000, "g_void", IcebergType.Int, null)]);
-        md = await _ops.AppendFilesAsync(md, [File("data/a.parquet", tuple)]);
+        md = await _ops.AppendFilesAsync(md, [File("s3://bucket/t/data/a.parquet", tuple)]);
         Assert.Equal(tuple, Assert.Single(await _ops.ListDataFilesAsync(md)).Partition);
     }
 

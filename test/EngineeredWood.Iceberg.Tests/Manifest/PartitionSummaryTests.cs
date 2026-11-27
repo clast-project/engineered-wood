@@ -69,9 +69,9 @@ public class PartitionSummaryTests : IDisposable
         var md = TableMetadata.Create(TableSchema, Spec, location: Path.Combine(_dir, "t"));
         md = await _ops.AppendFilesAsync(md,
         [
-            File("data/a.parquet", 3, 1420, 19_000, "b", 0.0),
-            File("data/b.parquet", 7, -500, 18_000, "�", -0.0),
-            File("data/c.parquet", 0, null, 19_500, null, double.NaN),
+            File("s3://bucket/t/data/a.parquet", 3, 1420, 19_000, "b", 0.0),
+            File("s3://bucket/t/data/b.parquet", 7, -500, 18_000, "�", -0.0),
+            File("s3://bucket/t/data/c.parquet", 0, null, 19_500, null, double.NaN),
         ]);
 
         var snapshot = md.Snapshots.Single();
@@ -106,7 +106,7 @@ public class PartitionSummaryTests : IDisposable
         [
             new DataFile
             {
-                FilePath = "data/a.parquet", RecordCount = 1, FileSizeInBytes = 1,
+                FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 1, FileSizeInBytes = 1,
                 Partition = new PartitionData([new PartitionValue(1000, "name", IcebergType.String, null)]),
             },
         ]);
@@ -127,7 +127,7 @@ public class PartitionSummaryTests : IDisposable
         [
             new DataFile
             {
-                FilePath = "data/a.parquet", RecordCount = 1, FileSizeInBytes = 1,
+                FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 1, FileSizeInBytes = 1,
                 Partition = new PartitionData([new PartitionValue(1000, "key", IcebergType.Uuid, Guid.NewGuid())]),
             },
         ]);
@@ -138,7 +138,7 @@ public class PartitionSummaryTests : IDisposable
     public async Task UnpartitionedManifests_HaveAnEmptySummaryList()
     {
         var md = TableMetadata.Create(TableSchema, location: Path.Combine(_dir, "p"));
-        md = await _ops.AppendFilesAsync(md, [new DataFile { FilePath = "data/a.parquet", RecordCount = 1, FileSizeInBytes = 1 }]);
+        md = await _ops.AppendFilesAsync(md, [new DataFile { FilePath = "s3://bucket/t/data/a.parquet", RecordCount = 1, FileSizeInBytes = 1 }]);
         Assert.Empty(Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), md.Snapshots.Single().ManifestList)).Partitions!);
     }
 }

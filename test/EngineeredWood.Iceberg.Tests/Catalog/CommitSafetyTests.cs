@@ -41,7 +41,7 @@ public class CommitSafetyTests : IDisposable
 
     private static DataFile File(string name, long rows = 10) => new()
     {
-        FilePath = $"db/t/data/{name}.parquet",
+        FilePath = $"s3://bucket/db/t/data/{name}.parquet",
         RecordCount = rows,
         FileSizeInBytes = 1000,
     };
@@ -148,7 +148,7 @@ public class CommitSafetyTests : IDisposable
 
         var files = await new TableOperations(TestResolvers.For(_fs)).ListDataFilesAsync(table.Metadata);
         Assert.Equal(
-            Enumerable.Range(0, writers).Select(i => $"db/t/data/f{i}.parquet").OrderBy(p => p),
+            Enumerable.Range(0, writers).Select(i => $"s3://bucket/db/t/data/f{i}.parquet").OrderBy(p => p),
             files.Select(f => f.FilePath).OrderBy(p => p));
         Assert.Equal((10L * writers).ToString(), bySequence[^1].Summary["total-records"]);
     }
@@ -487,7 +487,7 @@ public class CommitSafetyTests : IDisposable
 
         Assert.False(await catalog.TableExistsAsync(id));
         var moved = await catalog.LoadTableAsync(to);
-        Assert.Equal(["db/t/data/a.parquet"], (await ops.ListDataFilesAsync(moved.Metadata)).Select(f => f.FilePath));
+        Assert.Equal(["s3://bucket/db/t/data/a.parquet"], (await ops.ListDataFilesAsync(moved.Metadata)).Select(f => f.FilePath));
         Assert.Single((await new TableScan(moved.Metadata, TestResolvers.For(_fs)).PlanFilesAsync()).DataFiles);
 
         var appended = await catalog.CommitTableAsync(moved, await ops.AppendFilesAsync(moved.Metadata, [File("b")]));

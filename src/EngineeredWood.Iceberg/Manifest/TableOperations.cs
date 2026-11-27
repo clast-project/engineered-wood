@@ -72,6 +72,7 @@ public sealed class TableOperations
         if (filesToAdd.Count > 0)
             ThrowIfSpecNotWritable(current);
         ThrowIfEncryptedFiles(filesToAdd);
+        ThrowIfNotAbsolute(filesToAdd);
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var snapshotId = GenerateSnapshotId();
@@ -283,6 +284,7 @@ public sealed class TableOperations
         current.ThrowIfNotWritable();
         ThrowIfSpecNotWritable(current);
         ThrowIfEncryptedFiles(files);
+        ThrowIfNotAbsolute(files);
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var snapshotId = GenerateSnapshotId();
@@ -540,6 +542,26 @@ public sealed class TableOperations
                 "is not supported.");
     }
 
-    private static string TransformName(Transform transform) =>
+    /// <summary>
+    /// Refuses a file whose location, or the data file a delete file references, is not an absolute location: the
+    /// spec (v1 to v3) makes every file location absolute, and a relative one in a manifest would be read against
+    /// whatever base each engine chose, or not at all.
+    /// </summary>
+    private static void ThrowIfNotAbsolute(IReadOnlyList<DataFile> files)
+    {
+        foreach (var file in files)
+        {
+            if (!StorageLocation.TryParse(file.FilePath, out _))
+                throw new ArgumentException(
+                    $"Cannot add '{file.FilePath}': a file's location must be absolute (s3://..., file:/...).",
+                    nameof(files));
+            if (file.ReferencedDataFile is { } referenced && !StorageLocation.TryParse(referenced, out _))
+                throw new ArgumentException(
+                    $"Cannot add '{file.FilePath}': the data file it references, '{referenced}', must be an absolute " +
+                    "location.", nameof(files));
+        }
+    }
+
+        private static string TransformName(Transform transform) =>
         transform is UnknownTransform u ? u.Name : transform.GetType().Name;
 }

@@ -35,7 +35,7 @@ public class SnapshotRefsTests : IDisposable
         for (int i = 0; i < count; i++)
         {
             metadata = await _ops.AppendFilesAsync(metadata, [
-                new DataFile { FilePath = $"data/f{i}.parquet", RecordCount = 100, FileSizeInBytes = 5000 }
+                new DataFile { FilePath = $"s3://bucket/t/data/f{i}.parquet", RecordCount = 100, FileSizeInBytes = 5000 }
             ]);
         }
         return metadata;
@@ -247,7 +247,7 @@ public class SnapshotRefsTests : IDisposable
 
         // Append creates snapshot 2, current-snapshot-id changes
         metadata = await _ops.AppendFilesAsync(metadata, [
-            new DataFile { FilePath = "data/new.parquet", RecordCount = 50, FileSizeInBytes = 2500 }
+            new DataFile { FilePath = "s3://bucket/t/data/new.parquet", RecordCount = 50, FileSizeInBytes = 2500 }
         ]);
 
         // The append moved main with current-snapshot-id
@@ -347,6 +347,6 @@ public class SnapshotRefsTests : IDisposable
         var atBaseline = TimeTravel.AtSnapshot(metadata, refId.Value);
         var files = await _ops.ListDataFilesAsync(atBaseline);
         Assert.Single(files);
-        Assert.Equal("data/f0.parquet", files[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/f0.parquet", files[0].FilePath);
     }
 }

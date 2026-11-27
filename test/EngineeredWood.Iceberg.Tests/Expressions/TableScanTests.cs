@@ -41,7 +41,7 @@ public class TableScanTests : IDisposable
         // File 1: ids 1-100, region a-m, scores 0-50
         new()
         {
-            FilePath = "data/file1.parquet", RecordCount = 100, FileSizeInBytes = 50000,
+            FilePath = "s3://bucket/t/data/file1.parquet", RecordCount = 100, FileSizeInBytes = 50000,
             NullValueCounts = new Dictionary<int, long> { [1] = 0, [2] = 0, [3] = 0 },
             ColumnLowerBounds = new Dictionary<int, LiteralValue>
                 { [1] = LiteralValue.Of(1L), [2] = LiteralValue.Of("a"), [3] = LiteralValue.Of(0.0) },
@@ -51,7 +51,7 @@ public class TableScanTests : IDisposable
         // File 2: ids 101-200, region n-z, scores 50-100
         new()
         {
-            FilePath = "data/file2.parquet", RecordCount = 100, FileSizeInBytes = 50000,
+            FilePath = "s3://bucket/t/data/file2.parquet", RecordCount = 100, FileSizeInBytes = 50000,
             NullValueCounts = new Dictionary<int, long> { [1] = 0, [2] = 0, [3] = 0 },
             ColumnLowerBounds = new Dictionary<int, LiteralValue>
                 { [1] = LiteralValue.Of(101L), [2] = LiteralValue.Of("n"), [3] = LiteralValue.Of(50.0) },
@@ -61,7 +61,7 @@ public class TableScanTests : IDisposable
         // File 3: ids 201-300, region a-z, all nulls for score
         new()
         {
-            FilePath = "data/file3.parquet", RecordCount = 100, FileSizeInBytes = 50000,
+            FilePath = "s3://bucket/t/data/file3.parquet", RecordCount = 100, FileSizeInBytes = 50000,
             NullValueCounts = new Dictionary<int, long> { [1] = 0, [2] = 0, [3] = 100 },
             ColumnLowerBounds = new Dictionary<int, LiteralValue>
                 { [1] = LiteralValue.Of(201L), [2] = LiteralValue.Of("a") },
@@ -91,7 +91,7 @@ public class TableScanTests : IDisposable
 
         Assert.Equal(1, result.FilesMatched);
         Assert.Equal(2, result.FilesSkipped);
-        Assert.Equal("data/file1.parquet", result.DataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/file1.parquet", result.DataFiles[0].FilePath);
     }
 
     [Fact]
@@ -103,7 +103,7 @@ public class TableScanTests : IDisposable
 
         Assert.Equal(1, result.FilesMatched);
         Assert.Equal(2, result.FilesSkipped);
-        Assert.Equal("data/file3.parquet", result.DataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/file3.parquet", result.DataFiles[0].FilePath);
     }
 
     [Fact]
@@ -139,7 +139,7 @@ public class TableScanTests : IDisposable
 
         Assert.Equal(1, result.FilesMatched);
         Assert.Equal(2, result.FilesSkipped);
-        Assert.Equal("data/file2.parquet", result.DataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/file2.parquet", result.DataFiles[0].FilePath);
     }
 
     [Fact]
@@ -151,7 +151,7 @@ public class TableScanTests : IDisposable
 
         Assert.Equal(1, result.FilesMatched);
         Assert.Equal(2, result.FilesSkipped);
-        Assert.Equal("data/file3.parquet", result.DataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/file3.parquet", result.DataFiles[0].FilePath);
     }
 
     [Fact]
@@ -201,8 +201,8 @@ public class TableScanTests : IDisposable
     {
         var metadata = CreateMetadata();
         var after = await _ops.AppendFilesAsync(metadata, [
-            new DataFile { FilePath = "data/v1.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
-            new DataFile { FilePath = "data/v2.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
+            new DataFile { FilePath = "s3://bucket/t/data/v1.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
+            new DataFile { FilePath = "s3://bucket/t/data/v2.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
         ]);
 
         var result = await new TableScan(after, TestResolvers.For(_fs)).PlanFilesAsync();
@@ -215,12 +215,12 @@ public class TableScanTests : IDisposable
         var metadata = CreateMetadata();
 
         var after1 = await _ops.AppendFilesAsync(metadata, [
-            new DataFile { FilePath = "data/v1.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
+            new DataFile { FilePath = "s3://bucket/t/data/v1.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
         ]);
         var snap1 = after1.CurrentSnapshotId!.Value;
 
         var after2 = await _ops.AppendFilesAsync(after1, [
-            new DataFile { FilePath = "data/v2.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
+            new DataFile { FilePath = "s3://bucket/t/data/v2.parquet", RecordCount = 100, FileSizeInBytes = 5000 },
         ]);
 
         var result = await new TableScan(after2, TestResolvers.For(_fs))
@@ -228,7 +228,7 @@ public class TableScanTests : IDisposable
             .PlanFilesAsync();
 
         Assert.Single(result.DataFiles);
-        Assert.Equal("data/v1.parquet", result.DataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/v1.parquet", result.DataFiles[0].FilePath);
     }
 
     [Fact]
@@ -261,7 +261,7 @@ public class TableScanTests : IDisposable
         // Top-level s.x in 1-100 (rules out 500); struct s.x in 0-1000.
         new()
         {
-            FilePath = "data/d1.parquet", RecordCount = 10, FileSizeInBytes = 1000,
+            FilePath = "s3://bucket/t/data/d1.parquet", RecordCount = 10, FileSizeInBytes = 1000,
             NullValueCounts = new Dictionary<int, long> { [1] = 0, [12] = 0 },
             ColumnLowerBounds = new Dictionary<int, LiteralValue>
                 { [1] = LiteralValue.Of(1L), [12] = LiteralValue.Of(0L) },
@@ -271,7 +271,7 @@ public class TableScanTests : IDisposable
         // Top-level s.x in 101-200 (rules out 500); no stats for the struct field.
         new()
         {
-            FilePath = "data/d2.parquet", RecordCount = 10, FileSizeInBytes = 1000,
+            FilePath = "s3://bucket/t/data/d2.parquet", RecordCount = 10, FileSizeInBytes = 1000,
             NullValueCounts = new Dictionary<int, long> { [1] = 0 },
             ColumnLowerBounds = new Dictionary<int, LiteralValue> { [1] = LiteralValue.Of(101L) },
             ColumnUpperBounds = new Dictionary<int, LiteralValue> { [1] = LiteralValue.Of(200L) },
@@ -279,7 +279,7 @@ public class TableScanTests : IDisposable
         // Top-level s.x in 400-600 (admits 500).
         new()
         {
-            FilePath = "data/d3.parquet", RecordCount = 10, FileSizeInBytes = 1000,
+            FilePath = "s3://bucket/t/data/d3.parquet", RecordCount = 10, FileSizeInBytes = 1000,
             NullValueCounts = new Dictionary<int, long> { [1] = 0 },
             ColumnLowerBounds = new Dictionary<int, LiteralValue> { [1] = LiteralValue.Of(400L) },
             ColumnUpperBounds = new Dictionary<int, LiteralValue> { [1] = LiteralValue.Of(600L) },
@@ -298,7 +298,7 @@ public class TableScanTests : IDisposable
 
         Assert.Equal(1, result.FilesMatched);
         Assert.Equal(2, result.FilesSkipped);
-        Assert.Equal("data/d3.parquet", result.DataFiles[0].FilePath);
+        Assert.Equal("s3://bucket/t/data/d3.parquet", result.DataFiles[0].FilePath);
     }
 
     [Fact]

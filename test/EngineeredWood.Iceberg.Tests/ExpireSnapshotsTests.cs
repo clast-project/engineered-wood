@@ -38,7 +38,7 @@ public class ExpireSnapshotsTests : IDisposable
             metadata = await _ops.AppendFilesAsync(metadata, [
                 new DataFile
                 {
-                    FilePath = $"data/file{i}.parquet",
+                    FilePath = $"s3://bucket/t/data/file{i}.parquet",
                     RecordCount = (i + 1) * 100,
                     FileSizeInBytes = (i + 1) * 5000,
                 }

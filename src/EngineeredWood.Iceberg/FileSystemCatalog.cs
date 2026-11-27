@@ -22,7 +22,11 @@ public sealed class FileSystemCatalog : ICatalog
 
     /// <summary>
     /// Initializes a catalog over the warehouse at <paramref name="warehouse"/>, which <paramref name="resolver"/>
-    /// must reach (it may be registered there itself or lie under a registered prefix).
+    /// must reach (it may be registered there itself or lie under a registered prefix). The catalog's own files
+    /// (metadata versions, version hints, namespace properties) are read and written through the file system the
+    /// warehouse resolves to, as a Hadoop catalog uses one FileIO for its warehouse; a narrower registration, for one
+    /// table's credentials say, serves the files that table names (manifests, data), which are reached through
+    /// <see cref="Resolver"/>. Both must therefore reach the same storage.
     /// </summary>
     public FileSystemCatalog(StorageResolver resolver, StorageLocation warehouse)
     {
@@ -50,8 +54,25 @@ public sealed class FileSystemCatalog : ICatalog
 
     // --- Namespace operations ---
 
-    private static string NamespacePath(Namespace ns) =>
-        string.Join("/", ns.Levels);
+    private static string NamespacePath(Namespace ns)
+    {
+        foreach (var level in ns.Levels)
+            ThrowIfNotOneSegment(level, "namespace level");
+        return string.Join("/", ns.Levels);
+    }
+
+    /// <summary>
+    /// Refuses a namespace level or table name that is not one plain path segment. Each one is a directory under the
+    /// warehouse, so a <c>..</c>, a <c>.</c>, an empty name or a separator would put the files elsewhere: in a
+    /// sibling of the warehouse, still inside the backend's root, where no root check catches it.
+    /// </summary>
+    private static void ThrowIfNotOneSegment(string name, string what)
+    {
+        if (name.Length == 0 || name is "." or ".." || name.IndexOfAny(['/', '\\']) >= 0)
+            throw new ArgumentException(
+                $"The {what} '{name}' is not a valid name in a file-system catalog: it is a directory under the " +
+                "warehouse, so it cannot be empty, '.' or '..', or hold a '/' or '\\'.");
+    }
 
     private static string NamespacePropertiesPath(Namespace ns) =>
         $"{NamespacePath(ns)}/.namespace-properties.json";
@@ -195,8 +216,11 @@ public sealed class FileSystemCatalog : ICatalog
     private const string MetadataFileSuffix = ".metadata.json";
     private const string VersionHintFileName = "version-hint.text";
 
-    private static string TablePath(TableIdentifier id) =>
-        $"{NamespacePath(id.Namespace)}/{id.Name}";
+    private static string TablePath(TableIdentifier id)
+    {
+        ThrowIfNotOneSegment(id.Name, "table name");
+        return $"{NamespacePath(id.Namespace)}/{id.Name}";
+    }
 
     private static string MetadataDir(TableIdentifier id) =>
         $"{TablePath(id)}/metadata";
@@ -456,10 +480,14 @@ public sealed class FileSystemCatalog : ICatalog
 
     private int ParseBaseVersion(Table baseTable)
     {
-        var expectedDir = Absolute(MetadataDir(baseTable.Identifier)) + "/";
+        // Compared as locations, so a table loaded by a catalog that spells the warehouse differently (file:/wh and
+        // file:///wh, s3a:// and s3://) commits here too.
+        var expectedDir = _warehouse.Combine(MetadataDir(baseTable.Identifier));
         var location = baseTable.MetadataLocation;
-        if (location is null || !location.StartsWith(expectedDir, StringComparison.Ordinal) ||
-            ParseMetadataVersion(location.Substring(expectedDir.Length)) is not { } version)
+        if (location is null || !StorageLocation.TryParse(location, out var parsed) ||
+            !parsed!.IsUnder(expectedDir) ||
+            parsed.RelativeTo(expectedDir) is not { Length: > 0 } fileName || fileName.IndexOf('/') >= 0 ||
+            ParseMetadataVersion(fileName) is not { } version)
             throw new ArgumentException(
                 $"The base table's metadata location '{location}' is not a version of {baseTable.Identifier} in " +
                 "this catalog; load the table from this catalog before committing to it.",

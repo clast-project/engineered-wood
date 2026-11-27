@@ -35,7 +35,7 @@ public class ManifestRewriteTests : IDisposable
         location: Path.Combine(_dir, "t"), formatVersion: formatVersion);
 
     private static DataFile File(string name, long rows = 10) =>
-        new() { FilePath = $"data/{name}.parquet", RecordCount = rows, FileSizeInBytes = 100 };
+        new() { FilePath = $"s3://bucket/t/data/{name}.parquet", RecordCount = rows, FileSizeInBytes = 100 };
 
     private async Task<List<ManifestEntry>> RawEntriesAsync(TableMetadata md)
     {
@@ -58,7 +58,7 @@ public class ManifestRewriteTests : IDisposable
 
         // Read through the snapshot, they take the manifest's sequence number.
         var live = Assert.Single(await _ops.ListDataFilesAsync(md));
-        Assert.Equal("data/a.parquet", live.FilePath);
+        Assert.Equal("s3://bucket/t/data/a.parquet", live.FilePath);
         var snapshot = md.Snapshots.Single();
         var mle = Assert.Single(await ManifestIO.ReadManifestListAsync(TestResolvers.Io(_fs), snapshot.ManifestList));
         var entry = Assert.Single(await ManifestIO.ReadSnapshotManifestAsync(TestResolvers.Io(_fs), md, snapshot, mle, default));
@@ -75,7 +75,7 @@ public class ManifestRewriteTests : IDisposable
         md = await _ops.OverwriteFilesAsync(md, [File("a")], []);                    // sequence 3
 
         var raw = await RawEntriesAsync(md);
-        var b = raw.Single(e => e.DataFile.FilePath == "data/b.parquet");
+        var b = raw.Single(e => e.DataFile.FilePath == "s3://bucket/t/data/b.parquet");
         // b moved to a manifest of snapshot 3, so it can no longer inherit: it is EXISTING, with the
         // snapshot and sequence numbers it was added with written out.
         Assert.Equal(ManifestEntryStatus.Existing, b.Status);
@@ -83,18 +83,18 @@ public class ManifestRewriteTests : IDisposable
         Assert.Equal(1, b.SequenceNumber);
         Assert.Equal(1, b.FileSequenceNumber);
 
-        var a = raw.Single(e => e.DataFile.FilePath == "data/a.parquet");
+        var a = raw.Single(e => e.DataFile.FilePath == "s3://bucket/t/data/a.parquet");
         Assert.Equal(ManifestEntryStatus.Deleted, a.Status);
         Assert.Equal(md.CurrentSnapshotId, a.SnapshotId);
         Assert.Equal(1, a.SequenceNumber);
 
         // c's manifest was not touched, so its entry still inherits sequence 2.
-        var c = raw.Single(e => e.DataFile.FilePath == "data/c.parquet");
+        var c = raw.Single(e => e.DataFile.FilePath == "s3://bucket/t/data/c.parquet");
         Assert.Equal(ManifestEntryStatus.Added, c.Status);
         Assert.Null(c.SequenceNumber);
 
         var live = await _ops.ListDataFilesAsync(md);
-        Assert.Equal(["data/b.parquet", "data/c.parquet"], live.Select(f => f.FilePath).OrderBy(p => p));
+        Assert.Equal(["s3://bucket/t/data/b.parquet", "s3://bucket/t/data/c.parquet"], live.Select(f => f.FilePath).OrderBy(p => p));
 
         // The rewritten manifest's counts describe what it now holds.
         var snapshot = md.Snapshots.Single(s => s.SnapshotId == md.CurrentSnapshotId);
@@ -107,7 +107,7 @@ public class ManifestRewriteTests : IDisposable
         // A later rewrite does not carry the DELETED entry forward.
         md = await _ops.OverwriteFilesAsync(md, [File("b")], []);
         Assert.DoesNotContain(await RawEntriesAsync(md),
-            e => e.DataFile.FilePath == "data/a.parquet");
+            e => e.DataFile.FilePath == "s3://bucket/t/data/a.parquet");
     }
 
     [Fact]

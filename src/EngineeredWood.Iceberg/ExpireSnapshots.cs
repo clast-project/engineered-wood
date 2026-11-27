@@ -104,9 +104,10 @@ public sealed class ExpireSnapshots
         var expiredIds = new HashSet<long>(expired.Select(s => s.SnapshotId));
         var keptSnapshots = allSnapshots.Where(s => !expiredIds.Contains(s.SnapshotId)).ToList();
 
-        // Collect files referenced by kept snapshots
-        var keptManifestLists = new HashSet<string>(keptSnapshots.Select(s => s.ManifestList));
-        var keptManifestPaths = new HashSet<string>();
+        // Collect files referenced by kept snapshots. Files are compared as locations, not strings: two snapshots
+        // can name one manifest in two spellings (file:/t/m.avro and file:///t/m.avro, s3a:// and s3://).
+        var keptManifestLists = new HashSet<string>(keptSnapshots.Select(s => s.ManifestList), LocationComparer.Instance);
+        var keptManifestPaths = new HashSet<string>(LocationComparer.Instance);
 
         if (fs is not null)
         {
@@ -122,14 +123,16 @@ public sealed class ExpireSnapshots
             }
         }
 
-        // Delete files only referenced by expired snapshots
+        // Delete files only referenced by expired snapshots, each once however many expired snapshots name it.
         var deletedFiles = new List<string>();
+        var candidates = new HashSet<string>(LocationComparer.Instance);
 
         foreach (var snap in expired)
         {
             if (!keptManifestLists.Contains(snap.ManifestList))
             {
-                deletedFiles.Add(snap.ManifestList);
+                if (candidates.Add(snap.ManifestList))
+                    deletedFiles.Add(snap.ManifestList);
 
                 if (fs is not null && await fs.ExistsAsync(snap.ManifestList, ct).ConfigureAwait(false))
                 {
@@ -139,7 +142,7 @@ public sealed class ExpireSnapshots
                     ManifestIO.ThrowIfEncryptedManifest(entries, snap, "its snapshots cannot be expired");
                     foreach (var e in entries)
                     {
-                        if (!keptManifestPaths.Contains(e.ManifestPath))
+                        if (!keptManifestPaths.Contains(e.ManifestPath) && candidates.Add(e.ManifestPath))
                             deletedFiles.Add(e.ManifestPath);
                     }
                 }
@@ -148,6 +151,7 @@ public sealed class ExpireSnapshots
 
         // Perform deletions, under the table's location only.
         var outside = new List<string>();
+        var outsideSet = new HashSet<string>(StringComparer.Ordinal);
         if (fs is not null)
         {
             var tableLocation = StorageLocation.Parse(metadata.Location);
@@ -156,13 +160,14 @@ public sealed class ExpireSnapshots
                 if (!StorageLocation.Parse(file).IsUnder(tableLocation))
                 {
                     outside.Add(file);
+                    outsideSet.Add(file);
                     continue;
                 }
 
                 await fs.DeleteAsync(file, ct).ConfigureAwait(false);
             }
 
-            deletedFiles.RemoveAll(outside.Contains);
+            deletedFiles.RemoveAll(outsideSet.Contains);
         }
 
         // Fix parent references in kept snapshots
@@ -203,4 +208,25 @@ public sealed record ExpireResult(TableMetadata Metadata, IReadOnlyList<string> 
     /// Files no longer referenced that lie outside the table's location, and so were left in place.
     /// </summary>
     public IReadOnlyList<string> FilesOutsideTable { get; init; } = [];
+}
+
+/// <summary>
+/// Compares file references as storage locations, so one file named in two spellings is one file. A reference that
+/// is not a location (a relative path in an old table) is compared as text.
+/// </summary>
+internal sealed class LocationComparer : IEqualityComparer<string>
+{
+    public static readonly LocationComparer Instance = new();
+
+    public bool Equals(string? x, string? y)
+    {
+        if (x is null || y is null)
+            return x is null && y is null;
+        bool px = StorageLocation.TryParse(x, out var lx);
+        bool py = StorageLocation.TryParse(y, out var ly);
+        return px && py ? lx == ly : !px && !py && string.Equals(x, y, StringComparison.Ordinal);
+    }
+
+    public int GetHashCode(string obj) =>
+        StorageLocation.TryParse(obj, out var location) ? location!.GetHashCode() : StringComparer.Ordinal.GetHashCode(obj);
 }
