@@ -28,8 +28,10 @@ namespace EngineeredWood.IO;
 ///
 /// <para>A segment that is exactly <c>.</c> or <c>..</c> in any location other than <c>file</c> is REFUSED. In an
 /// object store such a segment is a legal, literal key segment (S3 permits <c>a/../b</c> as a key distinct from
-/// <c>b</c>), and whether a table format's path means it literally or as navigation has to match what the other
-/// engines do; until that is decided (#963), EW does not guess.</para>
+/// <c>b</c>). The engines measured in #963 do not agree on what such a path names: some collapse it (and then reach
+/// outside the table, or even the bucket), some request the literal key, some reject or rewrite it, and none reads
+/// the literal key on its default path. No reading of it is portable, so the refusal is permanent: EW neither reads
+/// nor writes such a location. A <c>%2E%2E</c> segment is not a dot segment; like every <c>%</c>, it is literal.</para>
 ///
 /// <para>Equality and hashing use the normalized form, so one location has one identity however it was spelled.
 /// <see cref="ToString"/> keeps the spelling it was given, so a location EW derives from a table's own location is
@@ -494,6 +496,6 @@ public sealed class StorageLocation : IEquatable<StorageLocation>
 
     private static NotSupportedException DotSegmentRefusal(string path) =>
         new($"'{path}' has a '.' or '..' segment in an object-store location. In an object store such a segment " +
-            "is a literal part of the key, and whether a table format means it literally or as navigation is not " +
-            "decided yet (#963), so EW refuses it rather than guess.");
+            "is a literal part of the key, and engines disagree on whether it means that key or navigation (some " +
+            "collapse it out of the table or bucket), so no reading of it is portable. EW refuses such locations (#963).");
 }
