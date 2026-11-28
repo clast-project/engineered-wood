@@ -193,6 +193,52 @@ public sealed class IndexSectionTests : IDisposable
     }
 
     [Fact]
+    public async Task AnIndexSectionPointingAtTheTransaction_IsRefused()
+    {
+        // pylance 14.0.3 writes the index section at 0 and the transaction after it, pointed at by field 23. The
+        // transaction lies before the manifest, so only the overlap check keeps it from being read as an index section.
+        string dataset = Copy("index_vacuumed_v21");
+        LanceBasePathsTests.RewriteManifests(dataset, m =>
+        {
+            Assert.True(m.HasTransactionSection);
+            m.IndexSection = m.TransactionSection;
+        });
+
+        var ex = await Assert.ThrowsAsync<LanceTableFormatException>(() => LanceTable.OpenAsync(dataset).AsTask());
+        Assert.Contains("overlaps the transaction section", ex.Message);
+    }
+
+    [Fact]
+    public async Task AnIndexSectionRunningIntoTheManifest_IsRefused()
+    {
+        string dataset = Copy("index_vacuumed_v21");
+        LanceBasePathsTests.RewriteManifests(dataset, m => m.ClearTransactionSection());
+        string file = Assert.Single(Directory.GetFiles(Path.Combine(dataset, "_versions"), "*.manifest"));
+        byte[] bytes = File.ReadAllBytes(file);
+        int manifestPos = checked((int)BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(bytes.Length - 16)));
+        // The section at 0 now claims every byte up to and including the manifest's length prefix.
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, (uint)manifestPos);
+        File.WriteAllBytes(file, bytes);
+
+        var ex = await Assert.ThrowsAsync<LanceTableFormatException>(() => LanceTable.OpenAsync(dataset).AsTask());
+        Assert.Contains("runs into the manifest", ex.Message);
+    }
+
+    [Fact]
+    public async Task AFragmentIdBeyond32Bits_ReadsUnpruned()
+    {
+        // lance never writes one (max_fragment_id is a u32), and an index's bitmap cannot name it; such a manifest is
+        // read without pruning rather than refused.
+        string dataset = Copy("index_vacuumed_v21");
+        LanceBasePathsTests.RewriteManifests(dataset, m => m.Fragments[2].Id = 1UL << 33);
+
+        await using var table = await LanceTable.OpenAsync(dataset);
+        var (batches, values) = await ReadXAsync(table, Equal("x", LiteralValue.Of(200)));
+        Assert.Equal([200], values);
+        Assert.Equal(3, batches);
+    }
+
+    [Fact]
     public async Task AnIndexNamingABaseTheManifestDoesNotList_IsRefused()
     {
         string dataset = Copy("index_vacuumed_v21");

@@ -326,6 +326,23 @@ public sealed class LanceTable : IAsyncDisposable
         return new LanceTable(fs, ownsFileSystem, manifest, arrowSchema, locator, indices);
     }
 
+    /// <summary>
+    /// Every fragment id, when each fits the 32 bits an index's fragment bitmap and row addresses hold. lance never
+    /// writes a larger one (its <c>max_fragment_id</c> is a u32), but a manifest that has one is read unpruned
+    /// rather than refused.
+    /// </summary>
+    private bool TryGetIndexableFragmentIds(out List<uint> fragmentIds)
+    {
+        fragmentIds = new List<uint>(_manifest.Fragments.Count);
+        foreach (var fragment in _manifest.Fragments)
+        {
+            if (fragment.Id > uint.MaxValue)
+                return false;
+            fragmentIds.Add((uint)fragment.Id);
+        }
+        return true;
+    }
+
     private static void ValidateScope(Proto.Manifest manifest)
     {
         // Feature flags: 1=deletion files, 2=stable row ids, 4=v2 format
@@ -434,13 +451,11 @@ public sealed class LanceTable : IAsyncDisposable
         // contain no matches. A null result means "no useful pruning"
         // and we scan every fragment as before.
         HashSet<uint>? candidateFragments = null;
-        if (filter is not null)
+        if (filter is not null && _indices.Count > 0 && TryGetIndexableFragmentIds(out var fragmentIds))
         {
-            if (_indices.Count > 0)
-                candidateFragments = await Indices.IndexPruner
-                    .ComputeCandidatesAsync(filter, _indices,
-                        _manifest.Fragments.Select(f => checked((uint)f.Id)).ToList(), _fs, cancellationToken)
-                    .ConfigureAwait(false);
+            candidateFragments = await Indices.IndexPruner
+                .ComputeCandidatesAsync(filter, _indices, fragmentIds, _fs, cancellationToken)
+                .ConfigureAwait(false);
         }
 
         foreach (DataFragment fragment in _manifest.Fragments)

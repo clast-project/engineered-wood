@@ -56,26 +56,41 @@ internal static class ManifestReader
 
     /// <summary>
     /// The index section <paramref name="manifest"/> points at in its file's <paramref name="bytes"/>, or null when it
-    /// points at none. The section must lie before the footer.
+    /// points at none. The section, with its length prefix, must lie wholly before the manifest's length prefix and
+    /// must not contain the start of the transaction section (either field, 23 or the deprecated 21), so it can never
+    /// be read out of another section's bytes.
     /// </summary>
     public static IndexSection? ParseIndexSection(ReadOnlySpan<byte> bytes, Proto.Manifest manifest, string pathForErrors)
     {
         if (!manifest.HasIndexSection)
             return null;
 
-        long trailerStart = bytes.Length - ManifestFooter.Size;
+        // Parse has checked the footer and that this position lies inside the file.
+        long manifestLenPos = ManifestFooter.Parse(bytes.Slice(bytes.Length - ManifestFooter.Size)).MetadataPosition;
         ulong position = manifest.IndexSection;
-        if (position > (ulong)trailerStart - sizeof(uint))
+        if (position > (ulong)manifestLenPos || (ulong)manifestLenPos - position < sizeof(uint))
             throw new LanceTableFormatException(
                 $"Manifest '{pathForErrors}' has out-of-range index section position {position} " +
-                $"(file size {bytes.Length}).");
+                $"(the manifest starts at {manifestLenPos}).");
 
         int start = (int)position;
         uint length = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(start, sizeof(uint)));
-        if (length > (ulong)(trailerStart - start - sizeof(uint)))
+        long end = start + sizeof(uint) + (long)length;
+        if (end > manifestLenPos)
             throw new LanceTableFormatException(
-                $"Manifest '{pathForErrors}' index section length {length} extends past the file " +
-                $"(start={start}, trailer={trailerStart}).");
+                $"Manifest '{pathForErrors}' index section length {length} runs into the manifest " +
+                $"(start={start}, manifest={manifestLenPos}).");
+        foreach (ulong? transaction in new ulong?[]
+                 {
+                     manifest.HasTransactionSection ? manifest.TransactionSection : null,
+                     manifest.HasTransactionSectionDeprecated ? manifest.TransactionSectionDeprecated : null,
+                 })
+        {
+            if (transaction is { } t && t >= (ulong)start && t < (ulong)end)
+                throw new LanceTableFormatException(
+                    $"Manifest '{pathForErrors}' index section [{start}, {end}) overlaps the transaction section at " +
+                    $"{t}.");
+        }
 
         try
         {
