@@ -34,7 +34,9 @@ namespace EngineeredWood.Lance.Table;
 /// </list>
 ///
 /// <para>Nothing here writes or deletes. Every file EW writes goes under the dataset root, as lance's do unless a
-/// writer names a target base.</para>
+/// writer names a target base. <see cref="LanceDatasetWriter"/> reads existing files through a locator, and its vacuum
+/// compares the locations it gives (<see cref="LocateDataFile"/>), so a base that lies under the root never makes a
+/// live file look unreferenced (#990).</para>
 /// </summary>
 internal sealed class LanceFileLocator
 {
@@ -103,11 +105,26 @@ internal sealed class LanceFileLocator
         if (!file.HasBaseId)
             return new ResolvedLanceFile(Table, DataDirectory + "/" + file.Path);
 
+        return Resolve(BaseDataFileLocation(fragment, file));
+    }
+
+    /// <summary>
+    /// Where a fragment's data file is, without reaching it: what <see cref="ResolveDataFile"/> would read, as a
+    /// location. Needs <see cref="TableLocation"/>.
+    /// </summary>
+    public StorageLocation LocateDataFile(DataFragment fragment, DataFile file) =>
+        file.HasBaseId
+            ? BaseDataFileLocation(fragment, file)
+            : Combine(RequireTableLocation().Combine(DataDirectory), file.Path,
+                $"data file '{file.Path}' of fragment {fragment.Id}");
+
+    private StorageLocation BaseDataFileLocation(DataFragment fragment, DataFile file)
+    {
         string what = $"data file '{file.Path}' of fragment {fragment.Id}";
         var basePath = Base(file.BaseId, what);
         var location = BaseLocation(file.BaseId, what);
         var directory = basePath.IsDatasetRoot ? location.Combine(DataDirectory) : location;
-        return Resolve(Combine(directory, file.Path, what));
+        return Combine(directory, file.Path, what);
     }
 
     /// <summary>
@@ -124,6 +141,24 @@ internal sealed class LanceFileLocator
         var directory = DeletionDirectory(deletion.BaseId, fragment.Id);
         return Resolve(Combine(directory, fileName, $"deletion file of fragment {fragment.Id}"));
     }
+
+    /// <summary>
+    /// Where a fragment's deletion file is, without reaching it: what <see cref="ResolveDeletionFile"/> would read,
+    /// as a location. Needs <see cref="TableLocation"/>.
+    /// </summary>
+    public StorageLocation LocateDeletionFile(DataFragment fragment, string fileName)
+    {
+        var deletion = fragment.DeletionFile
+            ?? throw new ArgumentException($"Fragment {fragment.Id} has no deletion file.", nameof(fragment));
+        var directory = deletion.HasBaseId
+            ? DeletionDirectory(deletion.BaseId, fragment.Id)
+            : RequireTableLocation().Combine(DeletionsDirectory);
+        return Combine(directory, fileName, $"deletion file of fragment {fragment.Id}");
+    }
+
+    private StorageLocation RequireTableLocation() =>
+        TableLocation ?? throw new InvalidOperationException(
+            "The dataset's file system does not say where it is rooted, so its files' locations are unknown.");
 
     /// <summary>The file system and directory of an index's files.</summary>
     public ResolvedLanceFile ResolveIndexDirectory(IndexMetadata index, Guid uuid)

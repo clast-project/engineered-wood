@@ -106,9 +106,42 @@ and exposes the read side via `LanceTable`.
 
 Every commit path stamps `manifest.timestamp` for time travel.
 
-Every writer operation refuses a dataset whose manifest has `base_paths`
-(`NotSupportedException`): the writer would read existing files as
-`data/{path}` and drop `base_paths` from the manifest it commits.
+**Datasets with `base_paths`** (#990). The writer does what lance 14.0.3
+does when a writer names no target base:
+- Every manifest it commits carries the read manifest's `base_paths`.
+  Its reader and writer feature flags are recomputed from its contents,
+  as lance's `apply_feature_flags` does: `FLAG_DELETION_FILES` (1) when
+  any fragment has a deletion file, `FLAG_BASE_PATHS` (16) when it lists
+  bases.
+  Fragments it carries forward keep their files' and deletion files'
+  `base_id`s. Overwrite keeps the bases too, as lance does (measured).
+- Every file it creates goes under the dataset root, with no `base_id`.
+  This includes a deletion file that replaces one under a base. It never
+  writes or deletes anything under another base.
+- Delete, delete-rows, update and compact read existing files where
+  their base puts them. Each has an overload that takes
+  `LanceWriteOptions { StorageResolver }`, which reaches bases outside
+  the dataset as `LanceTableOptions.StorageResolver` does for reads.
+  Without a resolver, an operation that must read such a file throws
+  `UnregisteredStorageLocationException` before it writes anything.
+  Append, overwrite and create read no existing data, so they take no
+  resolver.
+- Vacuum lists and deletes only under the root, as lance's cleanup does.
+  It keeps a file when any retained version names that file's location
+  through any base. It compares locations, not names or
+  `(base_id, path)`, so a base that lies inside the root cannot make a
+  live file look unreferenced. A base it cannot place, such as a relative
+  path, makes it refuse. A local base, inside the root or outside it, may
+  reach the root's files through a symlink or junction, so vacuum also
+  keeps any file named like a live file reached through a local base.
+
+Every operation except vacuum refuses a manifest whose writer feature
+flags it does not maintain: stable row ids (2), table config (8) and any
+unknown flag. Committing would silently drop them. Delete, delete-rows,
+update and compact also refuse a fragment that is not one data file
+holding the manifest's fields in order (a column-split or reordered
+layout), because they read columns by position. Both checks happen before
+anything is written.
 
 ## Type coverage
 
