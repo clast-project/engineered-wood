@@ -37,6 +37,16 @@ internal static class IndexCatalog
 {
     public static async ValueTask<IReadOnlyList<IndexInfo>> DiscoverAsync(
         ITableFileSystem fs, Proto.Manifest manifest, CancellationToken cancellationToken = default)
+        => await DiscoverAsync(fs, manifest, new LanceFileLocator(fs, manifest, resolver: null), cancellationToken)
+            .ConfigureAwait(false);
+
+    /// <summary>
+    /// As <see cref="DiscoverAsync(ITableFileSystem, Proto.Manifest, CancellationToken)"/>, finding each index's
+    /// files through <paramref name="locator"/>: an index whose metadata names a <c>base_id</c> lies under that base.
+    /// </summary>
+    public static async ValueTask<IReadOnlyList<IndexInfo>> DiscoverAsync(
+        ITableFileSystem fs, Proto.Manifest manifest, LanceFileLocator locator,
+        CancellationToken cancellationToken = default)
     {
         // Build a field-id → path lookup from the manifest's flat schema.
         var fieldPaths = BuildFieldPathMap(manifest.Fields);
@@ -92,6 +102,7 @@ internal static class IndexCatalog
             var columnNames = columnPaths.Select(path => string.Join(".", path)).ToList();
 
             var fragmentIds = DecodeFragmentBitmap(meta.FragmentBitmap);
+            var directory = locator.ResolveIndexDirectory(meta, uuid);
 
             infos.Add(new IndexInfo
             {
@@ -101,7 +112,8 @@ internal static class IndexCatalog
                 ColumnNames = columnNames,
                 ColumnPaths = columnPaths,
                 FragmentIds = fragmentIds,
-                DirectoryPath = $"_indices/{uuid:D}",
+                DirectoryPath = directory.Path,
+                FileSystem = ReferenceEquals(directory.FileSystem, fs) ? null : directory.FileSystem,
                 BuiltFromVersion = datasetVersion,
             });
         }

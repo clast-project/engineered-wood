@@ -59,6 +59,26 @@ and exposes the read side via `LanceTable`.
   index proves they can't match.
 - **Index reads**: B-tree and bitmap secondary index files (read-only —
   we don't write indices yet).
+- **Base paths** (#963): a manifest's `base_paths` (a shallow clone's
+  source, imported files, a multi-base write) are followed. A data file,
+  deletion file or index with a `base_id` lies under that base:
+  `{base}/data/`, `{base}/_deletions/`, `{base}/_indices/` for a base with
+  `is_dataset_root`, the base directory itself otherwise (a deletion file
+  under such a base is refused, as lance refuses it). A base outside the
+  dataset is reached only through `LanceTableOptions.StorageResolver`;
+  an unregistered one throws `UnregisteredStorageLocationException` when
+  a file under it is read. A base under the dataset's own location needs
+  no registration.
+  - A base with a URI scheme is percent-decoded per segment; a rooted
+    path with no scheme is a local path, taken literally (pylance's own
+    local `shallow_clone` writes one). This follows lance 14.0.3's
+    `uri_to_url` / `Path::from_url_path`.
+  - A **relative** base is refused: lance resolves it against the reading
+    process's working directory, not the dataset. A `.` or `..` segment
+    outside a local path is refused (#963).
+  - Index discovery walks `_transactions/`, so a clone's inherited indices
+    (whose `CreateIndex` happened in the source) are not found: reads
+    stay correct but are not index-pruned.
 
 ### Writing
 
@@ -85,6 +105,10 @@ and exposes the read side via `LanceTable`.
   (`RetainVersions`, `DryRun`).
 
 Every commit path stamps `manifest.timestamp` for time travel.
+
+Every writer operation refuses a dataset whose manifest has `base_paths`
+(`NotSupportedException`): the writer would read existing files as
+`data/{path}` and drop `base_paths` from the manifest it commits.
 
 ## Type coverage
 

@@ -55,9 +55,19 @@ public sealed class IndexInfo
     /// <summary>
     /// Path of the index directory relative to the dataset root, e.g.
     /// <c>"_indices/{uuid}"</c>. Pass to <see cref="BTreeIndex.OpenAsync(IO.ITableFileSystem, string, CancellationToken)"/>
-    /// to read the index files.
+    /// to read the index files. An index whose metadata names another base
+    /// (<c>base_id</c>) and lies outside the dataset has its directory's path
+    /// in the file system the dataset's storage resolver gave for that base;
+    /// open it with <see cref="LanceTable.OpenBTreeIndexAsync"/> or
+    /// <see cref="LanceTable.OpenBitmapIndexAsync"/>, which know which.
     /// </summary>
     public required string DirectoryPath { get; init; }
+
+    /// <summary>
+    /// The file system holding <see cref="DirectoryPath"/> when it is not the
+    /// dataset's own (an index under another base); null for the dataset's.
+    /// </summary>
+    internal IO.ITableFileSystem? FileSystem { get; init; }
 
     /// <summary>
     /// The dataset version at which this index was built. Useful for
