@@ -128,12 +128,10 @@ public class LanceSchemaEvolutionTests
         }
     }
 
-    [Theory]
-    [InlineData("dropped_column_v21")]
-    [InlineData("dropped_column_v20")]
-    public async Task DroppedColumn_DeleteUpdateCompactUseFieldIds(string fixture)
+    [Fact]
+    public async Task DroppedColumn_DeleteUpdateCompactUseFieldIds()
     {
-        string path = CopyFixture(fixture);
+        string path = CopyFixture("dropped_column_v21");
         try
         {
             // By position, "b = 20" would test the dropped a column and delete nothing.
@@ -142,19 +140,49 @@ public class LanceSchemaEvolutionTests
                 new Dictionary<string, Expression> { ["b"] = new LiteralExpression(LiteralValue.Of(99L)) });
             Assert.Equal(1L, updated);
 
-            // EW writes only 2.1 files, which pylance refuses in a 2.0 dataset, so pylance checks the 2.1 one alone.
-            bool pylanceCanRead = fixture.EndsWith("v21", StringComparison.Ordinal);
             const string expected = "[{\"b\":10,\"c\":100},{\"b\":99,\"c\":300}]";
             await using (var table = await LanceTable.OpenAsync(path))
                 Assert.Equal(expected, await ReadJsonAsync(table));
-            if (pylanceCanRead) await AssertPylanceReadsAsync(path, expected);
+            await AssertPylanceReadsAsync(path, expected);
 
             // Compact rewrites the original fragment's survivors into a new file (with field ids [1, 2]), last.
             await LanceDatasetWriter.CompactAsync(path);
             const string compacted = "[{\"b\":99,\"c\":300},{\"b\":10,\"c\":100}]";
             await using (var table = await LanceTable.OpenAsync(path))
                 Assert.Equal(compacted, await ReadJsonAsync(table));
-            if (pylanceCanRead) await AssertPylanceReadsAsync(path, compacted);
+            await AssertPylanceReadsAsync(path, compacted);
+        }
+        finally
+        {
+            DeleteDirectory(path);
+        }
+    }
+
+    // EW writes only 2.1 and 2.2 files, which lance refuses in a 2.0 dataset (#996), so it writes no data files
+    // there until #1000. Delete writes only a deletion file, and still uses the field ids.
+    [Fact]
+    public async Task DroppedColumn_V20_DeleteWorks_DataFileWritesAreRefused()
+    {
+        string path = CopyFixture("dropped_column_v20");
+        try
+        {
+            await LanceDatasetWriter.DeleteAsync(path, Equal("b", LiteralValue.Of(20L)));
+            const string expected = "[{\"b\":10,\"c\":100},{\"b\":30,\"c\":300}]";
+            await AssertPylanceReadsAsync(path, expected);
+            string[] versions = Directory.GetFiles(Path.Combine(path, "_versions"));
+
+            var update = await Assert.ThrowsAsync<NotSupportedException>(async () =>
+                await LanceDatasetWriter.UpdateAsync(path, Equal("c", LiteralValue.Of(300L)),
+                    new Dictionary<string, Expression> { ["b"] = new LiteralExpression(LiteralValue.Of(99L)) }));
+            Assert.Contains("2.0 dataset", update.Message);
+            await Assert.ThrowsAsync<NotSupportedException>(async () => await LanceDatasetWriter.CompactAsync(path));
+            await Assert.ThrowsAsync<NotSupportedException>(async () => await LanceDatasetWriter.AppendAsync(path));
+
+            // Nothing was committed, and pylance still reads it.
+            Assert.Equal(versions, Directory.GetFiles(Path.Combine(path, "_versions")));
+            await using (var table = await LanceTable.OpenAsync(path))
+                Assert.Equal(expected, await ReadJsonAsync(table));
+            await AssertPylanceReadsAsync(path, expected);
         }
         finally
         {

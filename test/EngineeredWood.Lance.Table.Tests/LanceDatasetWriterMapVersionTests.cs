@@ -108,6 +108,42 @@ public class LanceDatasetWriterMapVersionTests
         }
     }
 
+    // Copilot on #999: a rewrite of a dataset declared 2.1 that has a Map would
+    // write 2.2 files under a 2.1 manifest, which lance refuses. Raising the
+    // manifest to 2.2 would leave the other fragments' 2.1 files mixed in, so
+    // the rewrite is refused before anything is written.
+    [Fact]
+    public async Task Rewrite_OfA2_1DatasetWithAMap_IsRefused()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-mapver-{Guid.NewGuid():N}");
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteColumnAsync("kvs", BuildMap(1));
+                await ds.FileWriter.WriteInt32ColumnAsync("id", new[] { 1, 2, 3 });
+                await ds.FinishAsync();
+            }
+            LanceBasePathsTests.RewriteManifests(path, m => m.DataFormat.Version = "2.1");
+            // Delete writes only a deletion file, so it is allowed, and it gives Compact work to do.
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>> { [0] = new[] { 0 } });
+            string[] versions = Directory.GetFiles(Path.Combine(path, "_versions"));
+
+            var ex = await Assert.ThrowsAsync<NotSupportedException>(async () =>
+                await LanceDatasetWriter.UpdateAsync(path,
+                    EngineeredWood.Expressions.Expressions.LessThan("id", LiteralValue.Of(3)),
+                    new Dictionary<string, Expression> { ["id"] = new LiteralExpression(LiteralValue.Of(10)) }));
+            Assert.Contains("Map", ex.Message);
+            await Assert.ThrowsAsync<NotSupportedException>(async () => await LanceDatasetWriter.CompactAsync(path));
+            Assert.Equal(versions, Directory.GetFiles(Path.Combine(path, "_versions")));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
     /// <summary>Three one-entry rows: {"k{first}": first}, {"k{first+1}": first+1}, ...</summary>
     private static MapArray BuildMap(int first)
     {

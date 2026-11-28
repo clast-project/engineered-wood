@@ -252,7 +252,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         LanceVersion version;
         if (mode == LanceWriteMode.Append)
         {
-            version = FileVersionFor(baseManifest!, schema: null);
+            version = FileVersionFor(baseManifest!, schema: null, datasetPath);
             if (fileVersion is { } requested && requested != version)
                 throw new ArgumentException(
                     $"Cannot append Lance v{requested} files to the dataset at '{datasetPath}', whose data "
@@ -1021,6 +1021,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
         lanceSchema.Fields.AddRange(manifest.Fields);
         var arrowSchema = EngineeredWood.Lance.Schema.LanceSchemaConverter.ToArrowSchema(lanceSchema);
+        // Before anything is written: refuses a dataset version EW can't write.
+        LanceVersion rewriteVersion = FileVersionFor(manifest, arrowSchema, datasetPath);
 
         // Validate that every assignment column exists in the schema.
         var nameToIdx = new Dictionary<string, int>(arrowSchema.FieldsList.Count, StringComparer.Ordinal);
@@ -1130,7 +1132,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         IReadOnlyList<LanceField> newFileFields;
         await using (var w = await EngineeredWood.Lance.LanceFileWriter
             .CreateAsync(newDataFilePath, cancellationToken,
-                version: FileVersionFor(manifest, arrowSchema)).ConfigureAwait(false))
+                version: rewriteVersion).ConfigureAwait(false))
         {
             for (int i = 0; i < arrowSchema.FieldsList.Count; i++)
             {
@@ -1304,6 +1306,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
         lanceSchema.Fields.AddRange(manifest.Fields);
         var arrowSchema = EngineeredWood.Lance.Schema.LanceSchemaConverter.ToArrowSchema(lanceSchema);
+        // Before anything is written: refuses a dataset version EW can't write.
+        LanceVersion rewriteVersion = FileVersionFor(manifest, arrowSchema, datasetPath);
 
         // Per-column slices accumulated across all source fragments; we
         // write them as a single new fragment at the end.
@@ -1378,7 +1382,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             IReadOnlyList<LanceField> newFileFields;
             await using (var w = await EngineeredWood.Lance.LanceFileWriter
                 .CreateAsync(newDataFilePath, cancellationToken,
-                    version: FileVersionFor(manifest, arrowSchema)).ConfigureAwait(false))
+                    version: rewriteVersion).ConfigureAwait(false))
             {
                 for (int i = 0; i < arrowSchema.FieldsList.Count; i++)
                     await w.WriteColumnAsync(
@@ -1504,23 +1508,50 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     }
 
     /// <summary>
-    /// The version for a data file written into an existing dataset: v2.2 when
-    /// the dataset's data-storage version is 2.2 or its schema has a Map column
-    /// (which needs v2.2, and whose columns are written in schema order, so the
-    /// writer can't move to v2.2 on reaching it), else v2.1.
+    /// The version for a data file written into an existing dataset. lance refuses
+    /// a dataset whose data files don't all share the manifest's
+    /// <c>data_format.version</c>, so that version is the file version, and a
+    /// version this writer can't produce is refused before anything is written:
+    /// 2.0 (#996; writing 2.0 files is #1000), a Map column in a 2.1 dataset
+    /// (Map needs 2.2), and anything newer than 2.2. A manifest without a data
+    /// format gets v2.1, or v2.2 for a Map schema, and the rewrite's manifest
+    /// then records that version.
     /// </summary>
-    private static LanceVersion FileVersionFor(LanceManifest manifest, Apache.Arrow.Schema? schema)
+    private static LanceVersion FileVersionFor(
+        LanceManifest manifest, Apache.Arrow.Schema? schema, string datasetPath)
     {
-        if (manifest.DataFormat?.Version == "2.2") return LanceVersion.V2_2;
         if (schema is null)
         {
             var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
             lanceSchema.Fields.AddRange(manifest.Fields);
             schema = EngineeredWood.Lance.Schema.LanceSchemaConverter.ToArrowSchema(lanceSchema);
         }
-        foreach (var field in schema.FieldsList)
-            if (HasMap(field.DataType)) return LanceVersion.V2_2;
-        return LanceVersion.V2_1;
+        bool hasMap = schema.FieldsList.Any(f => HasMap(f.DataType));
+
+        string? declared = manifest.DataFormat?.Version;
+        switch (declared)
+        {
+            case null or "":
+                return hasMap ? LanceVersion.V2_2 : LanceVersion.V2_1;
+            case "2.2":
+                return LanceVersion.V2_2;
+            case "2.1" when !hasMap:
+                return LanceVersion.V2_1;
+            case "2.1":
+                throw new NotSupportedException(
+                    $"Cannot write to the Lance dataset at '{datasetPath}': it is a 2.1 dataset with a Map "
+                    + "column, and Map columns need 2.2 data files, which lance refuses in a 2.1 dataset.");
+            case "2.0" or "0.3":
+                throw new NotSupportedException(
+                    $"Cannot write data files to the Lance dataset at '{datasetPath}': it is a Lance 2.0 dataset, "
+                    + "and LanceDatasetWriter writes only 2.1 and 2.2 files, which lance refuses in a 2.0 dataset "
+                    + "(https://github.com/clast-project/engineered-wood/issues/1000). Delete still works; "
+                    + "OverwriteAsync replaces the dataset with 2.1 or 2.2 files.");
+            default:
+                throw new NotSupportedException(
+                    $"Cannot write data files to the Lance dataset at '{datasetPath}': its data storage version "
+                    + $"is {declared}, and LanceDatasetWriter writes only 2.1 and 2.2 files.");
+        }
 
         static bool HasMap(IArrowType type) => type switch
         {
