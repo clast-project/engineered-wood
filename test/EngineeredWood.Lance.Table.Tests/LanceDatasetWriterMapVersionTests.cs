@@ -210,6 +210,53 @@ public class LanceDatasetWriterMapVersionTests
         }
     }
 
+    // Copilot on #999: with no data_format, Delete and Compact fell back to a
+    // hard-coded "2.1" while the files were v2.2, which lance refuses. They now
+    // record the version of the files.
+    [Fact]
+    public async Task MissingDataFormat_DeleteAndCompactRecordTheFilesVersion()
+    {
+        string path = NewDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path, fileVersion: LanceVersion.V2_2))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("id", new[] { 1, 2, 3 });
+                await ds.FinishAsync();
+            }
+            LanceBasePathsTests.RewriteManifests(path, m => m.DataFormat = null);
+
+            await LanceDatasetWriter.DeleteRowsAsync(path,
+                new Dictionary<ulong, IReadOnlyList<int>> { [0] = new[] { 0 } });
+            Assert.Equal("2.2", (await LatestManifestAsync(path)).DataFormat.Version);
+
+            await LanceDatasetWriter.CompactAsync(path);
+            Assert.Equal("2.2", (await LatestManifestAsync(path)).DataFormat.Version);
+            foreach (string file in Directory.GetFiles(Path.Combine(path, "data"), "*.lance"))
+            {
+                await using var reader = await LanceFileReader.OpenAsync(file);
+                Assert.Equal(LanceVersion.V2_2, reader.Version);
+            }
+
+            await using var table = await LanceTable.OpenAsync(path);
+            var ids = new List<int>();
+            await foreach (var batch in table.ReadAsync())
+                ids.AddRange(((Int32Array)batch.Column("id")).Values.ToArray());
+            Assert.Equal(new[] { 2, 3 }, ids);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    internal static async Task<EngineeredWood.Lance.Table.Proto.Manifest> LatestManifestAsync(string path)
+    {
+        var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(path);
+        var entry = await EngineeredWood.Lance.Table.Manifest.ManifestPathResolver.ResolveLatestAsync(fs, default);
+        return await EngineeredWood.Lance.Table.Manifest.ManifestReader.ReadAsync(fs, entry.Path, default);
+    }
+
     private static string NewDatasetPath() =>
         Path.Combine(Path.GetTempPath(), $"ew-lance-mapver-{Guid.NewGuid():N}");
 

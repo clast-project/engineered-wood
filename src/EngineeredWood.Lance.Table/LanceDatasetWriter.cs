@@ -786,11 +786,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         {
             Version = newVersion,
             TransactionFile = txnFileName,
-            DataFormat = baseManifest.DataFormat?.Clone() ?? new LanceManifest.Types.DataStorageFormat
-            {
-                FileFormat = "lance",
-                Version = "2.1",
-            },
+            DataFormat = DataFormatFor(baseManifest, written: null, datasetPath),
         };
         newManifest.Fields.AddRange(baseManifest.Fields);
         newManifest.Fragments.AddRange(newFragments);
@@ -1244,11 +1240,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         {
             Version = newVersion,
             TransactionFile = txnFileName,
-            DataFormat = manifest.DataFormat?.Clone() ?? new LanceManifest.Types.DataStorageFormat
-            {
-                FileFormat = "lance",
-                Version = $"{newFileVersion.Major}.{newFileVersion.Minor}",
-            },
+            DataFormat = DataFormatFor(manifest, newFileVersion, datasetPath),
         };
         newManifest.Fields.AddRange(manifest.Fields);
         newManifest.Fragments.AddRange(newFragmentsList);
@@ -1453,11 +1445,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         {
             Version = newVersion,
             TransactionFile = txnFileName,
-            DataFormat = manifest.DataFormat?.Clone() ?? new LanceManifest.Types.DataStorageFormat
-            {
-                FileFormat = "lance",
-                Version = "2.1",
-            },
+            DataFormat = DataFormatFor(manifest, rewriteVersion, datasetPath),
         };
         newManifest.Fields.AddRange(manifest.Fields);
         newManifest.Fragments.AddRange(newFragments);
@@ -1603,6 +1591,24 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                         + $"and its data files mix versions {inferred} and {version}.");
             }
         return inferred;
+    }
+
+    /// <summary>
+    /// The <c>data_format</c> for a manifest that keeps <paramref name="manifest"/>'s
+    /// fragments: the base's own when it has one; otherwise the version the
+    /// operation <paramref name="written"/> (which <see cref="FileVersionFor"/>
+    /// matched to the existing files), or the one inferred from them; or none,
+    /// as in the base, when there is neither. Never a guess, since lance refuses
+    /// a manifest whose version differs from its data files'.
+    /// </summary>
+    private static LanceManifest.Types.DataStorageFormat? DataFormatFor(
+        LanceManifest manifest, LanceVersion? written, string datasetPath)
+    {
+        if (manifest.DataFormat is { Version.Length: > 0 } format) return format.Clone();
+        string? version = written is { } w ? $"{w.Major}.{w.Minor}" : DatasetVersion(manifest, datasetPath);
+        return version is null
+            ? null
+            : new LanceManifest.Types.DataStorageFormat { FileFormat = "lance", Version = version };
     }
 
     /// <summary>Reads <paramref name="fragment"/>'s deletion file, wherever its base puts it.</summary>

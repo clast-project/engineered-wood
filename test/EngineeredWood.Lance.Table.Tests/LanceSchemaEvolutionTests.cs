@@ -201,6 +201,13 @@ public class LanceSchemaEvolutionTests
             var ex = await Assert.ThrowsAsync<NotSupportedException>(async () =>
                 await LanceDatasetWriter.AppendAsync(path));
             Assert.Contains("2.0 dataset", ex.Message);
+
+            // Delete is still allowed, and records the files' own version, not a guessed 2.1.
+            await LanceDatasetWriter.DeleteAsync(path, Equal("b", LiteralValue.Of(20L)));
+            var manifest = await LanceDatasetWriterMapVersionTests.LatestManifestAsync(path);
+            var file = manifest.Fragments[0].Files[0];
+            Assert.Equal($"{file.FileMajorVersion}.{file.FileMinorVersion}", manifest.DataFormat.Version);
+            await AssertPylanceReadsAsync(path, "[{\"b\":10,\"c\":100},{\"b\":30,\"c\":300}]");
         }
         finally
         {
