@@ -197,6 +197,17 @@ def write_schema_evolution_fixtures():
     evolve("added_null_column_v21", flat(), "2.1",
            lambda ds: ds.add_columns(pa.schema([pa.field("n", pa.int64())])))
 
+    # A list whose child is named "element" (as Parquet-derived schemas name it), not pyarrow's "item": a
+    # rewrite must keep the name (#998).
+    target = os.path.join(THIS_DIR, "list_element_v21")
+    if os.path.exists(target):
+        shutil.rmtree(target)
+    lance.write_dataset(pa.table({
+        "k": pa.array([1, 2, 3], type=pa.int64()),
+        "l": pa.array([[1], [2, 3], []], type=pa.list_(pa.field("element", pa.int64()))),
+    }), target, data_storage_version="2.1")
+    print(f"  list_element_v21: schema {lance.dataset(target).schema}")
+
 
 def write_base_paths_fixtures(version="2.1"):
     """Datasets whose manifests have base_paths (#963). Each base path

@@ -57,6 +57,7 @@ internal sealed class DataFileColumns
                     $"The data file of fragment {fragmentId} lists {file.Fields.Count} fields but "
                     + $"{file.ColumnIndices.Count} column indices.");
             _columnOfField = new Dictionary<int, int>(file.Fields.Count);
+            var usedColumns = new HashSet<int>();
             for (int i = 0; i < file.Fields.Count; i++)
             {
                 // A negative field id is a tombstone (a field rewritten into another file of the fragment); a
@@ -65,6 +66,11 @@ internal sealed class DataFileColumns
                 if (_columnOfField.ContainsKey(file.Fields[i]))
                     throw new LanceTableFormatException(
                         $"The data file of fragment {fragmentId} lists field {file.Fields[i]} twice.");
+                // table.proto forbids two fields sharing a column; read through, both would get its values.
+                if (!usedColumns.Add(file.ColumnIndices[i]))
+                    throw new LanceTableFormatException(
+                        $"The data file of fragment {fragmentId} maps more than one field to column "
+                        + $"{file.ColumnIndices[i]}.");
                 _columnOfField[file.Fields[i]] = file.ColumnIndices[i];
             }
         }
@@ -84,7 +90,7 @@ internal sealed class DataFileColumns
     {
         LanceField root = _roots[topLevelIndex];
         if (_columnOfField is null)
-            return ReadThroughFileSchemaAsync(root, cancellationToken);
+            return ReadThroughFileSchemaAsync(root, arrowField, cancellationToken);
 
         var needed = new List<LanceField>();
         CollectColumnFields(root, needed);
@@ -113,8 +119,11 @@ internal sealed class DataFileColumns
         return _reader.ReadFieldAtColumnsAsync(arrowField, start, needed.Count, cancellationToken);
     }
 
-    /// <summary>Reads a legacy EW data file's field by its id in the file's own schema.</summary>
-    private Task<IArrowArray> ReadThroughFileSchemaAsync(LanceField root, CancellationToken cancellationToken)
+    /// <summary>Reads a legacy EW data file's field from the columns its id has in the file's own schema. It is
+    /// decoded as the manifest's <paramref name="arrowField"/>, so a field renamed since the file was written reads
+    /// under its new names.</summary>
+    private Task<IArrowArray> ReadThroughFileSchemaAsync(
+        LanceField root, Field arrowField, CancellationToken cancellationToken)
     {
         var (fileRoots, fileChildren) = BuildTree(_reader.ProtoSchema.Fields);
         for (int i = 0; i < fileRoots.Count; i++)
@@ -129,7 +138,8 @@ internal sealed class DataFileColumns
                     $"Field '{root.Name}' of fragment {_fragmentId} has fields [{string.Join(", ", expected)}] in "
                     + $"the manifest but [{string.Join(", ", actual)}] in its data file, which lists no column "
                     + "indices to map them by.");
-            return _reader.ReadColumnAsync(i, cancellationToken);
+            var (start, count) = _reader.GetFieldColumnRange(i);
+            return _reader.ReadFieldAtColumnsAsync(arrowField, start, count, cancellationToken);
         }
         throw new NotSupportedException(
             $"Field '{root.Name}' (id {root.Id}) is not in the data file of fragment {_fragmentId}.");

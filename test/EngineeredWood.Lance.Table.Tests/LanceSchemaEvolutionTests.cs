@@ -229,6 +229,102 @@ public class LanceSchemaEvolutionTests
         }
     }
 
+    [Fact]
+    public async Task DuplicateColumnIndices_AreRefused()
+    {
+        // table.proto forbids two fields sharing a column; mapped through, b and c would both read column 1.
+        string path = CopyFixture("dropped_column_v21");
+        try
+        {
+            LanceBasePathsTests.RewriteManifests(path, m =>
+            {
+                foreach (var file in m.Fragments.SelectMany(f => f.Files))
+                {
+                    file.ColumnIndices.Clear();
+                    file.ColumnIndices.AddRange(new[] { 0, 1, 1 });
+                }
+            });
+
+            await using (var table = await LanceTable.OpenAsync(path))
+            {
+                var ex = await Assert.ThrowsAsync<LanceTableFormatException>(() => ReadJsonAsync(table));
+                Assert.Contains("more than one field to column 1", ex.Message);
+            }
+            await Assert.ThrowsAsync<LanceTableFormatException>(async () =>
+                await LanceDatasetWriter.DeleteAsync(path, Equal("b", LiteralValue.Of(20L))));
+        }
+        finally
+        {
+            DeleteDirectory(path);
+        }
+    }
+
+    [Fact]
+    public async Task LegacyEwStructLayout_ReadsAndRewritesUnderRenamedFields()
+    {
+        // A rename changes only the manifest, so the legacy file's own schema still says rec.id and c.
+        string path = CopyFixture("ew_legacy_struct_v21");
+        try
+        {
+            LanceBasePathsTests.RewriteManifests(path, m =>
+            {
+                foreach (var f in m.Fields)
+                {
+                    if (f.Name == "id") f.Name = "ident";
+                    else if (f.Name == "c") f.Name = "c2";
+                }
+            });
+
+            const string renamed =
+                "[{\"a\":10,\"rec\":{\"ident\":1,\"name\":\"p\"},\"c2\":100},"
+                + "{\"a\":20,\"rec\":{\"ident\":2,\"name\":\"q\"},\"c2\":200},"
+                + "{\"a\":30,\"rec\":{\"ident\":3,\"name\":\"r\"},\"c2\":300}]";
+            await using (var table = await LanceTable.OpenAsync(path))
+                Assert.Equal(renamed, await ReadJsonAsync(table));
+
+            // The rewrite writes the struct as read; its child names must match the manifest's.
+            var (updated, _) = await LanceDatasetWriter.UpdateAsync(path, Equal("a", LiteralValue.Of(20L)),
+                new Dictionary<string, Expression> { ["c2"] = new LiteralExpression(LiteralValue.Of(222L)) });
+            Assert.Equal(1L, updated);
+            await using (var table = await LanceTable.OpenAsync(path))
+                Assert.Equal(
+                    "[{\"a\":10,\"rec\":{\"ident\":1,\"name\":\"p\"},\"c2\":100},"
+                    + "{\"a\":30,\"rec\":{\"ident\":3,\"name\":\"r\"},\"c2\":300},"
+                    + "{\"a\":20,\"rec\":{\"ident\":2,\"name\":\"q\"},\"c2\":222}]",
+                    await ReadJsonAsync(table));
+        }
+        finally
+        {
+            DeleteDirectory(path);
+        }
+    }
+
+    [Fact]
+    public async Task ListChildNamedElement_SurvivesARewrite()
+    {
+        // pylance list<element: int64>; EW's file writer used to name every list child "item".
+        string path = CopyFixture("list_element_v21");
+        try
+        {
+            var (updated, _) = await LanceDatasetWriter.UpdateAsync(path, Equal("k", LiteralValue.Of(2L)),
+                new Dictionary<string, Expression> { ["k"] = new LiteralExpression(LiteralValue.Of(22L)) });
+            Assert.Equal(1L, updated);
+
+            const string expected = "[{\"k\":1,\"l\":[1]},{\"k\":3,\"l\":[]},{\"k\":22,\"l\":[2,3]}]";
+            await using (var table = await LanceTable.OpenAsync(path))
+            {
+                Assert.Equal("element",
+                    ((Apache.Arrow.Types.ListType)table.Schema.GetFieldByName("l").DataType).ValueField.Name);
+                Assert.Equal(expected, await ReadJsonAsync(table));
+            }
+            await AssertPylanceReadsAsync(path, expected);
+        }
+        finally
+        {
+            DeleteDirectory(path);
+        }
+    }
+
     private const string ReorderedRows = "[{\"id\":1,\"v\":10},{\"id\":2,\"v\":20},{\"id\":3,\"v\":30}]";
 
     /// <summary>A dataset whose file holds v (field 0) then id (field 1), and whose manifest lists id first.</summary>

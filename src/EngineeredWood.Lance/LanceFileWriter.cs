@@ -2119,7 +2119,15 @@ public sealed class LanceFileWriter : IAsyncDisposable
             repetitionIndexDepth: 1)
             .ConfigureAwait(false);
 
-        RegisterListColumn(name, parentLogical, innerLogical, valueEncoding, new[] { page }, parentId);
+        // Keep the Arrow list's child name ("item" from pyarrow, "element" from Parquet-derived schemas):
+        // a dataset rewrite checks the file's fields against the manifest's by name (#998).
+        string itemName = listType switch
+        {
+            Apache.Arrow.Types.ListType lt => lt.ValueField.Name,
+            LargeListType llt => llt.ValueField.Name,
+            _ => "item",
+        };
+        RegisterListColumn(name, parentLogical, innerLogical, valueEncoding, new[] { page }, parentId, itemName);
     }
 
     /// <summary>
@@ -2911,7 +2919,8 @@ public sealed class LanceFileWriter : IAsyncDisposable
         string name, string parentLogical, string innerLogical,
         CompressiveEncoding valueEncoding,
         IEnumerable<ColumnMetadata.Types.Page> pages,
-        int parentId = -1)
+        int parentId = -1,
+        string itemName = "item")
     {
         var columnEncodingProto = new ColumnEncoding { Values = new Empty() };
         var columnAny = new Any
@@ -2944,7 +2953,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
             : Proto.Encoding.Plain;
         _fields.Add(new Proto.Field
         {
-            Name = "item",
+            Name = itemName,
             Id = listFieldId + 1,
             ParentId = listFieldId,
             LogicalType = innerLogical,

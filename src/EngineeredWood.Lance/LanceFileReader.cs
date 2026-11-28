@@ -436,6 +436,14 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             .ConfigureAwait(false);
     }
 
+    /// <summary>The physical columns <c>[StartColumn, StartColumn + ColumnCount)</c> that this file's own
+    /// top-level field <paramref name="fieldIndex"/> spans.</summary>
+    internal (int StartColumn, int ColumnCount) GetFieldColumnRange(int fieldIndex)
+    {
+        var range = _fieldColumnRanges[fieldIndex];
+        return (range.StartColumn, range.ColumnCount);
+    }
+
     /// <summary>
     /// Reads <paramref name="arrowField"/> from the physical columns
     /// <c>[startColumn, startColumn + columnCount)</c>, whatever this file's own
