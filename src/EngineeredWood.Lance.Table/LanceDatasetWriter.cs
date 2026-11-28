@@ -41,6 +41,12 @@ namespace EngineeredWood.Lance.Table;
 ///   data files remain on disk for vacuum to clean up. Schema can change.</item>
 /// </list>
 ///
+/// <para><b>Datasets with <c>base_paths</c></b> (a shallow clone, imported files, a multi-base write; #990): every
+/// operation carries the bases into the manifest it commits and writes its own files under the dataset root, as lance
+/// does when a writer names no target base. Delete, update and compact read existing files where their bases put them;
+/// pass a <see cref="LanceWriteOptions"/> overload a <see cref="LanceWriteOptions.StorageResolver"/> to reach a base
+/// outside the dataset. Vacuum deletes only under the root.</para>
+///
 /// <para><b>Multi-fragment</b>: call <see cref="NewFragmentAsync"/>
 /// between batches of column writes to close the current data file and
 /// start a new fragment in the same transaction. All fragments produced
@@ -66,6 +72,9 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     private const ushort ManifestMajorVersion = 0;
     private const ushort ManifestMinorVersion = 2;
 
+    // lance-table 14.0.3 feature_flags.rs FLAG_BASE_PATHS.
+    private const ulong FlagBasePaths = 16;
+
     private readonly string _datasetPath;
     private readonly LanceWriteMode _mode;
     private readonly LanceCompressionScheme _compression;
@@ -75,6 +84,9 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     // For Overwrite: the latest version we read (so the new manifest
     // bumps to readVersion+1 instead of always 1). 0 if no prior dataset.
     private readonly ulong _readVersion;
+    // The base_paths of the manifest this session builds on (Append: the base manifest; Overwrite: the latest
+    // version), carried into the new manifest as lance carries them (#990). Empty for Create.
+    private readonly IReadOnlyList<BasePath> _basePaths;
 
     private LanceFileWriter _currentFileWriter;
     private string _currentDataFileName;
@@ -96,7 +108,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
 
     private LanceDatasetWriter(
         string datasetPath, LanceWriteMode mode, LanceCompressionScheme compression,
-        LanceManifest? baseManifest, ulong readVersion,
+        LanceManifest? baseManifest, ulong readVersion, IReadOnlyList<BasePath> basePaths,
         LanceFileWriter fileWriter, string dataFileName)
     {
         _datasetPath = datasetPath;
@@ -104,6 +116,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         _compression = compression;
         _baseManifest = baseManifest;
         _readVersion = readVersion;
+        _basePaths = basePaths;
         _currentFileWriter = fileWriter;
         _currentDataFileName = dataFileName;
     }
@@ -151,6 +164,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
 
         LanceManifest? baseManifest = null;
         ulong readVersion = 0;
+        IReadOnlyList<BasePath> basePaths = System.Array.Empty<BasePath>();
 
         if (mode == LanceWriteMode.Create)
         {
@@ -180,8 +194,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 .ConfigureAwait(false);
             baseManifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
                 .ConfigureAwait(false);
-            ThrowIfBasePaths(baseManifest, datasetPath, "append to");
             readVersion = baseManifest.Version;
+            basePaths = baseManifest.BasePaths;
         }
         else // Overwrite
         {
@@ -195,8 +209,10 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 {
                     var latest = await ManifestReader.ReadAsync(fs, entries[0].Path, cancellationToken)
                         .ConfigureAwait(false);
-                    ThrowIfBasePaths(latest, datasetPath, "overwrite");
                     readVersion = latest.Version;
+                    // lance keeps the bases on an overwrite (measured, pylance 14.0.3, overwrite of a shallow
+                    // clone): older versions still name them, and so may an index.
+                    basePaths = latest.BasePaths;
                 }
             }
             else if (!Directory.Exists(datasetPath))
@@ -215,7 +231,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             dataFilePath, cancellationToken, compression).ConfigureAwait(false);
 
         return new LanceDatasetWriter(
-            datasetPath, mode, compression, baseManifest, readVersion,
+            datasetPath, mode, compression, baseManifest, readVersion, basePaths,
             fileWriter, dataFileName);
     }
 
@@ -308,18 +324,20 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     }
 
     /// <summary>
-    /// Refuses to write a dataset whose manifest has <c>base_paths</c> (a shallow clone, imported files, a
-    /// multi-base write). This writer reads existing files as <c>data/{path}</c> and builds each new manifest without
-    /// <c>base_paths</c>, so on such a dataset it would read the wrong files and commit fragments naming a base the
-    /// manifest no longer lists. Reading such a dataset is supported (<see cref="LanceTable"/>).
+    /// Carries <paramref name="basePaths"/> (the manifest's the operation read) into <paramref name="manifest"/>, as
+    /// lance does on every commit (#990). The fragments it carries keep their <c>base_id</c>s, so their files stay
+    /// where they are; every file this writer creates goes under the dataset root, with no <c>base_id</c>. A manifest
+    /// with bases needs <c>FLAG_BASE_PATHS</c> (lance-table 14.0.3 <c>apply_feature_flags</c>), so a reader that
+    /// does not know them refuses the dataset rather than read the wrong files.
     /// </summary>
-    private static void ThrowIfBasePaths(LanceManifest manifest, string datasetPath, string operation)
+    private static void CarryBasePaths(IReadOnlyList<BasePath> basePaths, LanceManifest manifest)
     {
-        if (manifest.BasePaths.Count > 0)
-            throw new NotSupportedException(
-                $"Cannot {operation} the Lance dataset at '{datasetPath}': its manifest (version {manifest.Version}) "
-                + $"has {manifest.BasePaths.Count} base path(s) (a shallow clone, imported files or a multi-base "
-                + "write), and LanceDatasetWriter does not yet write such datasets. They can be read with LanceTable.");
+        if (basePaths.Count == 0)
+            return;
+        foreach (var basePath in basePaths)
+            manifest.BasePaths.Add(basePath.Clone());
+        manifest.ReaderFeatureFlags |= FlagBasePaths;
+        manifest.WriterFeatureFlags |= FlagBasePaths;
     }
 
     /// <summary>
@@ -329,7 +347,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// version, and "LANC" magic) and write it to
     /// <c>_versions/{u64::MAX - version}.manifest</c>. Used by both the
     /// regular write path and out-of-band ops like
-    /// <see cref="DeleteRowsAsync"/>.
+    /// <see cref="DeleteRowsAsync(string, IReadOnlyDictionary{ulong, IReadOnlyList{int}}, CancellationToken)"/>.
     /// </summary>
     private static async Task WriteManifestFileAsync(
         string datasetPath, LanceManifest manifest, byte[] transactionBytes,
@@ -451,6 +469,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         foreach (var f in manifestFields)
             manifest.Fields.Add(f);
         manifest.Fragments.AddRange(newFragments);
+        CarryBasePaths(_basePaths, manifest);
         return manifest;
     }
 
@@ -544,10 +563,33 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// shape; switching to Roaring bitmaps for dense deletes is a
     /// follow-up.</para>
     /// </summary>
-    public static async ValueTask<long> DeleteRowsAsync(
+    public static ValueTask<long> DeleteRowsAsync(
         string datasetPath,
         IReadOnlyDictionary<ulong, IReadOnlyList<int>> deletedOffsetsByFragment,
         CancellationToken cancellationToken = default)
+        => DeleteRowsCoreAsync(datasetPath, deletedOffsetsByFragment, resolver: null, cancellationToken);
+
+    /// <inheritdoc cref="DeleteRowsAsync(string, IReadOnlyDictionary{ulong, IReadOnlyList{int}}, CancellationToken)"/>
+    /// <param name="datasetPath">The dataset.</param>
+    /// <param name="deletedOffsetsByFragment">The row offsets to delete, by fragment id.</param>
+    /// <param name="options">Reaches an existing deletion file under another base
+    /// (<see cref="LanceWriteOptions.StorageResolver"/>).</param>
+    /// <param name="cancellationToken">Cancels the operation.</param>
+    public static ValueTask<long> DeleteRowsAsync(
+        string datasetPath,
+        IReadOnlyDictionary<ulong, IReadOnlyList<int>> deletedOffsetsByFragment,
+        LanceWriteOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        if (options is null) throw new ArgumentNullException(nameof(options));
+        return DeleteRowsCoreAsync(datasetPath, deletedOffsetsByFragment, options.StorageResolver, cancellationToken);
+    }
+
+    private static async ValueTask<long> DeleteRowsCoreAsync(
+        string datasetPath,
+        IReadOnlyDictionary<ulong, IReadOnlyList<int>> deletedOffsetsByFragment,
+        StorageResolver? resolver,
+        CancellationToken cancellationToken)
     {
         if (datasetPath is null) throw new ArgumentNullException(nameof(datasetPath));
         if (deletedOffsetsByFragment is null)
@@ -559,12 +601,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
 
         // Read the current manifest to figure out what version we're
         // building on top of and what fragments exist.
-        var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(datasetPath);
-        var entry = await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
+        var (_, baseManifest, locator) = await OpenLatestAsync(datasetPath, resolver, cancellationToken)
             .ConfigureAwait(false);
-        var baseManifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
-            .ConfigureAwait(false);
-        ThrowIfBasePaths(baseManifest, datasetPath, "delete rows from");
         ulong readVersion = baseManifest.Version;
 
         // Filter out empty work and validate fragment ids upfront.
@@ -584,8 +622,6 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                     nameof(deletedOffsetsByFragment));
         }
 
-        Directory.CreateDirectory(Path.Combine(datasetPath, "_deletions"));
-
         ulong newVersion = readVersion + 1;
         // The DeletionFile.id field is opaque per the proto comment ("used
         // to differentiate this file from others written by concurrent
@@ -594,24 +630,20 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         // manifest filename level first anyway.
         ulong newDeletionId = newVersion;
 
-        // Build the new fragments list — unaffected fragments cloned
-        // verbatim, affected ones get a fresh deletion_file reference.
-        var newFragments = new List<DataFragment>(baseManifest.Fragments.Count);
+        // Merge each affected fragment's offsets with its existing deletion
+        // mask. Every existing mask is read before any file is written, so a
+        // mask that cannot be read (one under a base the resolver does not
+        // reach, say) refuses the operation with the dataset unchanged.
+        var mergedByFragment = new Dictionary<ulong, HashSet<int>>(work.Count);
         foreach (var oldFrag in baseManifest.Fragments)
         {
             if (!work.TryGetValue(oldFrag.Id, out var newOffsetsList))
-            {
-                newFragments.Add(oldFrag.Clone());
                 continue;
-            }
 
-            // Validate per-fragment offsets and merge with any existing
-            // deletion mask.
             var merged = new HashSet<int>();
             if (oldFrag.DeletionFile is not null && oldFrag.DeletionFile.NumDeletedRows > 0)
             {
-                var existing = await DeletionFileReader.ReadAsync(
-                    fs, oldFrag.Id, oldFrag.DeletionFile, cancellationToken)
+                var existing = await ReadDeletionMaskAsync(locator, oldFrag, cancellationToken)
                     .ConfigureAwait(false);
                 foreach (int off in existing.DeletedOffsets)
                     merged.Add(off);
@@ -626,9 +658,26 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                         $"(physical_rows={physicalRows}).");
                 merged.Add(off);
             }
+            mergedByFragment[oldFrag.Id] = merged;
+        }
 
-            // Write the deletion file. Path format matches the reader's
-            // expectation: _deletions/{fragmentId}-{readVersion}-{id}.arrow.
+        Directory.CreateDirectory(Path.Combine(datasetPath, "_deletions"));
+
+        // Build the new fragments list — unaffected fragments cloned
+        // verbatim, affected ones get a fresh deletion_file reference.
+        var newFragments = new List<DataFragment>(baseManifest.Fragments.Count);
+        foreach (var oldFrag in baseManifest.Fragments)
+        {
+            if (!mergedByFragment.TryGetValue(oldFrag.Id, out var merged))
+            {
+                newFragments.Add(oldFrag.Clone());
+                continue;
+            }
+
+            // Write the deletion file under the dataset root (no base_id),
+            // wherever the fragment's previous one was. Path format matches
+            // the reader's expectation:
+            // _deletions/{fragmentId}-{readVersion}-{id}.arrow.
             string deletionFileName =
                 $"{oldFrag.Id}-{readVersion}-{newDeletionId}.arrow";
             string deletionFilePath = Path.Combine(
@@ -673,6 +722,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         };
         newManifest.Fields.AddRange(baseManifest.Fields);
         newManifest.Fragments.AddRange(newFragments);
+        CarryBasePaths(baseManifest.BasePaths, newManifest);
 
         await WriteManifestFileAsync(datasetPath, newManifest, transactionBytes, cancellationToken)
             .ConfigureAwait(false);
@@ -685,7 +735,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// at <paramref name="datasetPath"/>. For each fragment, reads the
     /// columns the predicate references, evaluates it, and collects the
     /// row offsets where it returns true; those offsets are then written
-    /// out via <see cref="DeleteRowsAsync"/>. Returns the new version
+    /// out via <see cref="DeleteRowsAsync(string, IReadOnlyDictionary{ulong, IReadOnlyList{int}}, CancellationToken)"/>. Returns the new version
     /// number, or the current version when no rows match (no-op).
     ///
     /// <para>Rows already covered by an existing deletion file are
@@ -694,9 +744,28 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// Predicate, CancellationToken)"/>: a null result counts as
     /// not-true and the row stays.</para>
     /// </summary>
-    public static async ValueTask<long> DeleteAsync(
+    public static ValueTask<long> DeleteAsync(
         string datasetPath, Predicate predicate,
         CancellationToken cancellationToken = default)
+        => DeleteCoreAsync(datasetPath, predicate, resolver: null, cancellationToken);
+
+    /// <inheritdoc cref="DeleteAsync(string, Predicate, CancellationToken)"/>
+    /// <param name="datasetPath">The dataset.</param>
+    /// <param name="predicate">The rows to delete.</param>
+    /// <param name="options">Reaches existing data and deletion files under other bases
+    /// (<see cref="LanceWriteOptions.StorageResolver"/>).</param>
+    /// <param name="cancellationToken">Cancels the operation.</param>
+    public static ValueTask<long> DeleteAsync(
+        string datasetPath, Predicate predicate, LanceWriteOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        if (options is null) throw new ArgumentNullException(nameof(options));
+        return DeleteCoreAsync(datasetPath, predicate, options.StorageResolver, cancellationToken);
+    }
+
+    private static async ValueTask<long> DeleteCoreAsync(
+        string datasetPath, Predicate predicate, StorageResolver? resolver,
+        CancellationToken cancellationToken)
     {
         if (datasetPath is null) throw new ArgumentNullException(nameof(datasetPath));
         if (predicate is null) throw new ArgumentNullException(nameof(predicate));
@@ -706,12 +775,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 $"Path '{datasetPath}' does not contain a Lance dataset.");
 
         // Read the latest manifest + Arrow schema.
-        var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(datasetPath);
-        var entry = await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
+        var (_, manifest, locator) = await OpenLatestAsync(datasetPath, resolver, cancellationToken)
             .ConfigureAwait(false);
-        var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
-            .ConfigureAwait(false);
-        ThrowIfBasePaths(manifest, datasetPath, "delete from");
 
         var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
         lanceSchema.Fields.AddRange(manifest.Fields);
@@ -741,8 +806,9 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         foreach (var fragment in manifest.Fragments)
         {
             DataFile file = fragment.Files[0];
-            string relPath = "data/" + file.Path;
-            await using IRandomAccessFile raf = await fs.OpenReadAsync(relPath, cancellationToken)
+            var dataFile = locator.ResolveDataFile(fragment, file);
+            await using IRandomAccessFile raf = await dataFile.FileSystem
+                .OpenReadAsync(dataFile.Path, cancellationToken)
                 .ConfigureAwait(false);
             await using var reader = await EngineeredWood.Lance.LanceFileReader
                 .OpenAsync(raf, ownsReader: false, cancellationToken)
@@ -755,8 +821,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             DeletionMask? existing = null;
             if (fragment.DeletionFile is not null && fragment.DeletionFile.NumDeletedRows > 0)
             {
-                existing = await DeletionFileReader.ReadAsync(
-                    fs, fragment.Id, fragment.DeletionFile, cancellationToken)
+                existing = await ReadDeletionMaskAsync(locator, fragment, cancellationToken)
                     .ConfigureAwait(false);
             }
 
@@ -783,7 +848,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         if (perFragmentDeletes.Count == 0)
             return (long)manifest.Version;
 
-        return await DeleteRowsAsync(datasetPath, perFragmentDeletes, cancellationToken)
+        return await DeleteRowsCoreAsync(datasetPath, perFragmentDeletes, resolver, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -857,10 +922,34 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// raises <see cref="NotSupportedException"/> rather than being written
     /// through unfiltered.</para>
     /// </summary>
-    public static async ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
+    public static ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
         string datasetPath, Predicate predicate,
         IReadOnlyDictionary<string, Expression> assignments,
         CancellationToken cancellationToken = default)
+        => UpdateCoreAsync(datasetPath, predicate, assignments, resolver: null, cancellationToken);
+
+    /// <inheritdoc cref="UpdateAsync(string, Predicate, IReadOnlyDictionary{string, Expression}, CancellationToken)"/>
+    /// <param name="datasetPath">The dataset.</param>
+    /// <param name="predicate">The rows to update.</param>
+    /// <param name="assignments">The new value of each assigned column.</param>
+    /// <param name="options">Reaches existing data and deletion files under other bases
+    /// (<see cref="LanceWriteOptions.StorageResolver"/>).</param>
+    /// <param name="cancellationToken">Cancels the operation.</param>
+    public static ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
+        string datasetPath, Predicate predicate,
+        IReadOnlyDictionary<string, Expression> assignments,
+        LanceWriteOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        if (options is null) throw new ArgumentNullException(nameof(options));
+        return UpdateCoreAsync(datasetPath, predicate, assignments, options.StorageResolver, cancellationToken);
+    }
+
+    private static async ValueTask<(long RowsUpdated, long Version)> UpdateCoreAsync(
+        string datasetPath, Predicate predicate,
+        IReadOnlyDictionary<string, Expression> assignments,
+        StorageResolver? resolver,
+        CancellationToken cancellationToken)
     {
         if (datasetPath is null) throw new ArgumentNullException(nameof(datasetPath));
         if (predicate is null) throw new ArgumentNullException(nameof(predicate));
@@ -873,12 +962,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             throw new InvalidOperationException(
                 $"Path '{datasetPath}' does not contain a Lance dataset.");
 
-        var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(datasetPath);
-        var entry = await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
+        var (_, manifest, locator) = await OpenLatestAsync(datasetPath, resolver, cancellationToken)
             .ConfigureAwait(false);
-        var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
-            .ConfigureAwait(false);
-        ThrowIfBasePaths(manifest, datasetPath, "update");
 
         var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
         lanceSchema.Fields.AddRange(manifest.Fields);
@@ -899,6 +984,10 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
 
         var evaluator = new ArrowRowEvaluator();
         var perFragmentDeletes = new Dictionary<ulong, List<int>>();
+        // The existing deletion masks of the fragments the update touches, read
+        // in the first pass so that nothing is written before every read has
+        // succeeded.
+        var existingMasks = new Dictionary<ulong, DeletionMask>();
         var perColumnSlices = new List<IArrowArray>[arrowSchema.FieldsList.Count];
         for (int i = 0; i < perColumnSlices.Length; i++)
             perColumnSlices[i] = new List<IArrowArray>();
@@ -907,8 +996,9 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         foreach (var fragment in manifest.Fragments)
         {
             DataFile file = fragment.Files[0];
-            string relPath = "data/" + file.Path;
-            await using IRandomAccessFile raf = await fs.OpenReadAsync(relPath, cancellationToken)
+            var dataFile = locator.ResolveDataFile(fragment, file);
+            await using IRandomAccessFile raf = await dataFile.FileSystem
+                .OpenReadAsync(dataFile.Path, cancellationToken)
                 .ConfigureAwait(false);
             await using var reader = await EngineeredWood.Lance.LanceFileReader
                 .OpenAsync(raf, ownsReader: false, cancellationToken)
@@ -924,8 +1014,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             DeletionMask? existing = null;
             if (fragment.DeletionFile is not null && fragment.DeletionFile.NumDeletedRows > 0)
             {
-                existing = await DeletionFileReader.ReadAsync(
-                    fs, fragment.Id, fragment.DeletionFile, cancellationToken)
+                existing = await ReadDeletionMaskAsync(locator, fragment, cancellationToken)
                     .ConfigureAwait(false);
             }
 
@@ -938,6 +1027,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 if (v == true) matching.Add(i);
             }
             if (matching.Count == 0) continue;
+            if (existing is not null)
+                existingMasks[fragment.Id] = existing;
 
             // Evaluate each assigned expression once over the full batch;
             // we'll take its values at matching indices below.
@@ -1012,11 +1103,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             if (perFragmentDeletes.TryGetValue(oldFrag.Id, out var matched))
             {
                 var merged = new HashSet<int>();
-                if (oldFrag.DeletionFile is not null && oldFrag.DeletionFile.NumDeletedRows > 0)
+                if (existingMasks.TryGetValue(oldFrag.Id, out var existingMask))
                 {
-                    var existingMask = await DeletionFileReader.ReadAsync(
-                        fs, oldFrag.Id, oldFrag.DeletionFile, cancellationToken)
-                        .ConfigureAwait(false);
                     foreach (int off in existingMask.DeletedOffsets) merged.Add(off);
                 }
                 foreach (int off in matched) merged.Add(off);
@@ -1089,6 +1177,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         };
         newManifest.Fields.AddRange(manifest.Fields);
         newManifest.Fragments.AddRange(newFragmentsList);
+        CarryBasePaths(manifest.BasePaths, newManifest);
 
         await WriteManifestFileAsync(datasetPath, newManifest, transactionBytes, cancellationToken)
             .ConfigureAwait(false);
@@ -1112,10 +1201,26 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// versions stay readable; <see cref="VacuumAsync"/> with
     /// <see cref="LanceVacuumOptions.RetainVersions"/> = 1 reclaims them.
     /// Survivors are gathered with <see cref="ArrowCompute.Take(IArrowArray, ReadOnlySpan{int})"/>, so the
-    /// same column-type scope as <see cref="UpdateAsync"/> applies.</para>
+    /// same column-type scope as <see cref="UpdateAsync(string, Predicate, IReadOnlyDictionary{string, Expression}, CancellationToken)"/> applies.</para>
     /// </summary>
-    public static async ValueTask<LanceCompactionResult> CompactAsync(
+    public static ValueTask<LanceCompactionResult> CompactAsync(
         string datasetPath, CancellationToken cancellationToken = default)
+        => CompactCoreAsync(datasetPath, resolver: null, cancellationToken);
+
+    /// <inheritdoc cref="CompactAsync(string, CancellationToken)"/>
+    /// <param name="datasetPath">The dataset.</param>
+    /// <param name="options">Reaches existing data and deletion files under other bases
+    /// (<see cref="LanceWriteOptions.StorageResolver"/>).</param>
+    /// <param name="cancellationToken">Cancels the operation.</param>
+    public static ValueTask<LanceCompactionResult> CompactAsync(
+        string datasetPath, LanceWriteOptions options, CancellationToken cancellationToken = default)
+    {
+        if (options is null) throw new ArgumentNullException(nameof(options));
+        return CompactCoreAsync(datasetPath, options.StorageResolver, cancellationToken);
+    }
+
+    private static async ValueTask<LanceCompactionResult> CompactCoreAsync(
+        string datasetPath, StorageResolver? resolver, CancellationToken cancellationToken)
     {
         if (datasetPath is null) throw new ArgumentNullException(nameof(datasetPath));
         if (!Directory.Exists(datasetPath)
@@ -1123,12 +1228,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             throw new InvalidOperationException(
                 $"Path '{datasetPath}' does not contain a Lance dataset.");
 
-        var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(datasetPath);
-        var entry = await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
+        var (_, manifest, locator) = await OpenLatestAsync(datasetPath, resolver, cancellationToken)
             .ConfigureAwait(false);
-        var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
-            .ConfigureAwait(false);
-        ThrowIfBasePaths(manifest, datasetPath, "compact");
 
         // Identify fragments with at least one tombstoned row. Fragments
         // without deletion files are well-packed already and aren't
@@ -1163,8 +1264,9 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         foreach (var fragment in compactable)
         {
             DataFile file = fragment.Files[0];
-            string relPath = "data/" + file.Path;
-            await using IRandomAccessFile raf = await fs.OpenReadAsync(relPath, cancellationToken)
+            var dataFile = locator.ResolveDataFile(fragment, file);
+            await using IRandomAccessFile raf = await dataFile.FileSystem
+                .OpenReadAsync(dataFile.Path, cancellationToken)
                 .ConfigureAwait(false);
             await using var reader = await EngineeredWood.Lance.LanceFileReader
                 .OpenAsync(raf, ownsReader: false, cancellationToken)
@@ -1176,8 +1278,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 arrays[i] = await reader.ReadColumnAsync(i, cancellationToken)
                     .ConfigureAwait(false);
 
-            var existingMask = await DeletionFileReader.ReadAsync(
-                fs, fragment.Id, fragment.DeletionFile, cancellationToken)
+            var existingMask = await ReadDeletionMaskAsync(locator, fragment, cancellationToken)
                 .ConfigureAwait(false);
 
             var survivors = new List<int>();
@@ -1283,6 +1384,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         };
         newManifest.Fields.AddRange(manifest.Fields);
         newManifest.Fragments.AddRange(newFragments);
+        CarryBasePaths(manifest.BasePaths, newManifest);
 
         await WriteManifestFileAsync(datasetPath, newManifest, transactionBytes, cancellationToken)
             .ConfigureAwait(false);
@@ -1294,6 +1396,34 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             RowsRetained = totalRetained,
             Version = (long)newVersion,
         };
+    }
+
+    /// <summary>
+    /// Reads the latest manifest of the dataset at <paramref name="datasetPath"/> and a locator for the files it
+    /// names, checking every base its fragments refer to (#990). Files under a base outside the dataset are reached
+    /// through <paramref name="resolver"/> when they are read.
+    /// </summary>
+    private static async ValueTask<(EngineeredWood.IO.Local.LocalTableFileSystem FileSystem, LanceManifest Manifest,
+        LanceFileLocator Locator)> OpenLatestAsync(
+        string datasetPath, StorageResolver? resolver, CancellationToken cancellationToken)
+    {
+        var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(datasetPath);
+        var entry = await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
+            .ConfigureAwait(false);
+        var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
+            .ConfigureAwait(false);
+        var locator = new LanceFileLocator(fs, manifest, resolver);
+        locator.Validate(manifest);
+        return (fs, manifest, locator);
+    }
+
+    /// <summary>Reads <paramref name="fragment"/>'s deletion file, wherever its base puts it.</summary>
+    private static ValueTask<DeletionMask> ReadDeletionMaskAsync(
+        LanceFileLocator locator, DataFragment fragment, CancellationToken cancellationToken)
+    {
+        var deletion = fragment.DeletionFile;
+        var file = locator.ResolveDeletionFile(fragment, DeletionFileReader.FileName(fragment.Id, deletion));
+        return DeletionFileReader.ReadAsync(file.FileSystem, file.Path, fragment.Id, deletion, cancellationToken);
     }
 
     /// <summary>
@@ -1386,37 +1516,48 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         // Read each retained manifest and collect the live data file
         // names + the transaction filenames + deletion-file names it
         // references.
-        var liveDataFiles = new HashSet<string>(StringComparer.Ordinal);
+        // The live data and deletion files, by location. A fragment's files may
+        // lie under a base (a shallow clone's source, an imported directory),
+        // and such a base may even lie under this dataset's own root, so the
+        // keep-set compares where each file IS, not its bare name or its
+        // (base_id, path): a file under the root is live when any retained
+        // version names it through any base (#990). Bases are only parsed,
+        // never reached, and vacuum deletes only under the root, as lance's
+        // cleanup does; a base EW cannot place (a relative path, say) refuses
+        // the vacuum rather than guess.
+        var tableLocation = fs.Location;
+        var liveFiles = new HashSet<StorageLocation>();
         var liveTxnFiles = new HashSet<string>(StringComparer.Ordinal);
-        var liveDeletionFiles = new HashSet<string>(StringComparer.Ordinal);
         foreach (var entry in retainedEntries)
         {
             var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
                 .ConfigureAwait(false);
-            ThrowIfBasePaths(manifest, datasetPath, "vacuum");
+            var locator = new LanceFileLocator(fs, manifest, resolver: null);
+            locator.Validate(manifest);
             foreach (var fragment in manifest.Fragments)
             {
                 foreach (var file in fragment.Files)
-                {
-                    // DataFile.Path is relative to the dataset root, e.g.
-                    // "data/abc.lance" — but our writer just uses the bare
-                    // filename. Normalise to the basename.
-                    string baseName = Path.GetFileName(file.Path);
-                    liveDataFiles.Add(baseName);
-                }
+                    liveFiles.Add(locator.LocateDataFile(fragment, file));
                 if (fragment.DeletionFile is not null)
-                {
-                    string ext = fragment.DeletionFile.FileType
-                        == DeletionFile.Types.DeletionFileType.Bitmap
-                        ? ".bin"
-                        : ".arrow";
-                    liveDeletionFiles.Add(
-                        $"{fragment.Id}-{fragment.DeletionFile.ReadVersion}-" +
-                        $"{fragment.DeletionFile.Id}{ext}");
-                }
+                    liveFiles.Add(locator.LocateDeletionFile(
+                        fragment, DeletionFileReader.FileName(fragment.Id, fragment.DeletionFile)));
             }
             if (!string.IsNullOrEmpty(manifest.TransactionFile))
                 liveTxnFiles.Add(Path.GetFileName(manifest.TransactionFile));
+        }
+
+        // A listed file is kept unless its location is known and no retained
+        // version names it; a name StorageLocation will not take is kept.
+        bool IsLive(StorageLocation directory, string name)
+        {
+            try
+            {
+                return liveFiles.Contains(directory.Combine(name));
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or FormatException)
+            {
+                return true;
+            }
         }
 
         var deletedDataFiles = new List<string>();
@@ -1433,7 +1574,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             foreach (string file in Directory.EnumerateFiles(dataDir, "*.lance"))
             {
                 string baseName = Path.GetFileName(file);
-                if (liveDataFiles.Contains(baseName)) continue;
+                if (IsLive(tableLocation.Combine("data"), baseName)) continue;
                 long size = new FileInfo(file).Length;
                 if (!options.DryRun) File.Delete(file);
                 deletedDataFiles.Add(baseName);
@@ -1477,7 +1618,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             foreach (string file in Directory.EnumerateFiles(deletionsDir))
             {
                 string baseName = Path.GetFileName(file);
-                if (liveDeletionFiles.Contains(baseName)) continue;
+                if (IsLive(tableLocation.Combine("_deletions"), baseName)) continue;
                 long size = new FileInfo(file).Length;
                 if (!options.DryRun) File.Delete(file);
                 deletedDeletionFiles.Add(baseName);
@@ -1557,7 +1698,7 @@ public sealed record LanceVacuumOptions
 }
 
 /// <summary>
-/// Outcome of <see cref="LanceDatasetWriter.CompactAsync"/>: which
+/// Outcome of <see cref="LanceDatasetWriter.CompactAsync(string, CancellationToken)"/>: which
 /// fragment ids were rewritten, what new fragment id replaces them, and
 /// the surviving row count. <see cref="Version"/> is the manifest
 /// version after the compaction (= read version when no compaction was

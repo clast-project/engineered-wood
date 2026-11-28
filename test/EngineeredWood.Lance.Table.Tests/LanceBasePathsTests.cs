@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers.Binary;
+using System.Diagnostics;
 using Apache.Arrow;
 using EngineeredWood.Expressions;
 using EngineeredWood.IO;
@@ -262,35 +263,348 @@ public sealed class LanceBasePathsTests : IDisposable
         await Assert.ThrowsAsync<LanceTableFormatException>(() => ReadIdsAsync(table));
     }
 
-    // --- writes -----------------------------------------------------------------------------------
+    // --- writes (#990) ----------------------------------------------------------------------------
 
     [Fact]
-    public async Task Writer_RefusesEveryOperation_AndLeavesTheDatasetUnchanged()
+    public async Task Append_CarriesBasesForward_AndLeavesTheSourceUnchanged()
+    {
+        string[] source = HashTree(Source);
+        await AppendIdsAsync(Clone, 200, 201);
+
+        var manifest = await ReadLatestManifestAsync(Clone);
+        Assert.Single(manifest.BasePaths);
+        Assert.Equal(FlagBasePaths, manifest.ReaderFeatureFlags & FlagBasePaths);
+        Assert.Equal(FlagBasePaths, manifest.WriterFeatureFlags & FlagBasePaths);
+        var appended = manifest.Fragments[manifest.Fragments.Count - 1];
+        Assert.False(appended.Files[0].HasBaseId);
+        Assert.True(File.Exists(Path.Combine(Clone, "data", appended.Files[0].Path)));
+
+        Assert.Equal(CloneIds.Concat([200, 201]).OrderBy(i => i), await ReadCloneIdsAsync());
+        Assert.Equal(source, HashTree(Source));
+    }
+
+    [Fact]
+    public async Task Overwrite_KeepsTheBases_AsLanceDoes()
+    {
+        // Measured, pylance 14.0.3: an overwrite of a shallow clone keeps its base_paths.
+        await using (var writer = await LanceDatasetWriter.OverwriteAsync(Clone))
+        {
+            await writer.FileWriter.WriteInt32ColumnAsync("id", new[] { 7 });
+            await writer.FinishAsync();
+        }
+
+        var manifest = await ReadLatestManifestAsync(Clone);
+        Assert.Single(manifest.BasePaths);
+        Assert.Equal(FlagBasePaths, manifest.ReaderFeatureFlags & FlagBasePaths);
+        Assert.All(manifest.Fragments, f => Assert.False(f.Files[0].HasBaseId));
+
+        await using var table = await LanceTable.OpenAsync(Clone);
+        Assert.Equal(new[] { 7 }, await ReadIdsAsync(table));
+    }
+
+    [Fact]
+    public async Task Delete_ReadsSourceFiles_WritesUnderTheRoot()
+    {
+        string[] source = HashTree(Source);
+        await LanceDatasetWriter.DeleteAsync(Clone, EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", LiteralValue.Of(15)),
+            CloneWrite);
+
+        var manifest = await ReadLatestManifestAsync(Clone);
+        Assert.Single(manifest.BasePaths);
+        // Fragment 1 is the source's, and its previous deletion file was the source's too (base 0); the merged one
+        // replacing it is the clone's own. Its data file still names the source.
+        var fragment1 = manifest.Fragments.Single(f => f.Id == 1);
+        Assert.True(fragment1.Files[0].HasBaseId);
+        Assert.False(fragment1.DeletionFile.HasBaseId);
+        Assert.True(File.Exists(Path.Combine(Clone, "_deletions",
+            Deletions.DeletionFileReader.FileName(1, fragment1.DeletionFile))));
+
+        Assert.Equal(CloneIds.Where(i => i < 15), await ReadCloneIdsAsync());
+        Assert.Equal(source, HashTree(Source));
+    }
+
+    [Fact]
+    public async Task DeleteRows_MergesADeletionFileUnderTheSource()
+    {
+        // Fragment 1 (ids 10-19) carries the source's deletion file, which deletes id 13 (offset 3).
+        string[] source = HashTree(Source);
+        await LanceDatasetWriter.DeleteRowsAsync(Clone,
+            new Dictionary<ulong, IReadOnlyList<int>> { [1] = new[] { 0 } }, CloneWrite);
+
+        Assert.Equal(CloneIds.Where(i => i != 10), await ReadCloneIdsAsync());
+        Assert.Equal(source, HashTree(Source));
+    }
+
+    [Fact]
+    public async Task Update_RewritesSourceRowsUnderTheRoot()
+    {
+        string[] source = HashTree(Source);
+        var (updated, _) = await LanceDatasetWriter.UpdateAsync(Clone,
+            EngineeredWood.Expressions.Expressions.LessThan("id", LiteralValue.Of(12)),
+            new Dictionary<string, Expression> { ["v"] = new LiteralExpression(LiteralValue.Of("new")) },
+            CloneWrite);
+
+        Assert.Equal(CloneIds.Count(i => i < 12), updated);
+        var rows = await ReadCloneRowsAsync();
+        Assert.Equal(CloneIds, rows.Keys.OrderBy(i => i));
+        Assert.All(rows, kv => Assert.Equal(kv.Key < 12 ? "new" : $"v{kv.Key}", kv.Value));
+        Assert.Equal(source, HashTree(Source));
+    }
+
+    [Fact]
+    public async Task Compact_MovesSourceSurvivorsUnderTheRoot()
+    {
+        string[] source = HashTree(Source);
+        var result = await LanceDatasetWriter.CompactAsync(Clone, CloneWrite);
+
+        Assert.Equal(new ulong[] { 0, 1 }, result.SourceFragmentIds.OrderBy(i => i));
+        var manifest = await ReadLatestManifestAsync(Clone);
+        Assert.Single(manifest.BasePaths);
+        Assert.All(manifest.Fragments, f => Assert.False(f.Files[0].HasBaseId));
+        Assert.Equal(CloneIds, await ReadCloneIdsAsync());
+        Assert.Equal(source, HashTree(Source));
+    }
+
+    [Fact]
+    public async Task MultiBase_DeleteAndCompact_ReadEveryBase()
+    {
+        string[] bases = HashTree(Path.Combine(_root, "rootbase")).Concat(HashTree(Path.Combine(_root, "filebase")))
+            .ToArray();
+        var resolver = new StorageResolver()
+            .Register(new LocalTableFileSystem(Path.Combine(_root, "rootbase")))
+            .Register(new LocalTableFileSystem(Path.Combine(_root, "filebase")));
+        var options = new LanceWriteOptions { StorageResolver = resolver };
+
+        await LanceDatasetWriter.DeleteAsync(Multi, EngineeredWood.Expressions.Expressions.Equal("id", LiteralValue.Of(15)), options);
+        await LanceDatasetWriter.CompactAsync(Multi, options);
+
+        var manifest = await ReadLatestManifestAsync(Multi);
+        Assert.Equal(2, manifest.BasePaths.Count);
+        await using var table = await LanceTable.OpenAsync(Multi);
+        Assert.Equal(MultiIds.Where(i => i != 15), await ReadIdsAsync(table));
+        Assert.Equal(bases,
+            HashTree(Path.Combine(_root, "rootbase")).Concat(HashTree(Path.Combine(_root, "filebase"))).ToArray());
+    }
+
+    [Fact]
+    public async Task ReadingOps_WithoutAResolver_RefuseBeforeWriting()
     {
         string[] before = ListFiles(_root);
         var pred = EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", LiteralValue.Of(0));
 
-        await AssertWriterRefusesAsync(async () => await LanceDatasetWriter.AppendAsync(Clone));
-        await AssertWriterRefusesAsync(async () => await LanceDatasetWriter.OverwriteAsync(Clone));
-        await AssertWriterRefusesAsync(async () => await LanceDatasetWriter.DeleteAsync(Clone, pred));
-        await AssertWriterRefusesAsync(async () =>
+        await Assert.ThrowsAsync<UnregisteredStorageLocationException>(async () =>
+            await LanceDatasetWriter.DeleteAsync(Clone, pred));
+        await Assert.ThrowsAsync<UnregisteredStorageLocationException>(async () =>
             await LanceDatasetWriter.DeleteRowsAsync(Clone,
-                new Dictionary<ulong, IReadOnlyList<int>> { [0] = new[] { 0 } }));
-        await AssertWriterRefusesAsync(async () =>
+                new Dictionary<ulong, IReadOnlyList<int>> { [0] = new[] { 0 }, [1] = new[] { 0 } }));
+        await Assert.ThrowsAsync<UnregisteredStorageLocationException>(async () =>
             await LanceDatasetWriter.UpdateAsync(Clone, pred,
                 new Dictionary<string, Expression> { ["v"] = new LiteralExpression(LiteralValue.Of("x")) }));
-        await AssertWriterRefusesAsync(async () => await LanceDatasetWriter.CompactAsync(Clone));
-        await AssertWriterRefusesAsync(async () => await LanceDatasetWriter.VacuumAsync(Multi));
+        await Assert.ThrowsAsync<UnregisteredStorageLocationException>(async () =>
+            await LanceDatasetWriter.CompactAsync(Clone));
 
         Assert.Equal(before, ListFiles(_root));
     }
 
+    [Fact]
+    public async Task Vacuum_NeverDeletesABaseFile()
+    {
+        await LanceDatasetWriter.CompactAsync(Clone, CloneWrite);
+        string[] source = HashTree(Source);
+
+        // Retaining one version leaves no reference to the source's files; they are still not the clone's to delete.
+        var result = await LanceDatasetWriter.VacuumAsync(Clone, new LanceVacuumOptions { RetainVersions = 1 });
+
+        Assert.NotEmpty(result.ManifestsDeleted);
+        Assert.Equal(source, HashTree(Source));
+        Assert.Equal(CloneIds, await ReadCloneIdsAsync());
+    }
+
+    [Fact]
+    public async Task Vacuum_KeepsAFileABaseInsideTheRootNames()
+    {
+        // A file-directory base at the dataset's own data/ (and a dataset-root base at the dataset itself) names
+        // files that vacuum lists as the dataset's own data/ files. They are live.
+        string filebase = Path.Combine(_root, "filebase");
+        foreach (string file in Directory.GetFiles(filebase))
+            File.Move(file, Path.Combine(Multi, "data", Path.GetFileName(file)));
+        foreach (string file in Directory.GetFiles(Path.Combine(_root, "rootbase", "data")))
+            File.Move(file, Path.Combine(Multi, "data", Path.GetFileName(file)));
+        RewriteBases(Multi, b => b.Path = b.IsDatasetRoot ? Multi : Path.Combine(Multi, "data"));
+
+        var result = await LanceDatasetWriter.VacuumAsync(Multi, new LanceVacuumOptions { RetainVersions = 1 });
+
+        Assert.Empty(result.DataFilesDeleted);
+        await using var table = await LanceTable.OpenAsync(Multi);
+        Assert.Equal(MultiIds, await ReadIdsAsync(table));
+    }
+
+    [Fact]
+    public async Task Vacuum_StillDeletesAnUnreferencedRootFile()
+    {
+        // An overwrite drops every fragment of the clone, its own included; vacuum then reclaims the clone's files.
+        string ownFile = Directory.GetFiles(Path.Combine(Clone, "data")).Single();
+        await using (var writer = await LanceDatasetWriter.OverwriteAsync(Clone))
+        {
+            await writer.FileWriter.WriteInt32ColumnAsync("id", new[] { 7 });
+            await writer.FinishAsync();
+        }
+        string[] source = HashTree(Source);
+
+        var result = await LanceDatasetWriter.VacuumAsync(Clone, new LanceVacuumOptions { RetainVersions = 1 });
+
+        Assert.Contains(Path.GetFileName(ownFile), result.DataFilesDeleted);
+        Assert.False(File.Exists(ownFile));
+        Assert.Equal(source, HashTree(Source));
+    }
+
+    [Fact]
+    public async Task Vacuum_RefusesABaseItCannotPlace()
+    {
+        RewriteBases(Clone, b => b.Path = "clone_source");
+        string[] before = ListFiles(_root);
+
+        await Assert.ThrowsAsync<NotSupportedException>(async () =>
+            await LanceDatasetWriter.VacuumAsync(Clone, new LanceVacuumOptions { RetainVersions = 1 }));
+        Assert.Equal(before, ListFiles(_root));
+    }
+
+    [Fact]
+    public async Task Pylance_ReadsTheWrittenClone_AndAgreesWithEW()
+    {
+        if (!IsPylanceAvailable())
+            return;
+
+        // Every fragment EW writes here holds an even number of rows, and the update writes two 4-character
+        // values: pylance 14.0.3 refuses an EW Flat buffer whose length is not a multiple of 8 (EW declares the
+        // size rounded up to 8; lance's value.rs now wants it exact), which is a defect of the file writer, not of
+        // base paths.
+        await AppendIdsAsync(Clone, 200, 201);
+        await LanceDatasetWriter.DeleteAsync(Clone, EngineeredWood.Expressions.Expressions.Equal("id", LiteralValue.Of(11)), CloneWrite);
+        await LanceDatasetWriter.UpdateAsync(Clone,
+            EngineeredWood.Expressions.Expressions.In("id", LiteralValue.Of(1), LiteralValue.Of(2)),
+            new Dictionary<string, Expression> { ["v"] = new LiteralExpression(LiteralValue.Of("vvvv")) }, CloneWrite);
+        var afterUpdate = await ReadCloneRowsAsync();
+        Assert.Equal(afterUpdate, await PylanceRowsAsync(Clone));
+
+        await LanceDatasetWriter.CompactAsync(Clone, CloneWrite);
+        var afterCompact = await ReadCloneRowsAsync();
+        Assert.Equal(afterUpdate, afterCompact);
+        Assert.Equal(afterCompact, await PylanceRowsAsync(Clone));
+    }
+
     // --- helpers ----------------------------------------------------------------------------------
 
-    private static async Task AssertWriterRefusesAsync(Func<Task> write)
+    private const ulong FlagBasePaths = 16;
+
+    private LanceWriteOptions CloneWrite =>
+        new() { StorageResolver = new StorageResolver().Register(new LocalTableFileSystem(Source)) };
+
+    private async Task<int[]> ReadCloneIdsAsync()
     {
-        var ex = await Assert.ThrowsAsync<NotSupportedException>(write);
-        Assert.Contains("base path(s)", ex.Message, StringComparison.Ordinal);
+        var resolver = new StorageResolver().Register(new LocalTableFileSystem(Source));
+        await using var table = await LanceTable.OpenAsync(Clone, new LanceTableOptions { StorageResolver = resolver });
+        return await ReadIdsAsync(table);
+    }
+
+    private async Task<SortedDictionary<int, string>> ReadCloneRowsAsync()
+    {
+        var resolver = new StorageResolver().Register(new LocalTableFileSystem(Source));
+        await using var table = await LanceTable.OpenAsync(Clone, new LanceTableOptions { StorageResolver = resolver });
+        var rows = new SortedDictionary<int, string>();
+        await foreach (var batch in table.ReadAsync())
+        {
+            var ids = (Int32Array)batch.Column("id");
+            var values = (StringArray)batch.Column("v");
+            for (int i = 0; i < batch.Length; i++)
+                rows.Add(ids.GetValue(i)!.Value, values.GetString(i));
+        }
+
+        return rows;
+    }
+
+    private static async Task AppendIdsAsync(string dataset, params int[] ids)
+    {
+        await using var writer = await LanceDatasetWriter.AppendAsync(dataset);
+        await writer.FileWriter.WriteInt32ColumnAsync("id", ids);
+        var values = new StringArray.Builder();
+        foreach (int id in ids)
+            values.Append($"v{id}");
+        await writer.FileWriter.WriteColumnAsync("v", values.Build());
+        await writer.FinishAsync();
+    }
+
+    private static async Task<Proto.Manifest> ReadLatestManifestAsync(string dataset)
+    {
+        var fs = new LocalTableFileSystem(dataset);
+        var entry = await Manifest.ManifestPathResolver.ResolveLatestAsync(fs);
+        return await Manifest.ManifestReader.ReadAsync(fs, entry.Path);
+    }
+
+    /// <summary>Every file under <paramref name="root"/> with a hash of its bytes.</summary>
+    private static string[] HashTree(string root)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        return Directory.GetFiles(root, "*", SearchOption.AllDirectories)
+            .Select(f => f.Substring(root.Length) + ":" + Convert.ToBase64String(sha.ComputeHash(File.ReadAllBytes(f))))
+            .OrderBy(f => f, StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static bool IsPylanceAvailable()
+    {
+        try
+        {
+            using var proc = Process.Start(new ProcessStartInfo("python", "-c \"import lance\"")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            });
+            if (proc is null) return false;
+            proc.WaitForExit(30_000);
+            return proc.ExitCode == 0;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>The rows pylance reads from <paramref name="dataset"/>, as id to v.</summary>
+    private static async Task<SortedDictionary<int, string>> PylanceRowsAsync(string dataset)
+    {
+        string script = "import sys, json, lance\n"
+            + "t = lance.dataset(sys.argv[1]).to_table()\n"
+            + "sys.stdout.write(json.dumps([t['id'].to_pylist(), t['v'].to_pylist()]))\n";
+        string scriptPath = Path.Combine(Path.GetTempPath(), "ew-lance-read-" + Guid.NewGuid().ToString("N") + ".py");
+        File.WriteAllText(scriptPath, script);
+        try
+        {
+            var psi = new ProcessStartInfo("python", $"-I \"{scriptPath}\" \"{dataset}\"")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            var stdout = proc.StandardOutput.ReadToEndAsync();
+            var stderr = proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0, $"pylance exited {proc.ExitCode}: {await stderr}");
+
+            using var json = System.Text.Json.JsonDocument.Parse(await stdout);
+            var ids = json.RootElement[0].EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            var values = json.RootElement[1].EnumerateArray().Select(e => e.GetString()!).ToArray();
+            var rows = new SortedDictionary<int, string>();
+            for (int i = 0; i < ids.Length; i++)
+                rows.Add(ids[i], values[i]);
+            return rows;
+        }
+        finally
+        {
+            File.Delete(scriptPath);
+        }
     }
 
     private static async Task<int[]> ReadIdsAsync(LanceTable table)
