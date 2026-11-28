@@ -9,6 +9,7 @@
 #   pip install pylance pyarrow
 #   python generate_test_data.py              # every fixture
 #   python generate_test_data.py base_paths   # only base_paths_v21/
+#   python generate_test_data.py schema_evolution   # only the #995 fixtures
 #
 # The generated directories are committed to source control so tests can
 # run without invoking pylance.
@@ -147,6 +148,67 @@ def _write_with_delete(name, table, *, delete_predicate, version="2.1"):
     print(f"  {name}: {sz} bytes")
 
 
+def write_schema_evolution_fixtures():
+    """Datasets whose data files no longer line up with the manifest schema
+    (#995). drop_columns and add_columns change only the manifest: the data
+    file keeps its fields/column_indices, so a reader must map each manifest
+    field to its column through them rather than by position."""
+    struct_type = pa.struct([("x", pa.int64()), ("y", pa.string())])
+
+    def flat():
+        return pa.table({
+            "a": pa.array([1, 2, 3], type=pa.int64()),
+            "b": pa.array([10, 20, 30], type=pa.int64()),
+            "c": pa.array([100, 200, 300], type=pa.int64()),
+        })
+
+    def nested():
+        return pa.table({
+            "a": pa.array([1, 2, 3], type=pa.int64()),
+            "s": pa.array([{"x": 1, "y": "p"}, {"x": 2, "y": "q"}, {"x": 3, "y": "r"}],
+                          type=struct_type),
+            "l": pa.array([[1], [2, 3], []], type=pa.list_(pa.int64())),
+            "c": pa.array([100, 200, 300], type=pa.int64()),
+        })
+
+    def evolve(name, table, version, change):
+        target = os.path.join(THIS_DIR, name)
+        if os.path.exists(target):
+            shutil.rmtree(target)
+        lance.write_dataset(table, target, data_storage_version=version)
+        change(lance.dataset(target))
+        ds = lance.dataset(target)
+        files = [(df.fields, df.column_indices)
+                 for f in ds.get_fragments() for df in f.metadata.files]
+        print(f"  {name}: schema {ds.schema.names}, files {files}, "
+              f"rows {ds.to_table().to_pylist()}")
+
+    # Schema [b, c]; the file still holds a, b, c as fields [0, 1, 2].
+    for version in ("2.1", "2.0"):
+        evolve(f"dropped_column_v{version.replace('.', '')}", flat(), version,
+               lambda ds: ds.drop_columns(["a"]))
+    # Schema [s{y}, l, c]. In 2.1 the file lists leaves only (s.y alone is
+    # still one contiguous column); in 2.0 it lists s, s.x, s.y as three
+    # columns, so s{y} is no longer contiguous.
+    for version in ("2.1", "2.0"):
+        evolve(f"dropped_nested_v{version.replace('.', '')}", nested(), version,
+               lambda ds: ds.drop_columns(["a", "s.x"]))
+    # Schema [a, b, c, n]: n is in no data file (pylance reads it as nulls).
+    evolve("added_null_column_v21", flat(), "2.1",
+           lambda ds: ds.add_columns(pa.schema([pa.field("n", pa.int64())])))
+
+    # A list whose child is named "element" (as Parquet-derived schemas name it), not pyarrow's "item": a
+    # rewrite must keep the name (#998).
+    target = os.path.join(THIS_DIR, "list_element_v21")
+    if os.path.exists(target):
+        shutil.rmtree(target)
+    lance.write_dataset(pa.table({
+        "k": pa.array([1, 2, 3], type=pa.int64()),
+        "l": pa.array([[1], [2, 3], []], type=pa.list_(pa.field("element", pa.int64()))),
+    }), target, data_storage_version="2.1")
+    print(f"  list_element_v21: schema {lance.dataset(target).schema}")
+
+
 def write_base_paths_fixtures(version="2.1"):
     """Datasets whose manifests have base_paths (#963). Each base path
     pylance stores is the ABSOLUTE local path of this machine's copy, so
@@ -201,6 +263,9 @@ if __name__ == "__main__":
     import sys
     if sys.argv[1:] == ["base_paths"]:
         write_base_paths_fixtures()
+    elif sys.argv[1:] == ["schema_evolution"]:
+        write_schema_evolution_fixtures()
     else:
         main()
         write_base_paths_fixtures()
+        write_schema_evolution_fixtures()

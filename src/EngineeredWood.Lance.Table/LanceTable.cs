@@ -424,10 +424,13 @@ public sealed class LanceTable : IAsyncDisposable
                 .ConfigureAwait(false);
 
             int rowCount = checked((int)reader.NumberOfRows);
+            // Each field is read through the file's fields/column_indices, not by
+            // position: after drop_columns the file still holds the dropped columns (#995).
+            var fileColumns = DataFileColumns.Create(_manifest.Fields, fragment.Id, file, reader);
             var readArrays = new IArrowArray[readFieldIndices.Length];
             for (int i = 0; i < readFieldIndices.Length; i++)
-                readArrays[i] = await reader
-                    .ReadColumnAsync(readFieldIndices[i], cancellationToken)
+                readArrays[i] = await fileColumns
+                    .ReadAsync(readFieldIndices[i], _arrowSchema.FieldsList[readFieldIndices[i]], cancellationToken)
                     .ConfigureAwait(false);
 
             var readBatch = new RecordBatch(readSchema, readArrays, rowCount);

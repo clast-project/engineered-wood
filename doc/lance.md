@@ -79,6 +79,19 @@ and exposes the read side via `LanceTable`.
   - Index discovery walks `_transactions/`, so a clone's inherited indices
     (whose `CreateIndex` happened in the source) are not found: reads
     stay correct but are not index-pruned.
+- **Columns by field id** (#995): each manifest field is read from the
+  column its data file's `fields`/`column_indices` name, as lance-rs does,
+  not from its position. `drop_columns` and a rename change only the
+  manifest, so after dropping `a` from `[a, b, c]` the file still holds
+  three columns and `b` is column 1. A 2.0 file lists every field with a
+  column; a 2.1+ file lists only leaves. A field with no column in the
+  fragment's file is refused (`NotSupportedException`): one added by
+  `add_columns` without data (pylance reads it as nulls) or a column-split
+  fragment. So is a nested field whose columns are no longer contiguous,
+  such as a struct child dropped from a 2.0 file. A projection that leaves
+  such a field out still reads. Datasets EW wrote before #995 listed a
+  2.1 struct's parent with a column of its own; they are read through the
+  file's schema.
 
 ### Writing
 
@@ -138,10 +151,13 @@ does when a writer names no target base:
 Every operation except vacuum refuses a manifest whose writer feature
 flags it does not maintain: stable row ids (2), table config (8) and any
 unknown flag. Committing would silently drop them. Delete, delete-rows,
-update and compact also refuse a fragment that is not one data file
-holding the manifest's fields in order (a column-split or reordered
-layout), because they read columns by position. Both checks happen before
-anything is written.
+update and compact also refuse a column-split fragment (more than one data
+file). Both checks happen before anything is written. They read a data
+file's columns by field id, as `LanceTable` does, and a file they write
+carries the manifest's field ids, which `drop_columns` leaves with gaps.
+EW writes only 2.1+ files, and lance refuses a 2.1 file in a dataset whose
+files are 2.0, so pylance cannot read a 2.0 dataset after an EW update or
+compact (measured), nor after any EW write that adds a file.
 
 ## Type coverage
 
