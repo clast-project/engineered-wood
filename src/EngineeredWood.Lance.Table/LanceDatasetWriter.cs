@@ -72,8 +72,13 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     private const ushort ManifestMajorVersion = 0;
     private const ushort ManifestMinorVersion = 2;
 
-    // lance-table 14.0.3 feature_flags.rs FLAG_BASE_PATHS.
+    // lance-table 14.0.3 feature_flags.rs.
+    private const ulong FlagDeletionFiles = 1;
+    private const ulong FlagV2DeprecatedMarker = 4;
     private const ulong FlagBasePaths = 16;
+    // The writer flags this writer honours: it reads and writes deletion files and carries base_paths. It does not
+    // assign stable row ids (2) or carry table config (8), so a manifest needing either would lose it on commit.
+    private const ulong WritableFlags = FlagDeletionFiles | FlagV2DeprecatedMarker | FlagBasePaths;
 
     private readonly string _datasetPath;
     private readonly LanceWriteMode _mode;
@@ -194,6 +199,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 .ConfigureAwait(false);
             baseManifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
                 .ConfigureAwait(false);
+            ThrowIfUnwritable(baseManifest, datasetPath);
             readVersion = baseManifest.Version;
             basePaths = baseManifest.BasePaths;
         }
@@ -209,6 +215,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 {
                     var latest = await ManifestReader.ReadAsync(fs, entries[0].Path, cancellationToken)
                         .ConfigureAwait(false);
+                    ThrowIfUnwritable(latest, datasetPath);
                     readVersion = latest.Version;
                     // lance keeps the bases on an overwrite (measured, pylance 14.0.3, overwrite of a shallow
                     // clone): older versions still name them, and so may an index.
@@ -1412,9 +1419,58 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             .ConfigureAwait(false);
         var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
             .ConfigureAwait(false);
+        ThrowIfUnwritable(manifest, datasetPath);
+        ThrowIfUnreadableLayout(manifest, datasetPath);
         var locator = new LanceFileLocator(fs, manifest, resolver);
         locator.Validate(manifest);
         return (fs, manifest, locator);
+    }
+
+    /// <summary>
+    /// Refuses a manifest whose writer feature flags this writer does not honour: stable row ids (2), which it would
+    /// commit without the flag, <c>next_row_id</c> or the new fragments' row id sequences, table config (8), which
+    /// it would drop, and any flag it does not know. Checked before anything is written.
+    /// </summary>
+    private static void ThrowIfUnwritable(LanceManifest manifest, string datasetPath)
+    {
+        ulong unsupported = manifest.WriterFeatureFlags & ~WritableFlags;
+        if (unsupported != 0)
+            throw new NotSupportedException(
+                $"Cannot write the Lance dataset at '{datasetPath}': its manifest (version {manifest.Version}) needs "
+                + $"writer feature flags 0x{unsupported:X} (2 = stable row ids, 8 = table config), which "
+                + "LanceDatasetWriter does not maintain; committing would silently drop them.");
+    }
+
+    /// <summary>
+    /// Refuses a fragment whose data file is not laid out as delete, update and compact read it: one file per
+    /// fragment, holding the manifest's fields in the manifest's order, column <c>i</c> being field <c>i</c>. A
+    /// column-split fragment, or one whose columns are ordered differently, would otherwise be read with the wrong
+    /// column at each position, deleting the wrong rows or committing swapped values.
+    /// </summary>
+    private static void ThrowIfUnreadableLayout(LanceManifest manifest, string datasetPath)
+    {
+        foreach (var fragment in manifest.Fragments)
+        {
+            if (fragment.Files.Count != 1)
+                throw new NotSupportedException(
+                    $"Cannot rewrite the Lance dataset at '{datasetPath}': fragment {fragment.Id} has "
+                    + $"{fragment.Files.Count} data files (a column-split layout), which LanceDatasetWriter does not read.");
+
+            var file = fragment.Files[0];
+            bool sameFields = file.Fields.Count == manifest.Fields.Count;
+            for (int i = 0; sameFields && i < file.Fields.Count; i++)
+                sameFields = file.Fields[i] == manifest.Fields[i].Id;
+            bool identityColumns = file.ColumnIndices.Count == 0 || file.ColumnIndices.Count == file.Fields.Count;
+            for (int i = 0; identityColumns && i < file.ColumnIndices.Count; i++)
+                identityColumns = file.ColumnIndices[i] == i;
+            if (!sameFields || !identityColumns)
+                throw new NotSupportedException(
+                    $"Cannot rewrite the Lance dataset at '{datasetPath}': the data file of fragment {fragment.Id} "
+                    + $"holds fields [{string.Join(", ", file.Fields)}] as columns "
+                    + $"[{string.Join(", ", file.ColumnIndices)}], not the manifest's fields "
+                    + $"[{string.Join(", ", manifest.Fields.Select(f => f.Id))}] in order, which LanceDatasetWriter "
+                    + "does not map.");
+        }
     }
 
     /// <summary>Reads <paramref name="fragment"/>'s deletion file, wherever its base puts it.</summary>
@@ -1527,6 +1583,13 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         // the vacuum rather than guess.
         var tableLocation = fs.Location;
         var liveFiles = new HashSet<StorageLocation>();
+        // The names of live files under a LOCAL base outside the root. Such a
+        // base may reach this dataset's own files through a link (a symlink or
+        // junction to {root}/data, say), so its locations can differ from the
+        // listed ones for the same file. A listed file with such a name is kept:
+        // data file names are UUIDs, so this only keeps an occasional dead
+        // deletion file, never deletes a live one.
+        var liveAliasNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var liveTxnFiles = new HashSet<string>(StringComparer.Ordinal);
         foreach (var entry in retainedEntries)
         {
@@ -1537,19 +1600,30 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             foreach (var fragment in manifest.Fragments)
             {
                 foreach (var file in fragment.Files)
-                    liveFiles.Add(locator.LocateDataFile(fragment, file));
+                    AddLive(locator.LocateDataFile(fragment, file), file.Path);
                 if (fragment.DeletionFile is not null)
-                    liveFiles.Add(locator.LocateDeletionFile(
-                        fragment, DeletionFileReader.FileName(fragment.Id, fragment.DeletionFile)));
+                {
+                    string deletionName = DeletionFileReader.FileName(fragment.Id, fragment.DeletionFile);
+                    AddLive(locator.LocateDeletionFile(fragment, deletionName), deletionName);
+                }
             }
             if (!string.IsNullOrEmpty(manifest.TransactionFile))
                 liveTxnFiles.Add(Path.GetFileName(manifest.TransactionFile));
+        }
+
+        void AddLive(StorageLocation location, string path)
+        {
+            liveFiles.Add(location);
+            if (location.IsFile && !location.IsUnder(tableLocation))
+                liveAliasNames.Add(Path.GetFileName(path));
         }
 
         // A listed file is kept unless its location is known and no retained
         // version names it; a name StorageLocation will not take is kept.
         bool IsLive(StorageLocation directory, string name)
         {
+            if (liveAliasNames.Contains(name))
+                return true;
             try
             {
                 return liveFiles.Contains(directory.Combine(name));

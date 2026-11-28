@@ -493,6 +493,104 @@ public sealed class LanceBasePathsTests : IDisposable
         Assert.Equal(afterCompact, await PylanceRowsAsync(Clone));
     }
 
+    [Theory]
+    [InlineData(2UL)]   // stable row ids
+    [InlineData(8UL)]   // table config
+    [InlineData(64UL)]  // unknown
+    public async Task WriterFlagsItDoesNotHonour_RefuseEveryWrite(ulong flag)
+    {
+        RewriteManifests(Clone, m => m.WriterFeatureFlags |= flag);
+        string[] before = ListFiles(_root);
+        var pred = EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", LiteralValue.Of(0));
+
+        await AssertRefusesAsync(async () => await LanceDatasetWriter.AppendAsync(Clone), "writer feature flags");
+        await AssertRefusesAsync(async () => await LanceDatasetWriter.OverwriteAsync(Clone), "writer feature flags");
+        await AssertRefusesAsync(async () => await LanceDatasetWriter.DeleteAsync(Clone, pred, CloneWrite),
+            "writer feature flags");
+        await AssertRefusesAsync(async () => await LanceDatasetWriter.DeleteRowsAsync(Clone,
+            new Dictionary<ulong, IReadOnlyList<int>> { [2] = new[] { 0 } }, CloneWrite), "writer feature flags");
+        await AssertRefusesAsync(async () => await LanceDatasetWriter.UpdateAsync(Clone, pred,
+            new Dictionary<string, Expression> { ["v"] = new LiteralExpression(LiteralValue.Of("x")) }, CloneWrite),
+            "writer feature flags");
+        await AssertRefusesAsync(async () => await LanceDatasetWriter.CompactAsync(Clone, CloneWrite),
+            "writer feature flags");
+
+        Assert.Equal(before, ListFiles(_root));
+    }
+
+    [Fact]
+    public async Task ColumnsOutOfManifestOrder_RefuseRewrites()
+    {
+        // Fragment 2 (the clone's own) claims to hold its two columns swapped: read by position, a delete on id would
+        // test the v column.
+        RewriteManifests(Clone, m =>
+        {
+            var fragment = m.Fragments.SingleOrDefault(f => f.Id == 2);
+            if (fragment is null) return; // older versions predate the clone's own fragment
+            var file = fragment.Files[0];
+            file.ColumnIndices.Clear();
+            file.ColumnIndices.AddRange(new[] { 1, 0 });
+        });
+        string[] before = ListFiles(_root);
+
+        await AssertRefusesAsync(async () => await LanceDatasetWriter.DeleteAsync(Clone,
+            EngineeredWood.Expressions.Expressions.Equal("id", LiteralValue.Of(100)), CloneWrite), "does not map");
+        await AssertRefusesAsync(async () => await LanceDatasetWriter.CompactAsync(Clone, CloneWrite), "does not map");
+        Assert.Equal(before, ListFiles(_root));
+    }
+
+    [Fact]
+    public async Task ColumnSplitFragment_RefusesRewrites()
+    {
+        RewriteManifests(Clone, m =>
+        {
+            var fragment = m.Fragments.SingleOrDefault(f => f.Id == 2);
+            fragment?.Files.Add(fragment.Files[0].Clone());
+        });
+
+        await AssertRefusesAsync(async () => await LanceDatasetWriter.CompactAsync(Clone, CloneWrite), "column-split");
+    }
+
+    [Fact]
+    public async Task Vacuum_KeepsAFileABaseReachesThroughALink()
+    {
+#if NET6_0_OR_GREATER
+        // A file-directory base at a link to the dataset's own data/: the base names alias/x.lance, vacuum lists
+        // data/x.lance, and they are the same file.
+        string alias = Path.Combine(_root, "alias");
+        try
+        {
+            Directory.CreateSymbolicLink(alias, Path.Combine(Multi, "data"));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return; // this machine may not create symbolic links
+        }
+
+        string filebase = Path.Combine(_root, "filebase");
+        string moved = Directory.GetFiles(filebase).Single();
+        File.Move(moved, Path.Combine(Multi, "data", Path.GetFileName(moved)));
+        RewriteBases(Multi, b => { if (!b.IsDatasetRoot) b.Path = alias; });
+
+        var result = await LanceDatasetWriter.VacuumAsync(Multi, new LanceVacuumOptions { RetainVersions = 1 });
+
+        Assert.DoesNotContain(Path.GetFileName(moved), result.DataFilesDeleted);
+        var resolver = new StorageResolver()
+            .Register(new LocalTableFileSystem(Path.Combine(_root, "rootbase")))
+            .Register(new LocalTableFileSystem(alias));
+        await using var table = await LanceTable.OpenAsync(Multi, new LanceTableOptions { StorageResolver = resolver });
+        Assert.Equal(MultiIds, await ReadIdsAsync(table));
+#else
+        await Task.CompletedTask;
+#endif
+    }
+
+    private static async Task AssertRefusesAsync(Func<Task> write, string expected)
+    {
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(write);
+        Assert.Contains(expected, ex.Message, StringComparison.Ordinal);
+    }
+
     // --- helpers ----------------------------------------------------------------------------------
 
     private const ulong FlagBasePaths = 16;

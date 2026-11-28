@@ -128,7 +128,17 @@ does when a writer names no target base:
   through any base. It compares locations, not names or
   `(base_id, path)`, so a base that lies inside the root cannot make a
   live file look unreferenced. A base it cannot place, such as a relative
-  path, makes it refuse.
+  path, makes it refuse. A local base outside the root may still reach the
+  root's files through a symlink or junction, so vacuum also keeps any
+  file named like a live file under such a base.
+
+Every operation except vacuum refuses a manifest whose writer feature
+flags it does not maintain: stable row ids (2), table config (8) and any
+unknown flag. Committing would silently drop them. Delete, delete-rows,
+update and compact also refuse a fragment that is not one data file
+holding the manifest's fields in order (a column-split or reordered
+layout), because they read columns by position. Both checks happen before
+anything is written.
 
 ## Type coverage
 
