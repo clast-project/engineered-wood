@@ -250,6 +250,53 @@ public class LanceDatasetWriterMapVersionTests
         }
     }
 
+    // A refused Create leaves nothing behind, so a retry isn't told the path
+    // "already contains a Lance dataset".
+    [Fact]
+    public async Task Create_WithAnUnsupportedVersion_LeavesNothingBehind()
+    {
+        string path = NewDatasetPath();
+        try
+        {
+            await Assert.ThrowsAsync<ArgumentOutOfRangeException>(async () =>
+                await LanceDatasetWriter.CreateAsync(path, fileVersion: LanceVersion.V2_0));
+            Assert.False(Directory.Exists(path));
+
+            await using var ds = await LanceDatasetWriter.CreateAsync(path);
+            await ds.FileWriter.WriteInt32ColumnAsync("id", new[] { 1 });
+            await ds.FinishAsync();
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    // The same for a failure inside the file writer's creation, into an existing empty directory.
+    [Fact]
+    public async Task Create_ThatFailsToCreateTheDataFile_CanBeRetried()
+    {
+        string path = NewDatasetPath();
+        Directory.CreateDirectory(path);
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+                await LanceDatasetWriter.CreateAsync(path, cts.Token));
+            Assert.True(Directory.Exists(path));
+            Assert.Empty(Directory.EnumerateFileSystemEntries(path));
+
+            await using var ds = await LanceDatasetWriter.CreateAsync(path);
+            await ds.FileWriter.WriteInt32ColumnAsync("id", new[] { 1 });
+            await ds.FinishAsync();
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
     internal static async Task<EngineeredWood.Lance.Table.Proto.Manifest> LatestManifestAsync(string path)
     {
         var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(path);

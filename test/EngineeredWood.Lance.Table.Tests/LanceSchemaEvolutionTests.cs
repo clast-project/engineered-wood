@@ -205,8 +205,42 @@ public class LanceSchemaEvolutionTests
             // Delete is still allowed, and records the files' own version, not a guessed 2.1.
             await LanceDatasetWriter.DeleteAsync(path, Equal("b", LiteralValue.Of(20L)));
             var manifest = await LanceDatasetWriterMapVersionTests.LatestManifestAsync(path);
-            var file = manifest.Fragments[0].Files[0];
-            Assert.Equal($"{file.FileMajorVersion}.{file.FileMinorVersion}", manifest.DataFormat.Version);
+            Assert.Equal("2.0", manifest.DataFormat.Version);
+            await AssertPylanceReadsAsync(path, "[{\"b\":10,\"c\":100},{\"b\":30,\"c\":300}]");
+        }
+        finally
+        {
+            DeleteDirectory(path);
+        }
+    }
+
+    // lance reads a DataFile's (0,3) and (2,0) both as 2.0, and refuses a manifest
+    // data_format of "0.3", so EW must neither call them a mix nor record "0.3".
+    [Fact]
+    public async Task DroppedColumn_V20_LegacyFileNumbers_AreTheSameVersion()
+    {
+        string path = CopyFixture("dropped_column_v20");
+        try
+        {
+            int files = 0;
+            LanceBasePathsTests.RewriteManifests(path, m =>
+            {
+                m.DataFormat = null;
+                int i = 0;
+                foreach (var fragment in m.Fragments)
+                    foreach (var file in fragment.Files)
+                        if (i++ % 2 == 0) { file.FileMajorVersion = 0; file.FileMinorVersion = 3; }
+                files = i;
+            });
+            Assert.True(files > 0);
+
+            var ex = await Assert.ThrowsAsync<NotSupportedException>(async () =>
+                await LanceDatasetWriter.AppendAsync(path));
+            Assert.Contains("2.0 dataset", ex.Message);
+
+            await LanceDatasetWriter.DeleteAsync(path, Equal("b", LiteralValue.Of(20L)));
+            var manifest = await LanceDatasetWriterMapVersionTests.LatestManifestAsync(path);
+            Assert.Equal("2.0", manifest.DataFormat.Version);
             await AssertPylanceReadsAsync(path, "[{\"b\":10,\"c\":100},{\"b\":30,\"c\":300}]");
         }
         finally
