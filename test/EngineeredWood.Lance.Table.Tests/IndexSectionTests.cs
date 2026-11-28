@@ -209,6 +209,30 @@ public sealed class IndexSectionTests : IDisposable
     }
 
     [Fact]
+    public async Task AnIndexSectionStartingInsideTheTransaction_IsRefused()
+    {
+        // Move the index section to just after pylance's transaction (at the old manifest position), then lengthen
+        // the transaction's prefix so that the transaction runs past the section's start. The section does not contain
+        // the transaction's start, but it lies inside the transaction's bytes.
+        string dataset = Copy("index_vacuumed_v21");
+        string file = Assert.Single(Directory.GetFiles(Path.Combine(dataset, "_versions"), "*.manifest"));
+        IndexSectionTests.RewriteIndexSection(dataset, _ => { });
+
+        byte[] bytes = File.ReadAllBytes(file);
+        int manifestPos = checked((int)BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(bytes.Length - 16)));
+        var manifest = Proto.Manifest.Parser.ParseFrom(bytes, manifestPos + 4,
+            checked((int)BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(manifestPos))));
+        int sectionPos = checked((int)manifest.IndexSection);
+        int txnPos = checked((int)manifest.TransactionSection);
+        Assert.True(txnPos < sectionPos);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(txnPos), (uint)(sectionPos + 8 - (txnPos + 4)));
+        File.WriteAllBytes(file, bytes);
+
+        var ex = await Assert.ThrowsAsync<LanceTableFormatException>(() => LanceTable.OpenAsync(dataset).AsTask());
+        Assert.Contains("overlaps the transaction section", ex.Message);
+    }
+
+    [Fact]
     public async Task AnIndexSectionRunningIntoTheManifest_IsRefused()
     {
         string dataset = Copy("index_vacuumed_v21");

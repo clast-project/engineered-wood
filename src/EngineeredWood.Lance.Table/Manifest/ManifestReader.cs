@@ -57,7 +57,7 @@ internal static class ManifestReader
     /// <summary>
     /// The index section <paramref name="manifest"/> points at in its file's <paramref name="bytes"/>, or null when it
     /// points at none. The section, with its length prefix, must lie wholly before the manifest's length prefix and
-    /// must not contain the start of the transaction section (either field, 23 or the deprecated 21), so it can never
+    /// must not overlap any byte of the transaction section (either field, 23 or the deprecated 21), so it can never
     /// be read out of another section's bytes.
     /// </summary>
     public static IndexSection? ParseIndexSection(ReadOnlySpan<byte> bytes, Proto.Manifest manifest, string pathForErrors)
@@ -86,10 +86,22 @@ internal static class ManifestReader
                      manifest.HasTransactionSectionDeprecated ? manifest.TransactionSectionDeprecated : null,
                  })
         {
-            if (transaction is { } t && t >= (ulong)start && t < (ulong)end)
+            if (transaction is not { } t || t >= (ulong)manifestLenPos)
+                continue;
+            // The transaction's own length prefix and message, cut at the manifest; a prefix that does not fit
+            // claims everything up to the manifest.
+            long txnStart = (long)t;
+            long txnEnd = manifestLenPos;
+            if (manifestLenPos - txnStart >= sizeof(uint))
+            {
+                uint txnLength = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
+                    bytes.Slice((int)txnStart, sizeof(uint)));
+                txnEnd = System.Math.Min(manifestLenPos, txnStart + sizeof(uint) + (long)txnLength);
+            }
+            if (start < txnEnd && txnStart < end)
                 throw new LanceTableFormatException(
-                    $"Manifest '{pathForErrors}' index section [{start}, {end}) overlaps the transaction section at " +
-                    $"{t}.");
+                    $"Manifest '{pathForErrors}' index section [{start}, {end}) overlaps the transaction section " +
+                    $"[{txnStart}, {txnEnd}).");
         }
 
         try
