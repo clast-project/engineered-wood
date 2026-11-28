@@ -93,6 +93,11 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     // The base_paths of the manifest this session builds on (Append: the base manifest; Overwrite: the latest
     // version), carried into the new manifest as lance carries them (#990). Empty for Create.
     private readonly IReadOnlyList<BasePath> _basePaths;
+    // The manifest this session commits on top of (Append: the base manifest; Overwrite: the latest version, or null
+    // when there is none; Create: null), whose fragment id high-water mark the new manifest keeps.
+    private readonly LanceManifest? _previousManifest;
+    // For Append: the base manifest's index section, carried into the new manifest (#1002). Null otherwise.
+    private readonly IndexSection? _baseIndices;
 
     private LanceFileWriter _currentFileWriter;
     private string _currentDataFileName;
@@ -115,6 +120,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     private LanceDatasetWriter(
         string datasetPath, LanceWriteMode mode, LanceCompressionScheme compression,
         LanceManifest? baseManifest, ulong readVersion, IReadOnlyList<BasePath> basePaths,
+        LanceManifest? previousManifest, IndexSection? baseIndices,
         LanceFileWriter fileWriter, string dataFileName)
     {
         _datasetPath = datasetPath;
@@ -123,6 +129,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         _baseManifest = baseManifest;
         _readVersion = readVersion;
         _basePaths = basePaths;
+        _previousManifest = previousManifest;
+        _baseIndices = baseIndices;
         _currentFileWriter = fileWriter;
         _currentDataFileName = dataFileName;
     }
@@ -184,6 +192,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 nameof(fileVersion), requestedVersion, "LanceDatasetWriter writes Lance v2.1 and v2.2 files only.");
 
         LanceManifest? baseManifest = null;
+        LanceManifest? previousManifest = null;
+        IndexSection? baseIndices = null;
         bool createdRoot = false;
         ulong readVersion = 0;
         IReadOnlyList<BasePath> basePaths = System.Array.Empty<BasePath>();
@@ -215,11 +225,12 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(datasetPath);
             var entry = await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
                 .ConfigureAwait(false);
-            baseManifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
+            (baseManifest, baseIndices) = await ManifestReader.ReadWithIndicesAsync(fs, entry.Path, cancellationToken)
                 .ConfigureAwait(false);
             ThrowIfUnwritable(baseManifest, datasetPath);
             readVersion = baseManifest.Version;
             basePaths = baseManifest.BasePaths;
+            previousManifest = baseManifest;
         }
         else // Overwrite
         {
@@ -238,6 +249,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                     // lance keeps the bases on an overwrite (measured, pylance 14.0.3, overwrite of a shallow
                     // clone): older versions still name them, and so may an index.
                     basePaths = latest.BasePaths;
+                    // Its indices are not: lance drops every index on an overwrite, whose schema may change.
+                    previousManifest = latest;
                 }
             }
             else if (!Directory.Exists(datasetPath))
@@ -310,7 +323,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
 
         return new LanceDatasetWriter(
             datasetPath, mode, compression, baseManifest, readVersion, basePaths,
-            fileWriter, dataFileName);
+            previousManifest, baseIndices, fileWriter, dataFileName);
     }
 
     /// <summary>
@@ -400,7 +413,11 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
 
         // --- Build the manifest proto ---
         LanceManifest manifest = BuildManifest(sessionFields, txnFileName);
-        await WriteManifestFileAsync(_datasetPath, manifest, transactionBytes, cancellationToken)
+        // Append keeps the base's indices: the new fragments are in no segment's bitmap, so readers scan them.
+        // Create and Overwrite have none.
+        IndexSection? indices = _mode == LanceWriteMode.Append ? CarryIndices(_baseIndices, manifest) : null;
+        await WriteManifestFileAsync(_datasetPath, manifest, _previousManifest, indices, transactionBytes,
+                cancellationToken)
             .ConfigureAwait(false);
         _finished = true;
     }
@@ -437,39 +454,132 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         manifest.WriterFeatureFlags = flags;
     }
 
+    // lance-table 14.0.3 system_index: indices lance maintains itself, whose bitmaps are lineage rather than coverage.
+    private const string FragReuseIndexName = "__lance_frag_reuse";
+    private const string MemWalIndexName = "__lance_mem_wal";
+
     /// <summary>
-    /// Pack a manifest proto + its transaction proto into the on-disk
-    /// manifest file format (transaction-len + transaction + manifest-len
-    /// + manifest + 16-byte trailer with the manifest-len position, file
-    /// version, and "LANC" magic) and write it to
-    /// <c>_versions/{u64::MAX - version}.manifest</c>. Used by both the
+    /// The index segments of <paramref name="baseIndices"/> that stay valid in <paramref name="manifest"/>, the
+    /// manifest an Append, Delete, Update or Compact commits on top of the one they came from (#1002); null for
+    /// none. Each segment answers only for the fragments in its <c>fragment_bitmap</c>, and none of those operations
+    /// rewrites a fragment in place: new rows go to new fragments, which no bitmap names (their ids are above the
+    /// high-water mark, <see cref="NextFragmentId"/>), deletion files only hide rows, and a fragment that is dropped
+    /// leaves an id no fragment takes again. So a carried segment never answers wrongly, as lance-table 14.0.3
+    /// <c>build_manifest</c> also carries them through these operations (it rewrites bitmaps only when it remaps the
+    /// index files themselves, or rewrites a column in place, which EW never does).
+    ///
+    /// <para>A segment on a field the schema no longer has is dropped (lance's <c>retain_relevant_indices</c>).
+    /// When the section holds a system index (fragment reuse, MemWAL), whose state follows the fragments lance
+    /// rewrites, nothing is carried: dropping every index loses pruning but never answers wrongly, and is what EW's
+    /// writer did before. Datasets whose indices need a feature flag (tagged fragment reuse, covering columns) are
+    /// already refused (<see cref="ThrowIfUnwritable"/>).</para>
+    /// </summary>
+    private static IndexSection? CarryIndices(IndexSection? baseIndices, LanceManifest manifest)
+    {
+        if (baseIndices is null || baseIndices.Indices.Count == 0)
+            return null;
+        if (baseIndices.Indices.Any(i => i.Name is FragReuseIndexName or MemWalIndexName))
+            return null;
+        var fieldIds = new HashSet<int>(manifest.Fields.Select(f => f.Id));
+        var carried = new IndexSection();
+        foreach (var index in baseIndices.Indices)
+            if (index.Fields.All(fieldIds.Contains))
+                carried.Indices.Add(index.Clone());
+        return carried.Indices.Count == 0 ? null : carried;
+    }
+
+    /// <summary>
+    /// The highest fragment id <paramref name="manifest"/> has ever used: its <c>max_fragment_id</c> or its largest
+    /// fragment id, whichever is larger, or null when it has neither (lance-table 14.0.3
+    /// <c>Manifest::max_fragment_id</c>, which a stored value decides alone; a manifest from an EW writer that did
+    /// not keep it may have a larger fragment).
+    /// </summary>
+    private static ulong? FragmentHighWater(LanceManifest? manifest)
+    {
+        if (manifest is null)
+            return null;
+        ulong? high = manifest.HasMaxFragmentId ? manifest.MaxFragmentId : null;
+        foreach (var fragment in manifest.Fragments)
+            if (high is not { } h || fragment.Id > h)
+                high = fragment.Id;
+        return high;
+    }
+
+    /// <summary>
+    /// The id of the first fragment a commit on top of <paramref name="previous"/> adds: above every id the dataset
+    /// has used, so an id never names two sets of rows. An index segment's bitmap, a deletion file's name, and
+    /// lance's caches all key on it; a reused id would let a carried segment claim rows it never saw (#1002).
+    /// </summary>
+    private static ulong NextFragmentId(LanceManifest? previous)
+        => FragmentHighWater(previous) is { } high ? high + 1 : 0;
+
+    /// <summary>
+    /// Sets <paramref name="manifest"/>'s <c>max_fragment_id</c> to the highest fragment id it or
+    /// <paramref name="previous"/> has used, as lance-table 14.0.3 carries it forward and raises it
+    /// (<c>update_max_fragment_id</c>), so a fragment dropped from the end keeps its id from being taken again. It
+    /// stays unset when nothing has used an id, or (as lance cannot represent it) when the id does not fit its u32.
+    /// </summary>
+    private static void ApplyMaxFragmentId(LanceManifest manifest, LanceManifest? previous)
+    {
+        ulong? high = FragmentHighWater(manifest);
+        if (FragmentHighWater(previous) is { } before && (high is not { } h || before > h))
+            high = before;
+        if (high is { } value && value <= uint.MaxValue)
+            manifest.MaxFragmentId = (uint)value;
+        else
+            manifest.ClearMaxFragmentId();
+    }
+
+    /// <summary>
+    /// Pack a manifest proto, its transaction proto and, when there are indices, its index section into the on-disk
+    /// manifest file format (index-section-len + index section, when present, + transaction-len + transaction +
+    /// manifest-len + manifest + 16-byte trailer with the manifest-len position, file version, and "LANC" magic) and
+    /// write it to <c>_versions/{u64::MAX - version}.manifest</c>. The index section goes first, at position 0, where
+    /// lance-table 14.0.3 <c>do_write_manifest</c> puts it. Used by both the
     /// regular write path and out-of-band ops like
     /// <see cref="DeleteRowsAsync(string, IReadOnlyDictionary{ulong, IReadOnlyList{int}}, CancellationToken)"/>.
+    /// <paramref name="previous"/> is the manifest the commit builds on (null for a new dataset), whose fragment id
+    /// high-water mark the new one keeps.
     /// </summary>
     private static async Task WriteManifestFileAsync(
-        string datasetPath, LanceManifest manifest, byte[] transactionBytes,
-        CancellationToken cancellationToken)
+        string datasetPath, LanceManifest manifest, LanceManifest? previous, IndexSection? indices,
+        byte[] transactionBytes, CancellationToken cancellationToken)
     {
+        ApplyFeatureFlags(manifest);
+        ApplyMaxFragmentId(manifest, previous);
+        // The index section's position is this file's, never one carried from another manifest, whose offset would
+        // point at unrelated bytes of this one (lance-table 14.0.3 do_write_manifest sets it the same way). A manifest
+        // without one has no indices, for lance and for EW's reader (#991).
+        byte[]? indexBytes = indices is { Indices.Count: > 0 } ? indices.ToByteArray() : null;
+        if (indexBytes is null)
+            manifest.ClearIndexSection();
+        else
+            manifest.IndexSection = 0;
         // Stamp every manifest with its commit timestamp (UTC). Lance
         // readers — including ours — use this for time-based time-travel
         // (`OpenAsync(path, asOf: ...)`). Don't overwrite an existing
         // timestamp; the manifest builder may already have set one (e.g.
         // when copying a manifest forward without a real new commit).
-        ApplyFeatureFlags(manifest);
-        // No index section is written to this file, so an offset carried from another manifest would point at
-        // unrelated bytes of this one (lance-table 14.0.3 do_write_manifest clears it the same way). A manifest without
-        // one has no indices, for lance and for EW's reader (#991).
-        manifest.ClearIndexSection();
         if (manifest.Timestamp is null)
             manifest.Timestamp = PbTimestamp.FromDateTime(DateTime.UtcNow);
         byte[] manifestBytes = manifest.ToByteArray();
-        long bodySize = sizeof(uint) + transactionBytes.Length
+        long indexSize = indexBytes is null ? 0 : sizeof(uint) + indexBytes.Length;
+        long bodySize = indexSize
+                      + sizeof(uint) + transactionBytes.Length
                       + sizeof(uint) + manifestBytes.Length;
-        long manifestLenPos = sizeof(uint) + transactionBytes.Length;
+        long manifestLenPos = indexSize + sizeof(uint) + transactionBytes.Length;
         long totalSize = bodySize + 16;
 
         byte[] buf = new byte[checked((int)totalSize)];
         int cursor = 0;
+        if (indexBytes is not null)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                buf.AsSpan(cursor, sizeof(uint)), checked((uint)indexBytes.Length));
+            cursor += sizeof(uint);
+            indexBytes.CopyTo(buf, cursor);
+            cursor += indexBytes.Length;
+        }
         BinaryPrimitives.WriteUInt32LittleEndian(
             buf.AsSpan(cursor, sizeof(uint)), checked((uint)transactionBytes.Length));
         cursor += sizeof(uint);
@@ -512,7 +622,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         IReadOnlyList<LanceField> sessionFields, string transactionFileName)
     {
         var newFragments = new List<DataFragment>(_completedFragments.Count);
-        ulong nextFragmentId = 0;
+        // Above every id the dataset has used, for Overwrite too, as lance numbers an overwrite's fragments.
+        ulong nextFragmentId = NextFragmentId(_previousManifest);
         ulong nextVersion = _readVersion + 1;
         IEnumerable<LanceField> manifestFields;
 
@@ -521,14 +632,9 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             // Use existing fields and field ids (already validated they
             // match our session fields).
             manifestFields = _baseManifest!.Fields;
-            // Carry forward existing fragments, then bump fragment ids
-            // beyond the highest existing one.
+            // Carry forward existing fragments; the new ones are numbered after them.
             foreach (var frag in _baseManifest.Fragments)
                 newFragments.Add(frag.Clone());
-            ulong maxExisting = 0;
-            foreach (var frag in _baseManifest.Fragments)
-                if (frag.Id >= maxExisting) maxExisting = frag.Id + 1;
-            nextFragmentId = maxExisting;
         }
         else
         {
@@ -715,7 +821,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
 
         // Read the current manifest to figure out what version we're
         // building on top of and what fragments exist.
-        var (_, baseManifest, locator) = await OpenLatestAsync(datasetPath, resolver, cancellationToken)
+        var (_, baseManifest, locator, baseIndices) = await OpenLatestAsync(datasetPath, resolver, cancellationToken)
             .ConfigureAwait(false);
         ulong readVersion = baseManifest.Version;
 
@@ -834,7 +940,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         newManifest.Fragments.AddRange(newFragments);
         CarryBasePaths(baseManifest.BasePaths, newManifest);
 
-        await WriteManifestFileAsync(datasetPath, newManifest, transactionBytes, cancellationToken)
+        await WriteManifestFileAsync(datasetPath, newManifest, baseManifest,
+                CarryIndices(baseIndices, newManifest), transactionBytes, cancellationToken)
             .ConfigureAwait(false);
 
         return (long)newVersion;
@@ -885,7 +992,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 $"Path '{datasetPath}' does not contain a Lance dataset.");
 
         // Read the latest manifest + Arrow schema.
-        var (_, manifest, locator) = await OpenLatestAsync(datasetPath, resolver, cancellationToken)
+        var (_, manifest, locator, _) = await OpenLatestAsync(datasetPath, resolver, cancellationToken)
             .ConfigureAwait(false);
 
         var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
@@ -1073,7 +1180,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             throw new InvalidOperationException(
                 $"Path '{datasetPath}' does not contain a Lance dataset.");
 
-        var (_, manifest, locator) = await OpenLatestAsync(datasetPath, resolver, cancellationToken)
+        var (_, manifest, locator, baseIndices) = await OpenLatestAsync(datasetPath, resolver, cancellationToken)
             .ConfigureAwait(false);
 
         var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
@@ -1211,10 +1318,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         ulong newDeletionId = newVersion;
 
         var newFragmentsList = new List<DataFragment>(manifest.Fragments.Count + 1);
-        ulong maxFragId = 0;
         foreach (var oldFrag in manifest.Fragments)
         {
-            if (oldFrag.Id > maxFragId) maxFragId = oldFrag.Id;
 
             DataFragment newFrag;
             if (perFragmentDeletes.TryGetValue(oldFrag.Id, out var matched))
@@ -1259,7 +1364,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         DataFileColumns.AddFields(newDataFileProto, newFileFields, newFileVersion);
         var newFragmentForUpdates = new DataFragment
         {
-            Id = maxFragId + 1,
+            Id = NextFragmentId(manifest),
             PhysicalRows = (ulong)totalUpdated,
         };
         newFragmentForUpdates.Files.Add(newDataFileProto);
@@ -1288,7 +1393,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         newManifest.Fragments.AddRange(newFragmentsList);
         CarryBasePaths(manifest.BasePaths, newManifest);
 
-        await WriteManifestFileAsync(datasetPath, newManifest, transactionBytes, cancellationToken)
+        await WriteManifestFileAsync(datasetPath, newManifest, manifest,
+                CarryIndices(baseIndices, newManifest), transactionBytes, cancellationToken)
             .ConfigureAwait(false);
 
         return (totalUpdated, (long)newVersion);
@@ -1337,7 +1443,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             throw new InvalidOperationException(
                 $"Path '{datasetPath}' does not contain a Lance dataset.");
 
-        var (_, manifest, locator) = await OpenLatestAsync(datasetPath, resolver, cancellationToken)
+        var (_, manifest, locator, baseIndices) = await OpenLatestAsync(datasetPath, resolver, cancellationToken)
             .ConfigureAwait(false);
 
         // Identify fragments with at least one tombstoned row. Fragments
@@ -1411,11 +1517,9 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         // files, drop the compacted source fragments, append the new
         // compacted fragment (when there are surviving rows).
         var newFragments = new List<DataFragment>(manifest.Fragments.Count);
-        ulong maxFragId = 0;
         var sourceSet = new HashSet<ulong>(sourceFragmentIds);
         foreach (var oldFrag in manifest.Fragments)
         {
-            if (oldFrag.Id > maxFragId) maxFragId = oldFrag.Id;
             if (sourceSet.Contains(oldFrag.Id)) continue;
             newFragments.Add(oldFrag.Clone());
         }
@@ -1458,7 +1562,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 FileSizeBytes = (ulong)newDataFileSize,
             };
             DataFileColumns.AddFields(newDataFileProto, newFileFields, newFileVersion);
-            ulong newFragId = maxFragId + 1;
+            ulong newFragId = NextFragmentId(manifest);
             var compactedFragment = new DataFragment
             {
                 Id = newFragId,
@@ -1493,7 +1597,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         newManifest.Fragments.AddRange(newFragments);
         CarryBasePaths(manifest.BasePaths, newManifest);
 
-        await WriteManifestFileAsync(datasetPath, newManifest, transactionBytes, cancellationToken)
+        await WriteManifestFileAsync(datasetPath, newManifest, manifest,
+                CarryIndices(baseIndices, newManifest), transactionBytes, cancellationToken)
             .ConfigureAwait(false);
 
         return new LanceCompactionResult
@@ -1511,19 +1616,19 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// through <paramref name="resolver"/> when they are read.
     /// </summary>
     private static async ValueTask<(EngineeredWood.IO.Local.LocalTableFileSystem FileSystem, LanceManifest Manifest,
-        LanceFileLocator Locator)> OpenLatestAsync(
+        LanceFileLocator Locator, IndexSection? Indices)> OpenLatestAsync(
         string datasetPath, StorageResolver? resolver, CancellationToken cancellationToken)
     {
         var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(datasetPath);
         var entry = await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
             .ConfigureAwait(false);
-        var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
+        var (manifest, indices) = await ManifestReader.ReadWithIndicesAsync(fs, entry.Path, cancellationToken)
             .ConfigureAwait(false);
         ThrowIfUnwritable(manifest, datasetPath);
         ThrowIfUnreadableLayout(manifest, datasetPath);
         var locator = new LanceFileLocator(fs, manifest, resolver);
         locator.Validate(manifest);
-        return (fs, manifest, locator);
+        return (fs, manifest, locator, indices);
     }
 
     /// <summary>
@@ -1714,7 +1819,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     }
 
     /// <summary>
-    /// Removes data files, manifest files, and transaction files no longer
+    /// Removes data files, manifest files, transaction files, deletion files
+    /// and index directories no longer
     /// referenced by any retained version of the dataset at
     /// <paramref name="datasetPath"/>. Use to free disk space after
     /// overwrite operations or once historical versions are no longer
@@ -1746,6 +1852,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         string dataDir = Path.Combine(datasetPath, "data");
         string txnDir = Path.Combine(datasetPath, "_transactions");
         string deletionsDir = Path.Combine(datasetPath, "_deletions");
+        string indicesDir = Path.Combine(datasetPath, "_indices");
 
         if (!Directory.Exists(datasetPath) || !Directory.Exists(versionsDir))
             throw new InvalidOperationException(
@@ -1786,10 +1893,25 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         // occasional dead deletion file, never deletes a live one.
         var liveAliasNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var liveTxnFiles = new HashSet<string>(StringComparer.Ordinal);
+        // The indices a retained version lists, by uuid, whatever base holds them: an index directory is named by
+        // its uuid, so one a retained version names through any base is kept (#1002). A retained index with no
+        // valid uuid leaves every index directory in place, rather than guess which is its.
+        var liveIndexUuids = new HashSet<Guid>();
+        bool indexDirectoriesKnown = true;
         foreach (var entry in retainedEntries)
         {
-            var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
+            var (manifest, indices) = await ManifestReader.ReadWithIndicesAsync(fs, entry.Path, cancellationToken)
                 .ConfigureAwait(false);
+            if (indices is not null)
+            {
+                foreach (var index in indices.Indices)
+                {
+                    if (EngineeredWood.Lance.Table.Indices.IndexCatalog.TryGetUuid(index, out var uuid))
+                        liveIndexUuids.Add(uuid);
+                    else
+                        indexDirectoriesKnown = false;
+                }
+            }
             var locator = new LanceFileLocator(fs, manifest, resolver: null);
             locator.Validate(manifest);
             foreach (var fragment in manifest.Fragments)
@@ -1834,6 +1956,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         var deletedManifests = new List<string>();
         var deletedTxnFiles = new List<string>();
         var deletedDeletionFiles = new List<string>();
+        var deletedIndexDirectories = new List<string>();
         long bytesDeleted = 0;
 
         // Walk data/ — anything not referenced by a retained manifest is
@@ -1896,12 +2019,34 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             }
         }
 
+        // Walk _indices/ — drop the directory of every index no retained
+        // version lists. A directory whose name is not a uuid is not an
+        // index's, and is left alone.
+        if (indexDirectoriesKnown && Directory.Exists(indicesDir))
+        {
+            foreach (string directory in Directory.EnumerateDirectories(indicesDir))
+            {
+                string baseName = Path.GetFileName(directory);
+                if (!Guid.TryParseExact(baseName, "D", out var uuid)
+                    || !string.Equals(baseName, uuid.ToString("D"), StringComparison.Ordinal)
+                    || liveIndexUuids.Contains(uuid))
+                    continue;
+                long size = 0;
+                foreach (string file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
+                    size += new FileInfo(file).Length;
+                if (!options.DryRun) Directory.Delete(directory, recursive: true);
+                deletedIndexDirectories.Add(baseName);
+                bytesDeleted += size;
+            }
+        }
+
         return new LanceVacuumResult
         {
             DataFilesDeleted = deletedDataFiles,
             ManifestsDeleted = deletedManifests,
             TransactionsDeleted = deletedTxnFiles,
             DeletionFilesDeleted = deletedDeletionFiles,
+            IndexDirectoriesDeleted = deletedIndexDirectories,
             BytesDeleted = bytesDeleted,
             DryRun = options.DryRun,
         };
@@ -2016,7 +2161,13 @@ public sealed record LanceVacuumResult
     /// </summary>
     public IReadOnlyList<string> DeletionFilesDeleted { get; init; }
         = System.Array.Empty<string>();
-    /// <summary>Total bytes reclaimed across all four buckets.</summary>
+    /// <summary>
+    /// Index directories in <c>_indices/</c> (each named by its index's uuid) that were deleted, with everything in
+    /// them: those of indices no retained version lists, such as one an overwrite dropped.
+    /// </summary>
+    public IReadOnlyList<string> IndexDirectoriesDeleted { get; init; }
+        = System.Array.Empty<string>();
+    /// <summary>Total bytes reclaimed across all five buckets.</summary>
     public long BytesDeleted { get; init; }
     /// <summary>
     /// True if vacuum ran in dry-run mode — the file lists describe what

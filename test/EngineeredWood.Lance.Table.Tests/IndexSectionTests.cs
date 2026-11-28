@@ -150,24 +150,6 @@ public sealed class IndexSectionTests : IDisposable
 
     // --- writer and refusals ----------------------------------------------------------------------
 
-    [Fact]
-    public async Task EWAppend_WritesNoIndexSection_SoTheIndexIsNoLongerListed()
-    {
-        // EW's writer does not carry indices forward (yet): its manifest has no index section, which lance reads as
-        // "no indices" too. Reads stay right; they are just not pruned.
-        string dataset = Copy("index_vacuumed_v21");
-        await using (var writer = await LanceDatasetWriter.AppendAsync(dataset))
-        {
-            await writer.FileWriter.WriteInt32ColumnAsync("x", new[] { 7 });
-            await writer.FinishAsync();
-        }
-
-        await using var table = await LanceTable.OpenAsync(dataset);
-        Assert.Empty(await table.GetIndicesAsync());
-        var (_, values) = await ReadXAsync(table, Equal("x", LiteralValue.Of(7)));
-        Assert.Equal([7], values);
-    }
-
     [Theory]
     [InlineData(1UL << 7)]   // FLAG_COVERED_INDEX_METADATA (lance-table 14.0.3)
     [InlineData(1UL << 13)]  // FLAG_INDEPENDENT_COVERING_FIELDS

@@ -70,9 +70,8 @@ and exposes the read side via `LanceTable`.
   (`1 << 7`, `1 << 13`), which change what `IndexMetadata.fields` means,
   are refused at open like every unknown reader flag.
 - **Index reads**: B-tree and bitmap secondary index files (read-only —
-  we don't write indices yet). EW's writer writes no index section, so a
-  commit it makes leaves the dataset with no indices, for lance and for
-  EW.
+  we don't build indices yet). EW's writer carries the indices of the
+  version it commits on (see *Indices across commits* below).
 - **Base paths** (#963): a manifest's `base_paths` (a shallow clone's
   source, imported files, a multi-base write) are followed. A data file,
   deletion file or index with a `base_id` lies under that base:
@@ -130,10 +129,31 @@ and exposes the read side via `LanceTable`.
 - `CompactAsync(path)` — repacks fragments carrying deletion files into
   a single fresh fragment of survivors.
 - `VacuumAsync(path, options)` — removes data, manifest, transaction,
-  and deletion files no longer referenced by any retained version
-  (`RetainVersions`, `DryRun`).
+  and deletion files and `_indices/{uuid}` directories no longer
+  referenced by any retained version (`RetainVersions`, `DryRun`).
 
 Every commit path stamps `manifest.timestamp` for time travel.
+
+**Indices across commits** (#1002). Append, delete, delete-rows, update
+and compact carry the read manifest's index section forward unchanged,
+as lance 14.0.3's `build_manifest` does for these operations; overwrite
+drops every index, as lance does. A carried segment stays right because
+EW never rewrites a fragment in place: new rows go to new fragments,
+which no segment's `fragment_bitmap` names, so readers scan them; a
+deletion file only hides rows; and a fragment compaction drops can stay
+in a bitmap harmlessly. That last point needs fragment ids never to be
+reused, so every commit numbers new fragments above the dataset's
+high-water mark and keeps `max_fragment_id` (lance's
+`update_max_fragment_id`). Before #1002 EW numbered them after the
+largest live id, so an append after a compaction that dropped the last
+fragment reused its id. A segment on a field the schema lacks is
+dropped. When the section holds a system index (`__lance_frag_reuse`,
+`__lance_mem_wal`), whose state follows lance's own rewrites, nothing is
+carried. Reads are then unpruned, never wrong. Indices that need a
+feature flag (tagged fragment reuse, covering columns) make the dataset
+unwritable, like every unknown writer flag. Vacuum keeps an index
+directory that any retained version lists by uuid, through any base, and
+leaves alone a directory not named like a uuid.
 
 **Datasets with `base_paths`** (#990). The writer does what lance 14.0.3
 does when a writer names no target base:

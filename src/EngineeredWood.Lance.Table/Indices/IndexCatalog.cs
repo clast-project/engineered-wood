@@ -119,7 +119,7 @@ internal static class IndexCatalog
         return paths;
     }
 
-    private static bool TryGetUuid(IndexMetadata idx, out Guid uuid)
+    internal static bool TryGetUuid(IndexMetadata idx, out Guid uuid)
     {
         if (idx.Uuid is null || idx.Uuid.Uuid.Length != 16)
         {
