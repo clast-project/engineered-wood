@@ -69,6 +69,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
     private readonly ISequentialFile _file;
     private readonly bool _ownsFile;
     private LanceVersion _version;  // bumped to V2_2 if a Map column is written
+    private bool _wroteMiniBlockPage;  // a page whose chunk grammar depends on _version
     private readonly LanceCompressionScheme _compression;
     private readonly List<Proto.Field> _fields = new();
     private readonly List<ColumnMetadata> _columns = new();
@@ -1536,7 +1537,18 @@ public sealed class LanceFileWriter : IAsyncDisposable
     {
         ThrowIfFinalized();
         // Bump the file version — pylance won't read maps from a v2.1 file.
-        if (_version != LanceVersion.V2_2) _version = LanceVersion.V2_2;
+        // The two versions use different mini-block chunk grammars (v2.2
+        // requires has_large_chunk, v2.1 forbids it), so a bump after a
+        // v2.1-grammar page is already on disk would leave a file that no
+        // lance reader accepts.
+        if (_version != LanceVersion.V2_2)
+        {
+            if (_wroteMiniBlockPage)
+                throw new NotSupportedException(
+                    $"Map column '{name}' needs a Lance v2.2 file, but earlier columns were already " +
+                    "written in the v2.1 mini-block grammar. Write the Map column first.");
+            _version = LanceVersion.V2_2;
+        }
 
         var mapType = (MapType)array.Data.DataType;
         var entriesField = mapType.Fields[0];  // typically "entries"
@@ -2337,7 +2349,9 @@ public sealed class LanceFileWriter : IAsyncDisposable
         int numLevels, int visibleItems, int dataBytes,
         bool isVariableInner, int innerBytesPerItem, bool hasDef)
     {
-        int header = 2 + 2 + (hasDef ? 2 : 0) + 2;
+        // Size the header for the v2.2 grammar (u32 value-buffer size), which
+        // is never smaller than the v2.1 one (u16), so one budget fits both.
+        int header = 2 + 2 + (hasDef ? 2 : 0) + 4;
         int headerPadded = AlignUp(header, MiniBlockAlignment);
         int repPadded = AlignUp(numLevels * sizeof(ushort), MiniBlockAlignment);
         int defPadded = hasDef ? AlignUp(numLevels * sizeof(ushort), MiniBlockAlignment) : 0;
@@ -2645,13 +2659,20 @@ public sealed class LanceFileWriter : IAsyncDisposable
             };
         }
 
+        // v2.2 files require the "large chunk" grammar (lance-file
+        // v2_2/reader.rs refuses a mini-block page without has_large_chunk)
+        // and v2.1 files forbid it: u32 chunk-metadata words and a u32
+        // value-buffer size in each chunk header instead of u16s.
+        bool largeChunk = _version == LanceVersion.V2_2;
+        _wroteMiniBlockPage = true;
+
         // num_levels (u16) + optional rep_size (u16) + optional def_size (u16)
-        // + value_buf_size (u16).
-        int headerLen = 2 + (hasRep ? 2 : 0) + (hasDef ? 2 : 0) + 2;
+        // + value_buf_size (u16, or u32 with the large-chunk grammar).
+        int headerLen = 2 + (hasRep ? 2 : 0) + (hasDef ? 2 : 0) + (largeChunk ? 4 : 2);
         int headerPadded = AlignUp(headerLen, MiniBlockAlignment);
 
         byte[][] chunkBytes = new byte[N][];
-        ushort[] metaWords = new ushort[N];
+        uint[] metaWords = new uint[N];
         long dataTotal = 0;
 
         for (int c = 0; c < N; c++)
@@ -2674,7 +2695,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
             int defPadded = hasDef ? AlignUp(defByteLen, MiniBlockAlignment) : 0;
             int chunkTotal = AlignUp(headerPadded + repPadded + defPadded + valueBufLen, MiniBlockAlignment);
             int dividedBytes = (chunkTotal / MiniBlockAlignment) - 1;
-            if (dividedBytes < 0 || dividedBytes > 0xFFF)
+            if (dividedBytes < 0 || (!largeChunk && dividedBytes > 0xFFF))
                 throw new InvalidOperationException(
                     $"Chunk {c} byte length {chunkTotal} cannot be encoded as a v2.1 mini-block word.");
 
@@ -2697,7 +2718,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
                         $"Non-last chunk {c} item count {itemCount} must be a power of 2 >= 2.");
                 logNumValues = log2;
             }
-            metaWords[c] = (ushort)((dividedBytes << 4) | (logNumValues & 0xF));
+            metaWords[c] = ((uint)dividedBytes << 4) | (uint)(logNumValues & 0xF);
 
             byte[] cb = new byte[chunkTotal];
             int cursor = 0;
@@ -2724,21 +2745,29 @@ public sealed class LanceFileWriter : IAsyncDisposable
                     cb.AsSpan(cursor, 2), checked((ushort)defByteLen));
                 cursor += 2;
             }
-            // Pylance writes valueBufSize ROUNDED UP to the 8-byte mini-block
-            // alignment for raw Flat / Variable encodings — its lance.dataset()
-            // decoder reads the value buffer as a fixed-width slice and panics
-            // when the declared size is not a multiple of the element width
-            // (e.g. 4-byte u32 offsets for Variable). For General(ZSTD) wraps
-            // we write the EXACT compressed-frame length: the reader slices
-            // `valueBufSize` bytes and hands them straight to ZSTD, which
-            // rejects trailing padding bytes as "Src size is incorrect".
-            bool isZstdWrap = valueEncoding.CompressionCase
-                == CompressiveEncoding.CompressionOneofCase.General;
-            int valueBufLenOnDisk = isZstdWrap
-                ? valueBufLen
-                : AlignUp(valueBufLen, MiniBlockAlignment);
-            BinaryPrimitives.WriteUInt16LittleEndian(
-                cb.AsSpan(cursor, 2), checked((ushort)valueBufLenOnDisk));
+            // The recorded value-buffer size is what lance's decompressor is
+            // handed, so it must be what pylance records; the chunk itself is
+            // still padded to the 8-byte mini-block alignment.
+            //  - Flat / FSL / General(ZSTD): the EXACT length. lance 14 checks
+            //    a Flat buffer's size exactly ("Flat buffer has 16 bytes,
+            //    expected 12"), and ZSTD rejects trailing padding.
+            //  - Variable: rounded up to the offset width (4 for u32 offsets).
+            //    pylance pads each chunk to that, and lance's legacy binary
+            //    decoder refuses a size that is not a multiple of it.
+            int valueBufLenOnDisk =
+                valueEncoding.CompressionCase == CompressiveEncoding.CompressionOneofCase.Variable
+                    ? AlignUp(valueBufLen, VariableOffsetBytes(valueEncoding.Variable))
+                    : valueBufLen;
+            if (largeChunk)
+            {
+                BinaryPrimitives.WriteUInt32LittleEndian(
+                    cb.AsSpan(cursor, 4), checked((uint)valueBufLenOnDisk));
+            }
+            else
+            {
+                BinaryPrimitives.WriteUInt16LittleEndian(
+                    cb.AsSpan(cursor, 2), checked((ushort)valueBufLenOnDisk));
+            }
 
             int writeCursor = headerPadded;
             if (hasRep)
@@ -2765,10 +2794,17 @@ public sealed class LanceFileWriter : IAsyncDisposable
             dataTotal += chunkTotal;
         }
 
-        // Buffer 0: one u16 chunk-meta word per chunk.
-        byte[] metaBuf = new byte[checked(N * sizeof(ushort))];
+        // Buffer 0: one chunk-meta word per chunk (u16, or u32 with the
+        // large-chunk grammar).
+        int wordBytes = largeChunk ? sizeof(uint) : sizeof(ushort);
+        byte[] metaBuf = new byte[checked(N * wordBytes)];
         for (int c = 0; c < N; c++)
-            BinaryPrimitives.WriteUInt16LittleEndian(metaBuf.AsSpan(c * sizeof(ushort), sizeof(ushort)), metaWords[c]);
+        {
+            if (largeChunk)
+                BinaryPrimitives.WriteUInt32LittleEndian(metaBuf.AsSpan(c * wordBytes, wordBytes), metaWords[c]);
+            else
+                BinaryPrimitives.WriteUInt16LittleEndian(metaBuf.AsSpan(c * wordBytes, wordBytes), (ushort)metaWords[c]);
+        }
 
         // Buffer 1: concatenated chunk bytes.
         byte[] dataBuf = new byte[checked((int)dataTotal)];
@@ -2806,6 +2842,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
             NumBuffers = 1,
             NumItems = (ulong)numItems,
             RepetitionIndexDepth = (uint)repetitionIndexDepth,
+            HasLargeChunk = largeChunk,
         };
         if (hasRep)
         {
@@ -3135,6 +3172,11 @@ public sealed class LanceFileWriter : IAsyncDisposable
         while (v > 1) { v >>= 1; log++; }
         return log;
     }
+
+    private static int VariableOffsetBytes(Proto.Encodings.V21.Variable variable) =>
+        variable.Offsets?.CompressionCase == CompressiveEncoding.CompressionOneofCase.Flat
+            ? checked((int)variable.Offsets.Flat.BitsPerValue / 8)
+            : sizeof(uint);
 
     private static int AlignUp(int value, int alignment) =>
         (value + (alignment - 1)) & ~(alignment - 1);
