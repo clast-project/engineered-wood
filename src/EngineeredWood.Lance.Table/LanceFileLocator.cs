@@ -41,6 +41,7 @@ internal sealed class LanceFileLocator
     private const string DataDirectory = "data";
     private const string DeletionsDirectory = "_deletions";
     private const string IndicesDirectory = "_indices";
+    private static readonly bool IsWindows = Path.DirectorySeparatorChar == '\\';
 
     private readonly StorageResolver _resolver;
     private readonly Dictionary<uint, BasePath> _basesById;
@@ -182,6 +183,14 @@ internal sealed class LanceFileLocator
                 $"Base path {baseId} is the relative path '{path}'. Lance resolves a relative base against the "
                 + "working directory of the process that opens the dataset, so what it names is not part of the "
                 + "dataset, and EW does not read it.");
+
+        // Off Windows a '\' in a bare path is a file-name character (lance takes the path literally), but
+        // StorageLocation.Parse reads it as a separator on every platform, so '/t\src' would name '/t/src', which may
+        // even lie under the dataset. Refuse it rather than read a different directory.
+        if (!IsWindows && !HasUriScheme(path) && path.IndexOf('\\') >= 0)
+            throw new NotSupportedException(
+                $"Base path {baseId} is the local path '{path}', which has a '\\'. Here that is a character of a file "
+                + "name, and EW does not yet read such a path literally.");
 
         try
         {

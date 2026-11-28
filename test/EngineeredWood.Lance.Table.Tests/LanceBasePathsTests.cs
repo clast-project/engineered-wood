@@ -168,6 +168,19 @@ public sealed class LanceBasePathsTests : IDisposable
 
     // --- refusals ---------------------------------------------------------------------------------
 
+    [Fact]
+    public async Task PosixBackslashInBarePath_IsRefused()
+    {
+        // Off Windows, '{clone}\clone_source' is ONE directory name beside the clone (lance reads it literally); read
+        // with '\' as a separator it would name a directory INSIDE the clone, reached without the resolver.
+        if (Path.DirectorySeparatorChar == '\\')
+            return;
+        RewriteBases(Clone, b => b.Path = Clone + "\\clone_source");
+
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(async () => await LanceTable.OpenAsync(Clone));
+        Assert.Contains("'\\'", ex.Message, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData("clone_source")]
     [InlineData("../clone_source")]
