@@ -431,10 +431,37 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                 $"Field index {fieldIndex} is out of range [0, {Schema.FieldsList.Count}).");
 
         var range = _fieldColumnRanges[fieldIndex];
-        var arrowField = Schema.FieldsList[fieldIndex];
+        return await ReadFieldAtColumnsAsync(
+            Schema.FieldsList[fieldIndex], range.StartColumn, range.ColumnCount, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reads <paramref name="arrowField"/> from the physical columns
+    /// <c>[startColumn, startColumn + columnCount)</c>, whatever this file's own
+    /// schema says sits there. A dataset reader uses it to read a manifest field
+    /// through its data file's <c>column_indices</c> (#995): after
+    /// <c>drop_columns</c> the file still holds the dropped columns, so the
+    /// manifest's field <c>i</c> is not the file's field <c>i</c>.
+    /// </summary>
+    /// <exception cref="LanceFormatException">The columns are out of range, or
+    /// <paramref name="arrowField"/>'s type does not span exactly
+    /// <paramref name="columnCount"/> columns in this file's version.</exception>
+    internal async Task<IArrowArray> ReadFieldAtColumnsAsync(
+        Apache.Arrow.Field arrowField, int startColumn, int columnCount, CancellationToken cancellationToken = default)
+    {
+        if (startColumn < 0 || columnCount < 0 || startColumn > _columnMetadatas.Length - columnCount)
+            throw new LanceFormatException(
+                $"Field '{arrowField.Name}' is mapped to columns [{startColumn}, {startColumn + columnCount}) "
+                + $"but the file has {_columnMetadatas.Length} columns.");
 
         if (Version.IsV2_1 || Version.IsV2_2)
         {
+            int leaves = ValidateAndCountLeavesV21(arrowField.DataType, arrowField.Name);
+            if (leaves != columnCount)
+                throw new LanceFormatException(
+                    $"Field '{arrowField.Name}' spans {leaves} physical columns but is mapped to {columnCount}.");
+
             // Phase 7b: structs of primitives are now supported via
             // ReadV21StructAsync. List-of-struct (one Arrow row per top-level
             // field, but multiple physical columns sharing the same rep+def
@@ -451,20 +478,20 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                 or Apache.Arrow.Types.ListType or LargeListType)
             {
                 var (arr, _, _) = await ReadV21NestedAsync(
-                    arrowField.DataType, range.StartColumn, cancellationToken).ConfigureAwait(false);
+                    arrowField.DataType, startColumn, cancellationToken).ConfigureAwait(false);
                 return arr;
             }
             return await ReadV21SingleColumnAsync(
-                range.StartColumn, arrowField.DataType, cancellationToken).ConfigureAwait(false);
+                startColumn, arrowField.DataType, cancellationToken).ConfigureAwait(false);
         }
 
         // v2.0 path (including nested types handled via multi-column reads).
         var (array, consumed) = await ReadArrowFieldAsync(
-            arrowField, range.StartColumn, cancellationToken).ConfigureAwait(false);
+            arrowField, startColumn, cancellationToken).ConfigureAwait(false);
 
-        if (consumed != range.ColumnCount)
+        if (consumed != columnCount)
             throw new LanceFormatException(
-                $"Field {fieldIndex} ({arrowField.Name}) declared {range.ColumnCount} " +
+                $"Field '{arrowField.Name}' is mapped to {columnCount} " +
                 $"physical columns but the decoder consumed {consumed}.");
         return array;
     }

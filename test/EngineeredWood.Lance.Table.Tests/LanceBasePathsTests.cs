@@ -519,27 +519,6 @@ public sealed class LanceBasePathsTests : IDisposable
     }
 
     [Fact]
-    public async Task ColumnsOutOfManifestOrder_RefuseRewrites()
-    {
-        // Fragment 2 (the clone's own) claims to hold its two columns swapped: read by position, a delete on id would
-        // test the v column.
-        RewriteManifests(Clone, m =>
-        {
-            var fragment = m.Fragments.SingleOrDefault(f => f.Id == 2);
-            if (fragment is null) return; // older versions predate the clone's own fragment
-            var file = fragment.Files[0];
-            file.ColumnIndices.Clear();
-            file.ColumnIndices.AddRange(new[] { 1, 0 });
-        });
-        string[] before = ListFiles(_root);
-
-        await AssertRefusesAsync(async () => await LanceDatasetWriter.DeleteAsync(Clone,
-            EngineeredWood.Expressions.Expressions.Equal("id", LiteralValue.Of(100)), CloneWrite), "does not map");
-        await AssertRefusesAsync(async () => await LanceDatasetWriter.CompactAsync(Clone, CloneWrite), "does not map");
-        Assert.Equal(before, ListFiles(_root));
-    }
-
-    [Fact]
     public async Task ColumnSplitFragment_RefusesRewrites()
     {
         RewriteManifests(Clone, m =>
@@ -789,7 +768,7 @@ public sealed class LanceBasePathsTests : IDisposable
     /// Rewrites the manifest message of every manifest under <paramref name="dataset"/>'s <c>_versions/</c>, keeping
     /// every byte before it (so any section offsets stay valid) and the footer's version and magic.
     /// </summary>
-    private static void RewriteManifests(string dataset, Action<Proto.Manifest> edit)
+    internal static void RewriteManifests(string dataset, Action<Proto.Manifest> edit)
     {
         foreach (string file in Directory.GetFiles(Path.Combine(dataset, "_versions"), "*.manifest"))
         {

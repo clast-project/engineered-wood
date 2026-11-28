@@ -3003,6 +3003,29 @@ public sealed class LanceFileWriter : IAsyncDisposable
     }
 
     /// <summary>
+    /// Gives schema field <c>i</c> (in <see cref="SchemaFields"/> order) the id <paramref name="ids"/>[i],
+    /// rewriting parent ids to match. A dataset writer calls it before <see cref="FinishAsync"/> so that a file it
+    /// writes into an existing dataset carries the manifest's field ids, which need not be <c>0..n-1</c> once a
+    /// column has been dropped (#995).
+    /// </summary>
+    internal void RenumberFields(IReadOnlyList<int> ids)
+    {
+        ThrowIfFinalized();
+        if (ids.Count != _fields.Count)
+            throw new ArgumentException(
+                $"Expected {_fields.Count} field ids, got {ids.Count}.", nameof(ids));
+        var map = new Dictionary<int, int>(_fields.Count);
+        for (int i = 0; i < _fields.Count; i++)
+            map[_fields[i].Id] = ids[i];
+        foreach (var f in _fields)
+        {
+            f.Id = map[f.Id];
+            if (map.TryGetValue(f.ParentId, out int parent))
+                f.ParentId = parent;
+        }
+    }
+
+    /// <summary>
     /// Finalises the file: writes column metadata blobs, the CMO table,
     /// the FileDescriptor (global buffer 0), the GBO table, and the
     /// 40-byte footer with <c>"LANC"</c> magic, then completes the

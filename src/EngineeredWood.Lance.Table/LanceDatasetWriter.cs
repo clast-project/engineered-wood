@@ -466,11 +466,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 FileMinorVersion = (uint)fragment.Version.Minor,
                 FileSizeBytes = (ulong)fragment.FileSizeBytes,
             };
-            for (int i = 0; i < fragment.Fields.Count; i++)
-            {
-                dataFile.Fields.Add(fragment.Fields[i].Id);
-                dataFile.ColumnIndices.Add(i);
-            }
+            DataFileColumns.AddFields(dataFile, fragment.Fields, fragment.Version);
             var fragProto = new DataFragment
             {
                 Id = nextFragmentId++,
@@ -850,10 +846,11 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             }
 
             // Read just the columns the predicate references and evaluate.
+            var fileColumns = DataFileColumns.Create(manifest.Fields, fragment.Id, file, reader);
             var readArrays = new IArrowArray[readIndices.Count];
             for (int i = 0; i < readIndices.Count; i++)
-                readArrays[i] = await reader
-                    .ReadColumnAsync(readIndices[i], cancellationToken)
+                readArrays[i] = await fileColumns
+                    .ReadAsync(readIndices[i], readFields[i], cancellationToken)
                     .ConfigureAwait(false);
             var readBatch = new RecordBatch(readSchema, readArrays, rowCount);
 
@@ -1029,9 +1026,10 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 .ConfigureAwait(false);
 
             int rowCount = checked((int)reader.NumberOfRows);
+            var fileColumns = DataFileColumns.Create(manifest.Fields, fragment.Id, file, reader);
             var arrays = new IArrowArray[arrowSchema.FieldsList.Count];
             for (int i = 0; i < arrays.Length; i++)
-                arrays[i] = await reader.ReadColumnAsync(i, cancellationToken)
+                arrays[i] = await fileColumns.ReadAsync(i, arrowSchema.FieldsList[i], cancellationToken)
                     .ConfigureAwait(false);
             var batch = new RecordBatch(arrowSchema, arrays, rowCount);
 
@@ -1107,6 +1105,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                     arrowSchema.FieldsList[i].Name, newFragArrays[i], cancellationToken)
                     .ConfigureAwait(false);
             }
+            // Carry the manifest's field ids, which drop_columns leaves with gaps (#995).
+            w.RenumberFields(DataFileColumns.ManifestIdsFor(manifest.Fields, w.SchemaFields));
             await w.FinishAsync(cancellationToken).ConfigureAwait(false);
             newFileVersion = w.Version;
             newFileFields = w.SchemaFields.Select(f => f.Clone()).ToList();
@@ -1163,11 +1163,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             FileMinorVersion = (uint)newFileVersion.Minor,
             FileSizeBytes = (ulong)newDataFileSize,
         };
-        for (int i = 0; i < newFileFields.Count; i++)
-        {
-            newDataFileProto.Fields.Add(newFileFields[i].Id);
-            newDataFileProto.ColumnIndices.Add(i);
-        }
+        DataFileColumns.AddFields(newDataFileProto, newFileFields, newFileVersion);
         var newFragmentForUpdates = new DataFragment
         {
             Id = maxFragId + 1,
@@ -1297,9 +1293,10 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 .ConfigureAwait(false);
 
             int rowCount = checked((int)reader.NumberOfRows);
+            var fileColumns = DataFileColumns.Create(manifest.Fields, fragment.Id, file, reader);
             var arrays = new IArrowArray[arrowSchema.FieldsList.Count];
             for (int i = 0; i < arrays.Length; i++)
-                arrays[i] = await reader.ReadColumnAsync(i, cancellationToken)
+                arrays[i] = await fileColumns.ReadAsync(i, arrowSchema.FieldsList[i], cancellationToken)
                     .ConfigureAwait(false);
 
             var existingMask = await ReadDeletionMaskAsync(locator, fragment, cancellationToken)
@@ -1353,6 +1350,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                     await w.WriteColumnAsync(
                         arrowSchema.FieldsList[i].Name, newFragArrays[i], cancellationToken)
                         .ConfigureAwait(false);
+                // Carry the manifest's field ids, which drop_columns leaves with gaps (#995).
+                w.RenumberFields(DataFileColumns.ManifestIdsFor(manifest.Fields, w.SchemaFields));
                 await w.FinishAsync(cancellationToken).ConfigureAwait(false);
                 newFileVersion = w.Version;
                 newFileFields = w.SchemaFields.Select(f => f.Clone()).ToList();
@@ -1366,11 +1365,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 FileMinorVersion = (uint)newFileVersion.Minor,
                 FileSizeBytes = (ulong)newDataFileSize,
             };
-            for (int i = 0; i < newFileFields.Count; i++)
-            {
-                newDataFileProto.Fields.Add(newFileFields[i].Id);
-                newDataFileProto.ColumnIndices.Add(i);
-            }
+            DataFileColumns.AddFields(newDataFileProto, newFileFields, newFileVersion);
             ulong newFragId = maxFragId + 1;
             var compactedFragment = new DataFragment
             {
@@ -1459,10 +1454,9 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     }
 
     /// <summary>
-    /// Refuses a fragment whose data file is not laid out as delete, update and compact read it: one file per
-    /// fragment, holding the manifest's fields in the manifest's order, column <c>i</c> being field <c>i</c>. A
-    /// column-split fragment, or one whose columns are ordered differently, would otherwise be read with the wrong
-    /// column at each position, deleting the wrong rows or committing swapped values.
+    /// Refuses a column-split fragment (more than one data file), which delete, update and compact do not read.
+    /// A single data file is read through its <c>fields</c>/<c>column_indices</c> (<see cref="DataFileColumns"/>,
+    /// #995), so its columns need not be the manifest's fields in order.
     /// </summary>
     private static void ThrowIfUnreadableLayout(LanceManifest manifest, string datasetPath)
     {
@@ -1472,21 +1466,6 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 throw new NotSupportedException(
                     $"Cannot rewrite the Lance dataset at '{datasetPath}': fragment {fragment.Id} has "
                     + $"{fragment.Files.Count} data files (a column-split layout), which LanceDatasetWriter does not read.");
-
-            var file = fragment.Files[0];
-            bool sameFields = file.Fields.Count == manifest.Fields.Count;
-            for (int i = 0; sameFields && i < file.Fields.Count; i++)
-                sameFields = file.Fields[i] == manifest.Fields[i].Id;
-            bool identityColumns = file.ColumnIndices.Count == 0 || file.ColumnIndices.Count == file.Fields.Count;
-            for (int i = 0; identityColumns && i < file.ColumnIndices.Count; i++)
-                identityColumns = file.ColumnIndices[i] == i;
-            if (!sameFields || !identityColumns)
-                throw new NotSupportedException(
-                    $"Cannot rewrite the Lance dataset at '{datasetPath}': the data file of fragment {fragment.Id} "
-                    + $"holds fields [{string.Join(", ", file.Fields)}] as columns "
-                    + $"[{string.Join(", ", file.ColumnIndices)}], not the manifest's fields "
-                    + $"[{string.Join(", ", manifest.Fields.Select(f => f.Id))}] in order, which LanceDatasetWriter "
-                    + "does not map.");
         }
     }
 
