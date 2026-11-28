@@ -4,20 +4,22 @@
 namespace EngineeredWood.Lance.Table.Indices;
 
 /// <summary>
-/// Discoverable metadata about a Lance secondary index that's currently
-/// active on a dataset (i.e. created by some past transaction and not
-/// later dropped).
+/// Metadata about one segment of a Lance secondary index that's active on a
+/// dataset version: one entry of the manifest's index section (#991). An
+/// index can have several segments, which share its <see cref="Name"/> and
+/// each cover their own <see cref="FragmentIds"/>; <c>optimize_indices</c>
+/// without merging adds one for the fragments appended since.
 /// </summary>
 public sealed class IndexInfo
 {
     /// <summary>
-    /// Index name. Unique within the dataset.
+    /// Index name, which every segment of the index shares.
     /// </summary>
     public required string Name { get; init; }
 
     /// <summary>
-    /// Unique 16-byte UUID assigned when the index was created. Doubles as
-    /// the directory name under <c>_indices/</c>.
+    /// Unique 16-byte UUID of this segment, assigned when it was written.
+    /// Doubles as the name of its directory under <c>_indices/</c>.
     /// </summary>
     public required Guid Uuid { get; init; }
 
@@ -46,33 +48,50 @@ public sealed class IndexInfo
     public required IReadOnlyList<IReadOnlyList<string>> ColumnPaths { get; init; }
 
     /// <summary>
-    /// Fragment ids covered by the index, decoded from the index's
-    /// stored Roaring bitmap (CRoaring portable variant — same flavour
-    /// Lance uses for deletion vectors). Sorted ascending.
+    /// Fragment ids covered by this segment, decoded from its stored
+    /// Roaring bitmap (CRoaring portable variant — same flavour Lance uses
+    /// for deletion vectors). Sorted ascending. The segment says nothing
+    /// about any other fragment, such as one appended after it was built.
     /// </summary>
     public required IReadOnlyList<uint> FragmentIds { get; init; }
 
     /// <summary>
-    /// Path of the index directory relative to the dataset root, e.g.
-    /// <c>"_indices/{uuid}"</c>. Pass to <see cref="BTreeIndex.OpenAsync(IO.ITableFileSystem, string, CancellationToken)"/>
-    /// to read the index files. An index whose metadata names another base
-    /// (<c>base_id</c>) and lies outside the dataset has its directory's path
-    /// in the file system the dataset's storage resolver gave for that base;
-    /// open it with <see cref="LanceTable.OpenBTreeIndexAsync"/> or
-    /// <see cref="LanceTable.OpenBitmapIndexAsync"/>, which know which.
+    /// Path of the index directory, e.g. <c>"_indices/{uuid}"</c>: relative to
+    /// the dataset root when <see cref="BaseId"/> is null, and otherwise to
+    /// that base (a shallow clone's inherited index lies in its source). For
+    /// an index under the root, pass it to
+    /// <see cref="BTreeIndex.OpenAsync(IO.ITableFileSystem, string, CancellationToken)"/>;
+    /// <see cref="LanceTable.OpenBTreeIndexAsync(IndexInfo, CancellationToken)"/>
+    /// and <see cref="LanceTable.OpenBitmapIndexAsync(IndexInfo, CancellationToken)"/>
+    /// open either kind, resolving a base through the dataset's storage resolver.
     /// </summary>
     public required string DirectoryPath { get; init; }
 
     /// <summary>
-    /// The file system holding <see cref="DirectoryPath"/> when it is not the
-    /// dataset's own (an index under another base); null for the dataset's.
+    /// The id of the manifest's <c>base_paths</c> entry the index lies under,
+    /// or null when it lies under the dataset root.
     /// </summary>
-    internal IO.ITableFileSystem? FileSystem { get; init; }
+    public uint? BaseId { get; init; }
+
+    /// <summary>The manifest's entry for this segment; null for one this library did not read.</summary>
+    internal Proto.IndexMetadata? Metadata { get; init; }
+
+    /// <summary>The locator of the table that listed this segment.</summary>
+    internal LanceFileLocator? Locator { get; init; }
 
     /// <summary>
-    /// The dataset version at which this index was built. Useful for
-    /// diagnostics; the index may still cover newer fragments via the
-    /// fragment bitmap above.
+    /// The dataset version this segment was built from (the manifest's
+    /// <c>dataset_version</c>). Useful for diagnostics; which fragments it
+    /// covers is <see cref="FragmentIds"/>.
     /// </summary>
     public required ulong BuiltFromVersion { get; init; }
+
+    /// <summary>
+    /// The file system and path of this segment's directory, resolving its base now: throws
+    /// <see cref="IO.UnregisteredStorageLocationException"/> when the base is outside the dataset and not registered.
+    /// </summary>
+    internal ResolvedLanceFile ResolveDirectory(IO.ITableFileSystem tableFileSystem) =>
+        Metadata is not null && Locator is not null
+            ? Locator.ResolveIndexDirectory(Metadata, Uuid)
+            : new ResolvedLanceFile(tableFileSystem, DirectoryPath);
 }

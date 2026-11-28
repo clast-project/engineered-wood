@@ -56,9 +56,23 @@ and exposes the read side via `LanceTable`.
 - **Predicate pushdown**: filter passed to `ReadAsync` evaluates against
   each fragment via `ArrowRowEvaluator`. For indexed columns,
   fragment-level pruning skips fragments whose B-tree or bitmap
-  index proves they can't match.
+  index proves they can't match. An index segment answers only for the
+  fragments in its `fragment_bitmap`; every fragment no segment covers
+  (such as one appended after the index was built) is always scanned.
+- **Index discovery** (#991): `GetIndicesAsync` lists the manifest's
+  index section, one `IndexInfo` per index segment, as lance's
+  `read_manifest_indexes` does. A manifest without one has no indices;
+  `_transactions/` is not consulted, so a vacuumed `CreateIndex` and a
+  shallow clone's inherited indices are both found. An index has several
+  segments after `optimize_indices` without merging; they share its name,
+  so `OpenBTreeIndexAsync(name)` refuses such an index and the
+  `IndexInfo` overloads open one segment. The covering-index feature flags
+  (`1 << 7`, `1 << 13`), which change what `IndexMetadata.fields` means,
+  are refused at open like every unknown reader flag.
 - **Index reads**: B-tree and bitmap secondary index files (read-only —
-  we don't write indices yet).
+  we don't write indices yet). EW's writer writes no index section, so a
+  commit it makes leaves the dataset with no indices, for lance and for
+  EW.
 - **Base paths** (#963): a manifest's `base_paths` (a shallow clone's
   source, imported files, a multi-base write) are followed. A data file,
   deletion file or index with a `base_id` lies under that base:
@@ -76,9 +90,11 @@ and exposes the read side via `LanceTable`.
   - A **relative** base is refused: lance resolves it against the reading
     process's working directory, not the dataset. A `.` or `..` segment
     outside a local path is refused (#963).
-  - Index discovery walks `_transactions/`, so a clone's inherited indices
-    (whose `CreateIndex` happened in the source) are not found: reads
-    stay correct but are not index-pruned.
+  - An index's base is checked when the dataset opens, as a data file's
+    is, but resolved only when the index is opened: an index under an
+    unregistered base gives no pruning instead of failing the read
+    (#992). `IndexInfo.BaseId` names the base, and `DirectoryPath` is
+    relative to it.
 - **Columns by field id** (#995): each manifest field is read from the
   column its data file's `fields`/`column_indices` name, as lance-rs does,
   not from its position. `drop_columns` and a rename change only the

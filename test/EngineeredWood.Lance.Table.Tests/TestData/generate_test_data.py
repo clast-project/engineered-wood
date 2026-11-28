@@ -10,6 +10,7 @@
 #   python generate_test_data.py              # every fixture
 #   python generate_test_data.py base_paths   # only base_paths_v21/
 #   python generate_test_data.py schema_evolution   # only the #995 fixtures
+#   python generate_test_data.py index_section      # only the #991 fixtures
 #
 # The generated directories are committed to source control so tests can
 # run without invoking pylance.
@@ -259,13 +260,53 @@ def write_base_paths_fixtures(version="2.1"):
               f"{ {k: (v.path, v.is_dataset_root) for k, v in d.base_paths().items()} }")
 
 
+def write_index_section_fixtures(version="2.1"):
+    """Indices that only the manifest's index section lists (#991).
+
+    index_vacuumed_v21: a BTREE index over fragments 0-1, then an append
+    (fragment 2, which the index does not cover), then
+    cleanup_old_versions, which deletes the CreateIndex .txn. A reader
+    that walks _transactions/ finds no index; and a reader that prunes
+    with it must still scan fragment 2.
+
+    index_segments_v21: the same, then optimize_indices without merging,
+    which adds a second segment of x_idx covering fragment 2 alone. Two
+    IndexMetadata share the name; each answers only for its fragments."""
+    import datetime
+    import time
+
+    def t(values):
+        return pa.table({"x": pa.array(values, type=pa.int32())})
+
+    for name in ("index_vacuumed_v21", "index_segments_v21"):
+        target = os.path.join(THIS_DIR, name)
+        if os.path.exists(target):
+            shutil.rmtree(target)
+        lance.write_dataset(t([1, 2, 3]), target, data_storage_version=version)
+        ds = lance.write_dataset(t([10, 20, 30]), target, mode="append")
+        ds.create_scalar_index("x", "BTREE")
+        ds = lance.write_dataset(t([100, 200]), target, mode="append")
+        if name == "index_vacuumed_v21":
+            time.sleep(0.1)
+            ds.cleanup_old_versions(older_than=datetime.timedelta(0), delete_unverified=True)
+        else:
+            ds.optimize.optimize_indices(num_indices_to_merge=0)
+        d = lance.dataset(target)
+        print(f"  {name}: {d.count_rows()} rows, indices "
+              f"{[(i['name'], sorted(i['fragment_ids'])) for i in d.list_indices()]}, "
+              f"txns {sorted(os.listdir(os.path.join(target, '_transactions')))}")
+
+
 if __name__ == "__main__":
     import sys
     if sys.argv[1:] == ["base_paths"]:
         write_base_paths_fixtures()
     elif sys.argv[1:] == ["schema_evolution"]:
         write_schema_evolution_fixtures()
+    elif sys.argv[1:] == ["index_section"]:
+        write_index_section_fixtures()
     else:
         main()
         write_base_paths_fixtures()
         write_schema_evolution_fixtures()
+        write_index_section_fixtures()

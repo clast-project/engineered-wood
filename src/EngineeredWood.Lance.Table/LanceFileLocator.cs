@@ -163,15 +163,38 @@ internal sealed class LanceFileLocator
     /// <summary>The file system and directory of an index's files.</summary>
     public ResolvedLanceFile ResolveIndexDirectory(IndexMetadata index, Guid uuid)
     {
+        if (!index.HasBaseId)
+            return new ResolvedLanceFile(Table, IndexDirectoryInBase(index, uuid));
+
+        return Resolve(LocateBaseIndexDirectory(index, uuid));
+    }
+
+    /// <summary>
+    /// The path of an index's directory under its base, without reaching it: <c>_indices/{uuid}</c> under the dataset
+    /// root or a dataset-root base, <c>{uuid}</c> under any other base. Checks the base as <see cref="Validate"/>
+    /// checks a data file's, so a based index whose base EW cannot place is refused when the dataset opens, while one
+    /// whose base is not registered fails only when it is opened (#992).
+    /// </summary>
+    public string IndexDirectoryInBase(IndexMetadata index, Guid uuid)
+    {
         string name = uuid.ToString("D");
         if (!index.HasBaseId)
-            return new ResolvedLanceFile(Table, IndicesDirectory + "/" + name);
+            return IndicesDirectory + "/" + name;
 
+        _ = LocateBaseIndexDirectory(index, uuid);
+        return Base(index.BaseId, $"index '{index.Name}' ({name})").IsDatasetRoot
+            ? IndicesDirectory + "/" + name
+            : name;
+    }
+
+    private StorageLocation LocateBaseIndexDirectory(IndexMetadata index, Guid uuid)
+    {
+        string name = uuid.ToString("D");
         string what = $"index '{index.Name}' ({name})";
         var basePath = Base(index.BaseId, what);
         var location = BaseLocation(index.BaseId, what);
         var directory = basePath.IsDatasetRoot ? location.Combine(IndicesDirectory) : location;
-        return Resolve(Combine(directory, name, what));
+        return Combine(directory, name, what);
     }
 
     private StorageLocation DeletionDirectory(uint baseId, ulong fragmentId)

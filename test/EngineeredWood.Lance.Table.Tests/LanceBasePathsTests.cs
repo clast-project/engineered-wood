@@ -60,8 +60,8 @@ public sealed class LanceBasePathsTests : IDisposable
     [Fact]
     public async Task ShallowClone_FilteredRead_MatchesUnfiltered()
     {
-        // The clone's inherited index lives in the source with base_id 0, and EW discovers indices from
-        // _transactions/ (the clone's has only a Clone op), so no index prunes here; the rows must still be right.
+        // The clone's inherited index lives in the source with base_id 0 and covers fragments 0 and 1; fragment 2 is
+        // the clone's own append, which it does not cover.
         var resolver = new StorageResolver().Register(new LocalTableFileSystem(Source));
         await using var table = await LanceTable.OpenAsync(Clone, new LanceTableOptions { StorageResolver = resolver });
 
@@ -71,6 +71,75 @@ public sealed class LanceBasePathsTests : IDisposable
             ids.AddRange(((Int32Array)batch.Column(0)).Values.ToArray());
 
         Assert.Equal(CloneIds.Where(i => i >= 10), ids.OrderBy(i => i));
+    }
+
+    [Fact]
+    public async Task ShallowClone_ListsTheInheritedIndex_UnderItsSource()
+    {
+        // The clone's only transaction is its Clone; the index is in the manifest's index section (#991).
+        var resolver = new StorageResolver().Register(new LocalTableFileSystem(Source));
+        await using var table = await LanceTable.OpenAsync(Clone, new LanceTableOptions { StorageResolver = resolver });
+
+        var info = Assert.Single(await table.GetIndicesAsync());
+        Assert.Equal("id_idx", info.Name);
+        Assert.Equal(0u, info.BaseId);
+        Assert.Equal(new uint[] { 0, 1 }, info.FragmentIds);
+        Assert.Equal($"_indices/{info.Uuid:D}", info.DirectoryPath);
+        Assert.True(Directory.Exists(Path.Combine(Source, "_indices", info.Uuid.ToString("D"))));
+        Assert.False(Directory.Exists(Path.Combine(Clone, "_indices")));
+
+        await using var index = await table.OpenBTreeIndexAsync("id_idx");
+        Assert.Equal(new uint[] { 0 }, (await index.QueryEqualAsync(7)).Select(h => h.FragmentId));
+    }
+
+    [Fact]
+    public async Task ShallowClone_InheritedIndexPrunes_ButNotTheClonesOwnFragment()
+    {
+        var resolver = new StorageResolver().Register(new LocalTableFileSystem(Source));
+        await using var table = await LanceTable.OpenAsync(Clone, new LanceTableOptions { StorageResolver = resolver });
+
+        // id 7 is in fragment 0: the index prunes fragment 1, and fragment 2 is scanned because it is uncovered.
+        {
+            var r = await ReadFilteredIdsAsync(table, EngineeredWood.Expressions.Expressions.Equal("id", LiteralValue.Of(7)));
+            Assert.Equal([7], r.Ids);
+            Assert.Equal(2, r.Batches);
+        }
+        // id 100 is in fragment 2, which the index knows nothing about.
+        {
+            var r = await ReadFilteredIdsAsync(table, EngineeredWood.Expressions.Expressions.Equal("id", LiteralValue.Of(100)));
+            Assert.Equal([100], r.Ids);
+            Assert.Equal(1, r.Batches);
+        }
+        // id 5 was deleted in the clone; the index still names fragment 0, and the deletion file hides the row.
+        {
+            var r = await ReadFilteredIdsAsync(table, EngineeredWood.Expressions.Expressions.Equal("id", LiteralValue.Of(5)));
+            Assert.Empty(r.Ids);
+            Assert.Equal(2, r.Batches);
+        }
+    }
+
+    [Fact]
+    public async Task IndexUnderAnUnregisteredBase_OnlyLosesItsPruning()
+    {
+        // #992 item 2: an index whose base is not registered must not fail a read that can reach every data file.
+        string elsewhere = Path.Combine(_root, "elsewhere");
+        RewriteManifests(Clone, m => m.BasePaths.Add(new Proto.BasePath { Id = 9, Path = elsewhere, IsDatasetRoot = true }));
+        IndexSectionTests.RewriteIndexSection(Clone, section => section.Indices[0].BaseId = 9);
+
+        var resolver = new StorageResolver().Register(new LocalTableFileSystem(Source));
+        await using var table = await LanceTable.OpenAsync(Clone, new LanceTableOptions { StorageResolver = resolver });
+
+        var info = Assert.Single(await table.GetIndicesAsync());
+        Assert.Equal(9u, info.BaseId);
+        {
+            var r = await ReadFilteredIdsAsync(table, EngineeredWood.Expressions.Expressions.Equal("id", LiteralValue.Of(7)));
+            Assert.Equal([7], r.Ids);
+            Assert.Equal(3, r.Batches);
+        }
+
+        var ex = await Assert.ThrowsAsync<UnregisteredStorageLocationException>(
+            () => table.OpenBTreeIndexAsync("id_idx").AsTask());
+        Assert.Contains("elsewhere", ex.Location.ToString(), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -742,6 +811,19 @@ public sealed class LanceBasePathsTests : IDisposable
         return ids.ToArray();
     }
 
+    private static async Task<(int[] Ids, int Batches)> ReadFilteredIdsAsync(LanceTable table, Predicate filter)
+    {
+        int batches = 0;
+        var ids = new List<int>();
+        await foreach (var batch in table.ReadAsync(null, filter))
+        {
+            batches++;
+            ids.AddRange(((Int32Array)batch.Column(0)).Values.ToArray());
+        }
+        ids.Sort();
+        return (ids.ToArray(), batches);
+    }
+
     private static string LastSegment(string path) =>
         path.Split('/', '\\').Last(s => s.Length > 0);
 
@@ -795,7 +877,7 @@ public sealed class LanceBasePathsTests : IDisposable
         }
     }
 
-    private static void CopyDirectory(string from, string to)
+    internal static void CopyDirectory(string from, string to)
     {
         Directory.CreateDirectory(to);
         foreach (string dir in Directory.GetDirectories(from, "*", SearchOption.AllDirectories))

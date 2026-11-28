@@ -456,6 +456,10 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         // timestamp; the manifest builder may already have set one (e.g.
         // when copying a manifest forward without a real new commit).
         ApplyFeatureFlags(manifest);
+        // No index section is written to this file, so an offset carried from another manifest would point at
+        // unrelated bytes of this one (lance-table 14.0.3 do_write_manifest clears it the same way). A manifest without
+        // one has no indices, for lance and for EW's reader (#991).
+        manifest.ClearIndexSection();
         if (manifest.Timestamp is null)
             manifest.Timestamp = PbTimestamp.FromDateTime(DateTime.UtcNow);
         byte[] manifestBytes = manifest.ToByteArray();
