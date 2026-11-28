@@ -131,44 +131,60 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// Creates an empty Lance dataset at <paramref name="datasetPath"/>.
     /// Throws <see cref="InvalidOperationException"/> if the path already
     /// contains a Lance dataset. Use <see cref="AppendAsync"/> or
-    /// <see cref="OverwriteAsync"/> for those cases.
+    /// <see cref="OverwriteAsync"/> for those cases. <paramref name="fileVersion"/>
+    /// is the data files' Lance version (default v2.1, which moves to v2.2 when
+    /// a Map column is written first); pass <see cref="LanceVersion.V2_2"/> to
+    /// write a Map column after other columns.
     /// </summary>
     public static ValueTask<LanceDatasetWriter> CreateAsync(
         string datasetPath, CancellationToken cancellationToken = default,
-        LanceCompressionScheme compression = LanceCompressionScheme.None)
-        => OpenInternalAsync(datasetPath, LanceWriteMode.Create, compression, cancellationToken);
+        LanceCompressionScheme compression = LanceCompressionScheme.None,
+        LanceVersion? fileVersion = null)
+        => OpenInternalAsync(datasetPath, LanceWriteMode.Create, compression, fileVersion, cancellationToken);
 
     /// <summary>
     /// Opens an existing Lance dataset for appending new fragments. The
     /// new fragments' schema must match the existing dataset's schema
     /// (same field names, types, and ids). Throws if no manifest exists
-    /// at <paramref name="datasetPath"/>.
+    /// at <paramref name="datasetPath"/>. The new files take the dataset's own
+    /// data-storage version (v2.2 when its schema has a Map column);
+    /// <paramref name="fileVersion"/>, if given, must be that version.
     /// </summary>
     public static ValueTask<LanceDatasetWriter> AppendAsync(
         string datasetPath, CancellationToken cancellationToken = default,
-        LanceCompressionScheme compression = LanceCompressionScheme.None)
-        => OpenInternalAsync(datasetPath, LanceWriteMode.Append, compression, cancellationToken);
+        LanceCompressionScheme compression = LanceCompressionScheme.None,
+        LanceVersion? fileVersion = null)
+        => OpenInternalAsync(datasetPath, LanceWriteMode.Append, compression, fileVersion, cancellationToken);
 
     /// <summary>
     /// Opens an existing Lance dataset (or creates a new one) and prepares
     /// to overwrite its contents. The new manifest's version is one more
     /// than the latest existing version (or 1 if no prior version) and
     /// references only the new fragments. Old data files remain on disk
-    /// for a future vacuum step to clean up.
+    /// for a future vacuum step to clean up. <paramref name="fileVersion"/> is
+    /// as for <see cref="CreateAsync"/>.
     /// </summary>
     public static ValueTask<LanceDatasetWriter> OverwriteAsync(
         string datasetPath, CancellationToken cancellationToken = default,
-        LanceCompressionScheme compression = LanceCompressionScheme.None)
-        => OpenInternalAsync(datasetPath, LanceWriteMode.Overwrite, compression, cancellationToken);
+        LanceCompressionScheme compression = LanceCompressionScheme.None,
+        LanceVersion? fileVersion = null)
+        => OpenInternalAsync(datasetPath, LanceWriteMode.Overwrite, compression, fileVersion, cancellationToken);
 
     private static async ValueTask<LanceDatasetWriter> OpenInternalAsync(
         string datasetPath, LanceWriteMode mode,
         LanceCompressionScheme compression,
+        LanceVersion? fileVersion,
         CancellationToken cancellationToken)
     {
         if (datasetPath is null) throw new ArgumentNullException(nameof(datasetPath));
+        // Before anything is created: a refused Create must leave nothing behind
+        // that would make a retry see "already contains a Lance dataset".
+        if (fileVersion is { } requestedVersion && !requestedVersion.IsV2_1 && !requestedVersion.IsV2_2)
+            throw new ArgumentOutOfRangeException(
+                nameof(fileVersion), requestedVersion, "LanceDatasetWriter writes Lance v2.1 and v2.2 files only.");
 
         LanceManifest? baseManifest = null;
+        bool createdRoot = false;
         ulong readVersion = 0;
         IReadOnlyList<BasePath> basePaths = System.Array.Empty<BasePath>();
 
@@ -185,6 +201,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             else
             {
                 Directory.CreateDirectory(datasetPath);
+                createdRoot = true;
             }
         }
         else if (mode == LanceWriteMode.Append)
@@ -229,14 +246,67 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             }
         }
 
-        Directory.CreateDirectory(Path.Combine(datasetPath, "data"));
-        Directory.CreateDirectory(Path.Combine(datasetPath, "_versions"));
-        Directory.CreateDirectory(Path.Combine(datasetPath, "_transactions"));
-
+        // Append keeps the dataset's version (and v2.2 for a Map schema), so its
+        // columns can be written in schema order. lance refuses a dataset whose
+        // data files don't all share the manifest's version, so an explicit
+        // different one is refused rather than written.
+        LanceVersion version;
+        if (mode == LanceWriteMode.Append)
+        {
+            version = FileVersionFor(baseManifest!, schema: null, datasetPath);
+            if (fileVersion is { } requested && requested != version)
+                throw new ArgumentException(
+                    $"Cannot append Lance v{requested} files to the dataset at '{datasetPath}', whose data "
+                    + $"files are v{version}: lance requires every data file to share the dataset's version.",
+                    nameof(fileVersion));
+        }
+        else
+        {
+            version = fileVersion ?? LanceVersion.V2_1;
+        }
+        string[] subdirectories =
+        {
+            Path.Combine(datasetPath, "data"),
+            Path.Combine(datasetPath, "_versions"),
+            Path.Combine(datasetPath, "_transactions"),
+        };
         string dataFileName = Guid.NewGuid().ToString("N") + ".lance";
-        string dataFilePath = Path.Combine(datasetPath, "data", dataFileName);
-        var fileWriter = await LanceFileWriter.CreateAsync(
-            dataFilePath, cancellationToken, compression).ConfigureAwait(false);
+        var created = new List<string>();
+        if (createdRoot) created.Add(datasetPath);
+        LanceFileWriter fileWriter;
+        try
+        {
+            foreach (string dir in subdirectories)
+            {
+                if (Directory.Exists(dir)) continue;
+                Directory.CreateDirectory(dir);
+                created.Add(dir);
+            }
+
+            // Append pins the dataset's version. Create and Overwrite pass the
+            // caller's choice through, so null keeps the file writer's default
+            // (v2.1, moving to v2.2 for a Map written first).
+            fileWriter = await LanceFileWriter.CreateAsync(
+                Path.Combine(datasetPath, "data", dataFileName), cancellationToken, compression,
+                mode == LanceWriteMode.Append ? version : fileVersion).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Remove what this call created (only while still empty), so a
+            // failed Create can be retried.
+            for (int i = created.Count - 1; i >= 0; i--)
+            {
+                try
+                {
+                    if (Directory.Exists(created[i])
+                        && !Directory.EnumerateFileSystemEntries(created[i]).Any())
+                        Directory.Delete(created[i]);
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+            throw;
+        }
 
         return new LanceDatasetWriter(
             datasetPath, mode, compression, baseManifest, readVersion, basePaths,
@@ -262,13 +332,17 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             throw new InvalidOperationException(
                 "Current fragment has no rows yet; write at least one column before starting a new fragment.");
 
+        // The next fragment starts at this one's version, which a Map column
+        // may have raised to v2.2, so the fragments agree and its columns can
+        // be written in the same order.
+        LanceVersion version = _currentFileWriter.Version;
         await CloseCurrentFragmentAsync(cancellationToken).ConfigureAwait(false);
 
         // Open the next fragment's writer.
         string newName = Guid.NewGuid().ToString("N") + ".lance";
         string newPath = Path.Combine(_datasetPath, "data", newName);
         _currentFileWriter = await LanceFileWriter.CreateAsync(
-            newPath, cancellationToken, _compression).ConfigureAwait(false);
+            newPath, cancellationToken, _compression, version).ConfigureAwait(false);
         _currentDataFileName = newName;
     }
 
@@ -476,15 +550,31 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             newFragments.Add(fragProto);
         }
 
+        // lance refuses a dataset whose data files don't all share one version,
+        // so check before committing: the new fragments against each other, and
+        // for Append against the dataset's version (which the manifest keeps).
+        LanceVersion newVersion = _completedFragments[0].Version;
+        foreach (var fragment in _completedFragments)
+            if (fragment.Version != newVersion)
+                throw new InvalidOperationException(
+                    $"The new fragments mix Lance v{newVersion} and v{fragment.Version} data files.");
+        if (_mode == LanceWriteMode.Append
+            && DatasetVersion(_baseManifest!, _datasetPath) is { } datasetVersion
+            && datasetVersion != $"{newVersion.Major}.{newVersion.Minor}")
+            throw new InvalidOperationException(
+                $"The appended fragments are Lance v{newVersion} files, but the dataset's are v{datasetVersion}.");
+
         var manifest = new LanceManifest
         {
             Version = nextVersion,
             TransactionFile = transactionFileName,
-            DataFormat = new LanceManifest.Types.DataStorageFormat
-            {
-                FileFormat = "lance",
-                Version = $"{_completedFragments[0].Version.Major}.{_completedFragments[0].Version.Minor}",
-            },
+            DataFormat = _mode == LanceWriteMode.Append && _baseManifest!.DataFormat is { } baseFormat
+                ? baseFormat.Clone()
+                : new LanceManifest.Types.DataStorageFormat
+                {
+                    FileFormat = "lance",
+                    Version = $"{newVersion.Major}.{newVersion.Minor}",
+                },
         };
         foreach (var f in manifestFields)
             manifest.Fields.Add(f);
@@ -734,11 +824,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         {
             Version = newVersion,
             TransactionFile = txnFileName,
-            DataFormat = baseManifest.DataFormat?.Clone() ?? new LanceManifest.Types.DataStorageFormat
-            {
-                FileFormat = "lance",
-                Version = "2.1",
-            },
+            DataFormat = DataFormatFor(baseManifest, written: null, datasetPath),
         };
         newManifest.Fields.AddRange(baseManifest.Fields);
         newManifest.Fragments.AddRange(newFragments);
@@ -989,6 +1075,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
         lanceSchema.Fields.AddRange(manifest.Fields);
         var arrowSchema = EngineeredWood.Lance.Schema.LanceSchemaConverter.ToArrowSchema(lanceSchema);
+        // Before anything is written: refuses a dataset version EW can't write.
+        LanceVersion rewriteVersion = FileVersionFor(manifest, arrowSchema, datasetPath);
 
         // Validate that every assignment column exists in the schema.
         var nameToIdx = new Dictionary<string, int>(arrowSchema.FieldsList.Count, StringComparer.Ordinal);
@@ -1097,7 +1185,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         LanceVersion newFileVersion;
         IReadOnlyList<LanceField> newFileFields;
         await using (var w = await EngineeredWood.Lance.LanceFileWriter
-            .CreateAsync(newDataFilePath, cancellationToken).ConfigureAwait(false))
+            .CreateAsync(newDataFilePath, cancellationToken,
+                version: rewriteVersion).ConfigureAwait(false))
         {
             for (int i = 0; i < arrowSchema.FieldsList.Count; i++)
             {
@@ -1189,11 +1278,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         {
             Version = newVersion,
             TransactionFile = txnFileName,
-            DataFormat = manifest.DataFormat?.Clone() ?? new LanceManifest.Types.DataStorageFormat
-            {
-                FileFormat = "lance",
-                Version = $"{newFileVersion.Major}.{newFileVersion.Minor}",
-            },
+            DataFormat = DataFormatFor(manifest, newFileVersion, datasetPath),
         };
         newManifest.Fields.AddRange(manifest.Fields);
         newManifest.Fragments.AddRange(newFragmentsList);
@@ -1271,6 +1356,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
         lanceSchema.Fields.AddRange(manifest.Fields);
         var arrowSchema = EngineeredWood.Lance.Schema.LanceSchemaConverter.ToArrowSchema(lanceSchema);
+        // Before anything is written: refuses a dataset version EW can't write.
+        LanceVersion rewriteVersion = FileVersionFor(manifest, arrowSchema, datasetPath);
 
         // Per-column slices accumulated across all source fragments; we
         // write them as a single new fragment at the end.
@@ -1344,7 +1431,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             LanceVersion newFileVersion;
             IReadOnlyList<LanceField> newFileFields;
             await using (var w = await EngineeredWood.Lance.LanceFileWriter
-                .CreateAsync(newDataFilePath, cancellationToken).ConfigureAwait(false))
+                .CreateAsync(newDataFilePath, cancellationToken,
+                    version: rewriteVersion).ConfigureAwait(false))
             {
                 for (int i = 0; i < arrowSchema.FieldsList.Count; i++)
                     await w.WriteColumnAsync(
@@ -1395,11 +1483,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         {
             Version = newVersion,
             TransactionFile = txnFileName,
-            DataFormat = manifest.DataFormat?.Clone() ?? new LanceManifest.Types.DataStorageFormat
-            {
-                FileFormat = "lance",
-                Version = "2.1",
-            },
+            DataFormat = DataFormatFor(manifest, rewriteVersion, datasetPath),
         };
         newManifest.Fields.AddRange(manifest.Fields);
         newManifest.Fragments.AddRange(newFragments);
@@ -1467,6 +1551,116 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                     $"Cannot rewrite the Lance dataset at '{datasetPath}': fragment {fragment.Id} has "
                     + $"{fragment.Files.Count} data files (a column-split layout), which LanceDatasetWriter does not read.");
         }
+    }
+
+    /// <summary>
+    /// The version for a data file written into an existing dataset. lance refuses
+    /// a dataset whose data files don't all share the manifest's
+    /// <c>data_format.version</c>, so that version is the file version, and a
+    /// version this writer can't produce is refused before anything is written:
+    /// 2.0 (#996; writing 2.0 files is #1000), a Map column in a 2.1 dataset
+    /// (Map needs 2.2), and anything newer than 2.2. A manifest without a data
+    /// format gets v2.1, or v2.2 for a Map schema, and the rewrite's manifest
+    /// then records that version.
+    /// </summary>
+    private static LanceVersion FileVersionFor(
+        LanceManifest manifest, Apache.Arrow.Schema? schema, string datasetPath)
+    {
+        if (schema is null)
+        {
+            var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
+            lanceSchema.Fields.AddRange(manifest.Fields);
+            schema = EngineeredWood.Lance.Schema.LanceSchemaConverter.ToArrowSchema(lanceSchema);
+        }
+        bool hasMap = schema.FieldsList.Any(f => HasMap(f.DataType));
+
+        string? declared = DatasetVersion(manifest, datasetPath);
+        switch (declared)
+        {
+            case null:
+                return hasMap ? LanceVersion.V2_2 : LanceVersion.V2_1;
+            case "2.2":
+                return LanceVersion.V2_2;
+            case "2.1" when !hasMap:
+                return LanceVersion.V2_1;
+            case "2.1":
+                throw new NotSupportedException(
+                    $"Cannot write to the Lance dataset at '{datasetPath}': it is a 2.1 dataset with a Map "
+                    + "column, and Map columns need 2.2 data files, which lance refuses in a 2.1 dataset.");
+            case "2.0" or "0.3":
+                throw new NotSupportedException(
+                    $"Cannot write data files to the Lance dataset at '{datasetPath}': it is a Lance 2.0 dataset, "
+                    + "and LanceDatasetWriter writes only 2.1 and 2.2 files, which lance refuses in a 2.0 dataset "
+                    + "(https://github.com/clast-project/engineered-wood/issues/1000). Delete still works; "
+                    + "OverwriteAsync replaces the dataset with 2.1 or 2.2 files.");
+            default:
+                throw new NotSupportedException(
+                    $"Cannot write data files to the Lance dataset at '{datasetPath}': its data storage version "
+                    + $"is {declared}, and LanceDatasetWriter writes only 2.1 and 2.2 files.");
+        }
+
+        static bool HasMap(IArrowType type) => type switch
+        {
+            MapType => true,
+            NestedType nested => nested.Fields.Any(f => HasMap(f.DataType)),
+            _ => false,
+        };
+    }
+
+    /// <summary>
+    /// The dataset's data-file version as lance resolves it: the manifest's
+    /// <c>data_format.version</c>, or, when that is absent, the version every
+    /// data file records (lance-table <c>Fragment::try_infer_version</c>), or
+    /// null for a dataset with neither. Files that disagree are refused, as
+    /// lance refuses them ("All data files must have the same version").
+    /// </summary>
+    private static string? DatasetVersion(LanceManifest manifest, string datasetPath)
+    {
+        if (manifest.DataFormat is { Version.Length: > 0 } format) return format.Version;
+        string? inferred = null;
+        foreach (var fragment in manifest.Fragments)
+            foreach (var file in fragment.Files)
+            {
+                string version = ManifestVersionOf(file.FileMajorVersion, file.FileMinorVersion);
+                if (inferred is null) inferred = version;
+                else if (inferred != version)
+                    throw new NotSupportedException(
+                        $"Cannot write to the Lance dataset at '{datasetPath}': it declares no data storage version "
+                        + $"and its data files mix versions {inferred} and {version}.");
+            }
+        return inferred;
+    }
+
+    /// <summary>
+    /// A data file's major/minor pair as the manifest spells the version
+    /// (lance-file <c>ConcreteFileVersion::from_data_file_numbers</c> and
+    /// <c>to_manifest_string</c>): (0,3) and (2,0) are both 2.0, and (0,0)
+    /// through (0,2) are all the legacy "0.1". lance 14 refuses a manifest
+    /// <c>data_format</c> of "0.3", so a 2.0 file must never be recorded that way.
+    /// </summary>
+    private static string ManifestVersionOf(uint major, uint minor) => (major, minor) switch
+    {
+        (0, <= 2) => "0.1",
+        (0, 3) or (2, 0) => "2.0",
+        _ => $"{major}.{minor}",
+    };
+
+    /// <summary>
+    /// The <c>data_format</c> for a manifest that keeps <paramref name="manifest"/>'s
+    /// fragments: the base's own when it has one; otherwise the version the
+    /// operation <paramref name="written"/> (which <see cref="FileVersionFor"/>
+    /// matched to the existing files), or the one inferred from them; or none,
+    /// as in the base, when there is neither. Never a guess, since lance refuses
+    /// a manifest whose version differs from its data files'.
+    /// </summary>
+    private static LanceManifest.Types.DataStorageFormat? DataFormatFor(
+        LanceManifest manifest, LanceVersion? written, string datasetPath)
+    {
+        if (manifest.DataFormat is { Version.Length: > 0 } format) return format.Clone();
+        string? version = written is { } w ? $"{w.Major}.{w.Minor}" : DatasetVersion(manifest, datasetPath);
+        return version is null
+            ? null
+            : new LanceManifest.Types.DataStorageFormat { FileFormat = "lance", Version = version };
     }
 
     /// <summary>Reads <paramref name="fragment"/>'s deletion file, wherever its base puts it.</summary>
