@@ -2,7 +2,6 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using EngineeredWood.Encodings;
-using EngineeredWood.IO;
 using EngineeredWood.Lance.Proto;
 using EngineeredWood.Lance.Table.Proto;
 using Google.Protobuf;
@@ -10,99 +9,43 @@ using Google.Protobuf;
 namespace EngineeredWood.Lance.Table.Indices;
 
 /// <summary>
-/// Walks a Lance dataset's transaction history to discover the set of
-/// indices currently active on the table.
+/// Lists the indices active on a Lance dataset version from its manifest's index section (#991), as lance's own reader
+/// does (lance-table 14.0.3 <c>read_manifest_indexes</c>). The section holds one <c>IndexMetadata</c> per index
+/// segment; a manifest without one has no indices.
 ///
-/// <para>Lance writes a <c>Transaction</c> proto for every commit, both
-/// inline in the manifest (when <c>transaction_section</c> is set) and
-/// as a sibling file in <c>_transactions/{read_version}-{uuid}.txn</c>.
-/// A <c>CreateIndex</c> operation in any transaction adds entries to
-/// <c>new_indices</c> and removes entries listed in <c>removed_indices</c>;
-/// the live index set is the running accumulation across all such
-/// transactions.</para>
+/// <para>EW once found indices by walking <c>_transactions/</c> for <c>CreateIndex</c> operations instead. That missed
+/// an index whose transaction file was vacuumed and a shallow clone's inherited ones (the clone's only transaction is
+/// its <c>Clone</c>), and kept listing an index after a commit that dropped it from the section, which lance then no
+/// longer reads. lance has written the index section since before it wrote transaction files, so a manifest without
+/// one is not an older format with indices elsewhere, and there is no fallback.</para>
 ///
-/// <para>This walker reads the <c>.txn</c> files (more reliable than
-/// the optional inline copy) and only keys on the <c>CreateIndex</c>
-/// case of the <c>operation</c> oneof. Other operations (Append,
-/// Delete, Overwrite, Rewrite, etc.) are skipped — they don't change
-/// the index set.</para>
-///
-/// <para>Caveat: vacuuming can prune old <c>.txn</c> files. If indices
-/// were created in a vacuumed version, this walker won't find them. A
-/// manifest-resident catalog of current indices would be needed to
-/// handle that case; the current Lance manifest format doesn't expose
-/// one consistently.</para>
+/// <para>Each entry's base is checked here, so the dataset refuses to open when an index names a base EW cannot place,
+/// as it does for a data file; but its directory is resolved only when the index is opened
+/// (<see cref="IndexInfo.ResolveDirectory"/>), so an index whose base is not registered does not fail a read that
+/// does not open it (#992).</para>
 /// </summary>
 internal static class IndexCatalog
 {
-    public static async ValueTask<IReadOnlyList<IndexInfo>> DiscoverAsync(
-        ITableFileSystem fs, Proto.Manifest manifest, CancellationToken cancellationToken = default)
-        => await DiscoverAsync(fs, manifest, new LanceFileLocator(fs, manifest, resolver: null), cancellationToken)
-            .ConfigureAwait(false);
-
-    /// <summary>
-    /// As <see cref="DiscoverAsync(ITableFileSystem, Proto.Manifest, CancellationToken)"/>, finding each index's
-    /// files through <paramref name="locator"/>: an index whose metadata names a <c>base_id</c> lies under that base.
-    /// </summary>
-    public static async ValueTask<IReadOnlyList<IndexInfo>> DiscoverAsync(
-        ITableFileSystem fs, Proto.Manifest manifest, LanceFileLocator locator,
-        CancellationToken cancellationToken = default)
+    public static IReadOnlyList<IndexInfo> FromManifest(
+        Proto.Manifest manifest, IndexSection? section, LanceFileLocator locator)
     {
+        if (section is null || section.Indices.Count == 0)
+            return System.Array.Empty<IndexInfo>();
+
         // Build a field-id → path lookup from the manifest's flat schema.
         var fieldPaths = BuildFieldPathMap(manifest.Fields);
 
-        // Walk every .txn file in _transactions/ ordered by read_version.
-        // Each Lance commit produces a file named "{read_version}-{uuid}.txn".
-        var txnEntries = new List<(ulong ReadVersion, string Path)>();
-        await foreach (var info in fs.ListAsync("_transactions/", cancellationToken).ConfigureAwait(false))
+        var infos = new List<IndexInfo>(section.Indices.Count);
+        foreach (var meta in section.Indices)
         {
-            string fileName = ExtractFileName(info.Path);
-            if (!fileName.EndsWith(".txn", StringComparison.Ordinal))
-                continue;
-            int dash = fileName.IndexOf('-');
-            if (dash <= 0) continue;
-            if (!ulong.TryParse(fileName.Substring(0, dash), out ulong readVersion))
-                continue;
-            txnEntries.Add((readVersion, info.Path));
-        }
-        txnEntries.Sort((a, b) => a.ReadVersion.CompareTo(b.ReadVersion));
+            if (!TryGetUuid(meta, out var uuid))
+                throw new LanceTableFormatException(
+                    $"Index '{meta.Name}' in the manifest's index section has no valid 16-byte UUID.");
 
-        // Accumulate live indices keyed by UUID. Each CreateIndex adds new
-        // entries and removes listed ones; later edits supersede earlier
-        // ones for the same UUID.
-        var live = new Dictionary<Guid, (IndexMetadata Meta, ulong DatasetVersion)>();
-        foreach (var (readVersion, path) in txnEntries)
-        {
-            byte[] bytes = await fs.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
-            Transaction txn;
-            try { txn = Transaction.Parser.ParseFrom(bytes); }
-            catch (InvalidProtocolBufferException) { continue; }
-            if (txn.OperationCase != Transaction.OperationOneofCase.CreateIndex) continue;
-
-            var op = txn.CreateIndex;
-            ulong producedVersion = readVersion + 1;
-            foreach (var idx in op.RemovedIndices)
-            {
-                if (TryGetUuid(idx, out var uuid))
-                    live.Remove(uuid);
-            }
-            foreach (var idx in op.NewIndices)
-            {
-                if (!TryGetUuid(idx, out var uuid)) continue;
-                live[uuid] = (idx, producedVersion);
-            }
-        }
-
-        var infos = new List<IndexInfo>(live.Count);
-        foreach (var (uuid, (meta, datasetVersion)) in live)
-        {
             var columnPaths = new List<IReadOnlyList<string>>(meta.Fields.Count);
             foreach (int fieldId in meta.Fields)
                 columnPaths.Add(fieldPaths.TryGetValue(fieldId, out var path) ? path : [$"<field#{fieldId}>"]);
             var columnNames = columnPaths.Select(path => string.Join(".", path)).ToList();
-
-            var fragmentIds = DecodeFragmentBitmap(meta.FragmentBitmap);
-            var directory = locator.ResolveIndexDirectory(meta, uuid);
 
             infos.Add(new IndexInfo
             {
@@ -111,13 +54,20 @@ internal static class IndexCatalog
                 TypeUrl = meta.IndexDetails?.TypeUrl ?? string.Empty,
                 ColumnNames = columnNames,
                 ColumnPaths = columnPaths,
-                FragmentIds = fragmentIds,
-                DirectoryPath = directory.Path,
-                FileSystem = ReferenceEquals(directory.FileSystem, fs) ? null : directory.FileSystem,
-                BuiltFromVersion = datasetVersion,
+                FragmentIds = DecodeFragmentBitmap(meta.FragmentBitmap),
+                DirectoryPath = locator.IndexDirectoryInBase(meta, uuid),
+                BaseId = meta.HasBaseId ? meta.BaseId : null,
+                BuiltFromVersion = meta.DatasetVersion,
+                Metadata = meta,
+                Locator = locator,
             });
         }
-        infos.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.Ordinal));
+        // By name, then by the version each segment was built from, so an index's segments are listed oldest first.
+        infos.Sort((a, b) =>
+        {
+            int byName = string.Compare(a.Name, b.Name, StringComparison.Ordinal);
+            return byName != 0 ? byName : a.BuiltFromVersion.CompareTo(b.BuiltFromVersion);
+        });
         return infos;
     }
 
@@ -199,11 +149,5 @@ internal static class IndexCatalog
             bytesArr, v => ids.Add(checked((uint)v)), RoaringBitmap.RoaringFormat.CRoaring);
         ids.Sort();
         return ids;
-    }
-
-    private static string ExtractFileName(string path)
-    {
-        int slash = System.Math.Max(path.LastIndexOf('/'), path.LastIndexOf('\\'));
-        return slash >= 0 ? path.Substring(slash + 1) : path;
     }
 }

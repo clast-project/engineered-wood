@@ -19,9 +19,12 @@ namespace EngineeredWood.Lance.Table.Indices;
 /// over-approximation):</para>
 /// <list type="bullet">
 ///   <item><c>column op literal</c> on an indexed column with a
-///   supported operator → query the index, return its fragment set.</item>
-///   <item><c>column IN (lits)</c> on an indexed column → union of
-///   per-literal fragment sets.</item>
+///   supported operator → ask every segment of the column's indices that
+///   can answer, and return the fragments they hit plus every fragment
+///   none of them covers (#991): a segment knows nothing about a fragment
+///   outside its bitmap, such as one appended after it was built.</item>
+///   <item><c>column IN (lits)</c> on an indexed column → the same, with
+///   the union of the per-literal hits.</item>
 ///   <item><c>AND</c> → intersect children's non-null sets; null
 ///   children are ignored (a child with no info imposes no constraint).</item>
 ///   <item><c>OR</c> → union of children's sets, but ANY null child
@@ -40,73 +43,72 @@ internal static class IndexPruner
     /// Returns the set of fragment ids that may contain rows matching
     /// the filter, or <c>null</c> when no useful pruning is possible.
     /// </summary>
+    /// <param name="filter">The read's filter.</param>
+    /// <param name="indices">The dataset's index segments.</param>
+    /// <param name="fragmentIds">Every fragment of the dataset version: those no segment covers are always kept.</param>
+    /// <param name="fs">The dataset's file system.</param>
+    /// <param name="cancellationToken">Cancels the index reads.</param>
     public static async ValueTask<HashSet<uint>?> ComputeCandidatesAsync(
         Predicate filter,
         IReadOnlyList<IndexInfo> indices,
+        IReadOnlyCollection<uint> fragmentIds,
         ITableFileSystem fs,
         CancellationToken cancellationToken)
     {
-        // Build column-path → IndexInfo lookup, by path rather than by name, so an index on a struct's
+        // Build column-path → segments lookup, by path rather than by name, so an index on a struct's
         // field never answers for a top-level column of the field's name (#771). Only single-column scalar
         // indices we know how to query (BTREE or BITMAP) get registered;
         // others fall through to "no info" so the caller scans every
-        // fragment for that branch.
-        var byColumn = new Dictionary<IReadOnlyList<string>, IndexInfo>(ColumnPathComparer.Ordinal);
+        // fragment for that branch. A column may have several segments, of one index or of several; each
+        // answers only for the fragments it covers.
+        var byColumn = new Dictionary<IReadOnlyList<string>, List<IndexInfo>>(ColumnPathComparer.Ordinal);
         foreach (var info in indices)
         {
             if (info.ColumnPaths.Count != 1) continue;
-            if (!info.TypeUrl.Contains("BTreeIndexDetails", StringComparison.Ordinal)
-                && !info.TypeUrl.Contains("BitmapIndexDetails", StringComparison.Ordinal))
+            if (!IsBTree(info) && !IsBitmap(info))
                 continue;
-            byColumn[info.ColumnPaths[0]] = info;
+            if (!byColumn.TryGetValue(info.ColumnPaths[0], out var segments))
+                byColumn[info.ColumnPaths[0]] = segments = new List<IndexInfo>();
+            segments.Add(info);
         }
         if (byColumn.Count == 0) return null;
 
-        // Each index may be queried multiple times across an N-ary AND/OR
-        // or IN list, so we cache opened readers keyed by column name.
-        // BTREE and BITMAP have separate readers; the IndexInfo's TypeUrl
-        // chooses which one to open.
-        var btreeCache = new Dictionary<string, BTreeIndex>(StringComparer.Ordinal);
-        var bitmapCache = new Dictionary<string, BitmapIndex>(StringComparer.Ordinal);
+        // Each segment may be queried multiple times across an N-ary AND/OR
+        // or IN list, so the context caches opened readers by segment UUID.
+        var context = new Context(byColumn, fragmentIds, fs);
         try
         {
-            return await VisitAsync(filter, byColumn, btreeCache, bitmapCache, fs, cancellationToken)
-                .ConfigureAwait(false);
+            return await VisitAsync(filter, context, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            foreach (var idx in btreeCache.Values)
-                await idx.DisposeAsync().ConfigureAwait(false);
-            foreach (var idx in bitmapCache.Values)
-                await idx.DisposeAsync().ConfigureAwait(false);
+            await context.DisposeAsync().ConfigureAwait(false);
         }
     }
 
+    private static bool IsBTree(IndexInfo info) =>
+        info.TypeUrl.Contains("BTreeIndexDetails", StringComparison.Ordinal);
+
+    private static bool IsBitmap(IndexInfo info) =>
+        info.TypeUrl.Contains("BitmapIndexDetails", StringComparison.Ordinal);
+
     private static async ValueTask<HashSet<uint>?> VisitAsync(
-        Predicate predicate,
-        IReadOnlyDictionary<IReadOnlyList<string>, IndexInfo> byColumn,
-        Dictionary<string, BTreeIndex> btreeCache,
-        Dictionary<string, BitmapIndex> bitmapCache,
-        ITableFileSystem fs,
-        CancellationToken cancellationToken)
+        Predicate predicate, Context context, CancellationToken cancellationToken)
     {
         switch (predicate)
         {
             case ComparisonPredicate cp:
-                return await VisitComparisonAsync(cp, byColumn, btreeCache, bitmapCache, fs, cancellationToken)
-                    .ConfigureAwait(false);
+                return await VisitComparisonAsync(cp, context, cancellationToken).ConfigureAwait(false);
 
             case SetPredicate sp when sp.Op == SetOperator.In:
-                return await VisitInAsync(sp, byColumn, btreeCache, bitmapCache, fs, cancellationToken)
-                    .ConfigureAwait(false);
+                return await VisitInAsync(sp, context, cancellationToken).ConfigureAwait(false);
 
             case AndPredicate ap:
                 {
                     HashSet<uint>? acc = null;
                     foreach (var child in ap.Children)
                     {
-                        var childSet = await VisitAsync(child, byColumn, btreeCache, bitmapCache, fs, cancellationToken)
-                            .ConfigureAwait(false);
+                        var childSet = await VisitAsync(child, context, cancellationToken).ConfigureAwait(false);
                         if (childSet is null) continue;  // no info, no constraint
                         if (acc is null) acc = new HashSet<uint>(childSet);
                         else acc.IntersectWith(childSet);
@@ -120,8 +122,7 @@ internal static class IndexPruner
                     HashSet<uint> acc = new();
                     foreach (var child in op.Children)
                     {
-                        var childSet = await VisitAsync(child, byColumn, btreeCache, bitmapCache, fs, cancellationToken)
-                            .ConfigureAwait(false);
+                        var childSet = await VisitAsync(child, context, cancellationToken).ConfigureAwait(false);
                         if (childSet is null) return null;  // no info on a branch — must scan all
                         acc.UnionWith(childSet);
                     }
@@ -139,116 +140,179 @@ internal static class IndexPruner
     }
 
     private static async ValueTask<HashSet<uint>?> VisitComparisonAsync(
-        ComparisonPredicate cp,
-        IReadOnlyDictionary<IReadOnlyList<string>, IndexInfo> byColumn,
-        Dictionary<string, BTreeIndex> btreeCache,
-        Dictionary<string, BitmapIndex> bitmapCache,
-        ITableFileSystem fs,
-        CancellationToken cancellationToken)
+        ComparisonPredicate cp, Context context, CancellationToken cancellationToken)
     {
         if (!TryNormalizeColumnVsLiteral(cp, out var columnName, out var op, out var value))
             return null;
-        if (!byColumn.TryGetValue(columnName, out var info)) return null;
+        if (!context.ByColumn.TryGetValue(columnName, out var segments)) return null;
         if (value.Type != LiteralValue.Kind.Int32) return null;
         int v = value.AsInt32;
 
-        // BITMAP only handles equality. For everything else we punt to "no
-        // pruning" rather than open the index unnecessarily.
-        bool isBitmap = info.TypeUrl.Contains("BitmapIndexDetails", StringComparison.Ordinal);
-        if (isBitmap && op != ComparisonOperator.Equal) return null;
+        // NotEqual: complementing matched rows would require knowing
+        // every fragment, and the result wouldn't help prune anyway.
+        if (op is not (ComparisonOperator.Equal or ComparisonOperator.LessThan or ComparisonOperator.LessThanOrEqual
+            or ComparisonOperator.GreaterThan or ComparisonOperator.GreaterThanOrEqual))
+            return null;
 
-        IReadOnlyList<IndexedRowAddress>? hits;
-        if (isBitmap)
-        {
-            var idx = await GetOrOpenBitmapAsync(info, bitmapCache, fs, cancellationToken).ConfigureAwait(false);
-            if (idx.ValueType is not Apache.Arrow.Types.Int32Type) return null;
-            hits = await idx.QueryEqualAsync(v, cancellationToken).ConfigureAwait(false);
-        }
-        else
-        {
-            var idx = await GetOrOpenBTreeAsync(info, btreeCache, fs, cancellationToken).ConfigureAwait(false);
-            if (idx.ValueType is not Apache.Arrow.Types.Int32Type) return null;
-            hits = op switch
+        return await QuerySegmentsAsync(segments, context,
+            (idx, ct) => op switch
             {
-                ComparisonOperator.Equal =>
-                    await idx.QueryEqualAsync(v, cancellationToken).ConfigureAwait(false),
+                ComparisonOperator.Equal => idx.QueryEqualAsync(v, ct),
                 ComparisonOperator.LessThan =>
-                    await idx.QueryRangeAsync(min: null, max: v, includeMax: false, cancellationToken: cancellationToken).ConfigureAwait(false),
+                    idx.QueryRangeAsync(min: null, max: v, includeMax: false, cancellationToken: ct),
                 ComparisonOperator.LessThanOrEqual =>
-                    await idx.QueryRangeAsync(min: null, max: v, includeMax: true, cancellationToken: cancellationToken).ConfigureAwait(false),
+                    idx.QueryRangeAsync(min: null, max: v, includeMax: true, cancellationToken: ct),
                 ComparisonOperator.GreaterThan =>
-                    await idx.QueryRangeAsync(min: v, max: null, includeMin: false, cancellationToken: cancellationToken).ConfigureAwait(false),
-                ComparisonOperator.GreaterThanOrEqual =>
-                    await idx.QueryRangeAsync(min: v, max: null, includeMin: true, cancellationToken: cancellationToken).ConfigureAwait(false),
-                // NotEqual: complementing matched rows would require knowing
-                // every fragment, and the result wouldn't help prune anyway.
-                _ => null,
-            };
-        }
-        if (hits is null) return null;
-        return ToFragmentSet(hits);
+                    idx.QueryRangeAsync(min: v, max: null, includeMin: false, cancellationToken: ct),
+                _ => idx.QueryRangeAsync(min: v, max: null, includeMin: true, cancellationToken: ct),
+            },
+            // BITMAP only handles equality; for anything else a bitmap segment answers nothing.
+            op == ComparisonOperator.Equal ? (idx, ct) => idx.QueryEqualAsync(v, ct) : null,
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static async ValueTask<HashSet<uint>?> VisitInAsync(
-        SetPredicate sp,
-        IReadOnlyDictionary<IReadOnlyList<string>, IndexInfo> byColumn,
-        Dictionary<string, BTreeIndex> btreeCache,
-        Dictionary<string, BitmapIndex> bitmapCache,
-        ITableFileSystem fs,
-        CancellationToken cancellationToken)
+        SetPredicate sp, Context context, CancellationToken cancellationToken)
     {
         if (!TryGetReferenceName(sp.Operand, out IReadOnlyList<string> colName)) return null;
-        if (!byColumn.TryGetValue(colName, out var info)) return null;
+        if (!context.ByColumn.TryGetValue(colName, out var segments)) return null;
 
         // An index answers "which fragments hold this VALUE", so a list holding anything else --
         // `x IN (a, b)` names two other columns -- is one it cannot be asked about.
         if (!sp.TryGetLiteralValues(out var values)) return null;
-
-        bool isBitmap = info.TypeUrl.Contains("BitmapIndexDetails", StringComparison.Ordinal);
-
-        var acc = new HashSet<uint>();
+        var ints = new List<int>(values.Count);
         foreach (var lit in values)
         {
             if (lit.Type != LiteralValue.Kind.Int32) return null;
-            int v = lit.AsInt32;
-            IReadOnlyList<IndexedRowAddress> hits;
-            if (isBitmap)
+            ints.Add(lit.AsInt32);
+        }
+
+        return await QuerySegmentsAsync(segments, context,
+            async (idx, ct) =>
             {
-                var idx = await GetOrOpenBitmapAsync(info, bitmapCache, fs, cancellationToken).ConfigureAwait(false);
-                if (idx.ValueType is not Apache.Arrow.Types.Int32Type) return null;
-                hits = await idx.QueryEqualAsync(v, cancellationToken).ConfigureAwait(false);
+                var hits = new List<IndexedRowAddress>();
+                foreach (int v in ints)
+                    hits.AddRange(await idx.QueryEqualAsync(v, ct).ConfigureAwait(false));
+                return hits;
+            },
+            async (idx, ct) =>
+            {
+                var hits = new List<IndexedRowAddress>();
+                foreach (int v in ints)
+                    hits.AddRange(await idx.QueryEqualAsync(v, ct).ConfigureAwait(false));
+                return hits;
+            },
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Asks each segment that can answer (an Int32 index of a kind the queries cover, whose directory is reachable)
+    /// and returns the fragments they hit plus every fragment none of them covers; null when none can answer.
+    /// </summary>
+    private static async ValueTask<HashSet<uint>?> QuerySegmentsAsync(
+        IReadOnlyList<IndexInfo> segments,
+        Context context,
+        Func<BTreeIndex, CancellationToken, Task<IReadOnlyList<IndexedRowAddress>>> btree,
+        Func<BitmapIndex, CancellationToken, Task<IReadOnlyList<IndexedRowAddress>>>? bitmap,
+        CancellationToken cancellationToken)
+    {
+        HashSet<uint>? candidates = null;
+        var covered = new HashSet<uint>();
+        foreach (var segment in segments)
+        {
+            IReadOnlyList<IndexedRowAddress> hits;
+            if (IsBitmap(segment))
+            {
+                if (bitmap is null) continue;
+                var idx = await context.OpenBitmapAsync(segment, cancellationToken).ConfigureAwait(false);
+                if (idx is null || idx.ValueType is not Apache.Arrow.Types.Int32Type) continue;
+                hits = await bitmap(idx, cancellationToken).ConfigureAwait(false);
             }
             else
             {
-                var idx = await GetOrOpenBTreeAsync(info, btreeCache, fs, cancellationToken).ConfigureAwait(false);
-                if (idx.ValueType is not Apache.Arrow.Types.Int32Type) return null;
-                hits = await idx.QueryEqualAsync(v, cancellationToken).ConfigureAwait(false);
+                var idx = await context.OpenBTreeAsync(segment, cancellationToken).ConfigureAwait(false);
+                if (idx is null || idx.ValueType is not Apache.Arrow.Types.Int32Type) continue;
+                hits = await btree(idx, cancellationToken).ConfigureAwait(false);
             }
-            foreach (var h in hits) acc.Add(h.FragmentId);
+
+            candidates ??= new HashSet<uint>();
+            foreach (var h in hits) candidates.Add(h.FragmentId);
+            covered.UnionWith(segment.FragmentIds);
         }
-        return acc;
+        if (candidates is null) return null;
+
+        foreach (uint fragmentId in context.FragmentIds)
+        {
+            if (!covered.Contains(fragmentId))
+                candidates.Add(fragmentId);
+        }
+        return candidates;
     }
 
-    private static async ValueTask<BTreeIndex> GetOrOpenBTreeAsync(
-        IndexInfo info, Dictionary<string, BTreeIndex> opened,
-        ITableFileSystem fs, CancellationToken cancellationToken)
+    /// <summary>The segments by column, every fragment, and the readers opened so far.</summary>
+    private sealed class Context : IAsyncDisposable
     {
-        if (opened.TryGetValue(info.Name, out var idx)) return idx;
-        idx = await BTreeIndex.OpenAsync(info.FileSystem ?? fs, info.DirectoryPath, cancellationToken)
-            .ConfigureAwait(false);
-        opened[info.Name] = idx;
-        return idx;
-    }
+        private readonly ITableFileSystem _fs;
+        private readonly Dictionary<Guid, BTreeIndex?> _btrees = new();
+        private readonly Dictionary<Guid, BitmapIndex?> _bitmaps = new();
 
-    private static async ValueTask<BitmapIndex> GetOrOpenBitmapAsync(
-        IndexInfo info, Dictionary<string, BitmapIndex> opened,
-        ITableFileSystem fs, CancellationToken cancellationToken)
-    {
-        if (opened.TryGetValue(info.Name, out var idx)) return idx;
-        idx = await BitmapIndex.OpenAsync(info.FileSystem ?? fs, info.DirectoryPath, cancellationToken)
-            .ConfigureAwait(false);
-        opened[info.Name] = idx;
-        return idx;
+        public Context(
+            IReadOnlyDictionary<IReadOnlyList<string>, List<IndexInfo>> byColumn,
+            IReadOnlyCollection<uint> fragmentIds,
+            ITableFileSystem fs)
+        {
+            ByColumn = byColumn;
+            FragmentIds = fragmentIds;
+            _fs = fs;
+        }
+
+        public IReadOnlyDictionary<IReadOnlyList<string>, List<IndexInfo>> ByColumn { get; }
+
+        public IReadOnlyCollection<uint> FragmentIds { get; }
+
+        /// <summary>The segment's reader, or null when its base is outside the dataset and not registered.</summary>
+        public async ValueTask<BTreeIndex?> OpenBTreeAsync(IndexInfo info, CancellationToken cancellationToken)
+        {
+            if (_btrees.TryGetValue(info.Uuid, out var idx)) return idx;
+            idx = TryResolve(info) is { } dir
+                ? await BTreeIndex.OpenAsync(dir.FileSystem, dir.Path, cancellationToken).ConfigureAwait(false)
+                : null;
+            _btrees[info.Uuid] = idx;
+            return idx;
+        }
+
+        /// <summary>The segment's reader, or null when its base is outside the dataset and not registered.</summary>
+        public async ValueTask<BitmapIndex?> OpenBitmapAsync(IndexInfo info, CancellationToken cancellationToken)
+        {
+            if (_bitmaps.TryGetValue(info.Uuid, out var idx)) return idx;
+            idx = TryResolve(info) is { } dir
+                ? await BitmapIndex.OpenAsync(dir.FileSystem, dir.Path, cancellationToken).ConfigureAwait(false)
+                : null;
+            _bitmaps[info.Uuid] = idx;
+            return idx;
+        }
+
+        // An index under an unregistered base only loses its pruning: the read may never touch that base (#992).
+        // Once resolved, reading the index's files still surfaces every I/O error.
+        private ResolvedLanceFile? TryResolve(IndexInfo info)
+        {
+            try
+            {
+                return info.ResolveDirectory(_fs);
+            }
+            catch (UnregisteredStorageLocationException)
+            {
+                return null;
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            foreach (var idx in _btrees.Values)
+                if (idx is not null) await idx.DisposeAsync().ConfigureAwait(false);
+            foreach (var idx in _bitmaps.Values)
+                if (idx is not null) await idx.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     private static bool TryNormalizeColumnVsLiteral(
@@ -296,11 +360,4 @@ internal static class IndexPruner
         ComparisonOperator.GreaterThanOrEqual => ComparisonOperator.LessThanOrEqual,
         _ => op,
     };
-
-    private static HashSet<uint> ToFragmentSet(IReadOnlyList<IndexedRowAddress> hits)
-    {
-        var set = new HashSet<uint>();
-        foreach (var h in hits) set.Add(h.FragmentId);
-        return set;
-    }
 }

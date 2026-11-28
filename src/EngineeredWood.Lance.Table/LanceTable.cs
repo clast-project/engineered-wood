@@ -43,16 +43,19 @@ public sealed class LanceTable : IAsyncDisposable
     private readonly Proto.Manifest _manifest;
     private readonly Apache.Arrow.Schema _arrowSchema;
     private readonly LanceFileLocator _locator;
+    private readonly IReadOnlyList<Indices.IndexInfo> _indices;
 
     private LanceTable(
         ITableFileSystem fs, bool ownsFileSystem,
-        Proto.Manifest manifest, Apache.Arrow.Schema arrowSchema, LanceFileLocator locator)
+        Proto.Manifest manifest, Apache.Arrow.Schema arrowSchema, LanceFileLocator locator,
+        IReadOnlyList<Indices.IndexInfo> indices)
     {
         _fs = fs;
         _ownsFileSystem = ownsFileSystem;
         _manifest = manifest;
         _arrowSchema = arrowSchema;
         _locator = locator;
+        _indices = indices;
     }
 
     /// <summary>The Arrow schema of the dataset.</summary>
@@ -95,51 +98,82 @@ public sealed class LanceTable : IAsyncDisposable
     public int NumberOfFragments => _manifest.Fragments.Count;
 
     /// <summary>
-    /// Discovers the secondary indices currently active on this dataset by
-    /// walking transaction history. Returns one <see cref="Indices.IndexInfo"/>
-    /// per index, sorted by name. Empty if no indices have been created (or
-    /// if every index-creating transaction has been vacuumed).
+    /// The secondary indices active on this dataset version, from its manifest's index section, as lance lists them
+    /// (#991). Returns one <see cref="Indices.IndexInfo"/> per index segment, sorted by name and then by the version
+    /// each segment was built from; an index can have several segments, each covering its own fragments. Empty when
+    /// the version has no indices.
     /// </summary>
     public ValueTask<IReadOnlyList<Indices.IndexInfo>> GetIndicesAsync(
         CancellationToken cancellationToken = default)
-        => Indices.IndexCatalog.DiscoverAsync(_fs, _manifest, _locator, cancellationToken);
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return new ValueTask<IReadOnlyList<Indices.IndexInfo>>(_indices);
+    }
 
     /// <summary>
-    /// Open a BTREE scalar index by name. Convenience wrapper that calls
-    /// <see cref="GetIndicesAsync"/>, finds the matching <see cref="Indices.IndexInfo"/>,
-    /// and opens it via <see cref="Indices.BTreeIndex.OpenAsync(IO.ITableFileSystem, string, CancellationToken)"/>.
+    /// Open a BTREE scalar index by name. Convenience wrapper that finds the index's
+    /// <see cref="Indices.IndexInfo"/> and calls <see cref="OpenBTreeIndexAsync(Indices.IndexInfo, CancellationToken)"/>.
+    /// Throws when the index has several segments, since one reader answers for only its segment's fragments; open
+    /// each segment by its <see cref="Indices.IndexInfo"/> instead.
+    /// </summary>
+    public ValueTask<Indices.BTreeIndex> OpenBTreeIndexAsync(
+        string indexName, CancellationToken cancellationToken = default)
+        => OpenBTreeIndexAsync(FindIndex(indexName), cancellationToken);
+
+    /// <summary>
+    /// Open one BTREE index segment of this dataset, as <see cref="GetIndicesAsync"/> listed it. A segment under
+    /// another base (<see cref="Indices.IndexInfo.BaseId"/>) is reached through the dataset's storage resolver, and
+    /// <see cref="UnregisteredStorageLocationException"/> is thrown when that base is not registered.
     /// </summary>
     public async ValueTask<Indices.BTreeIndex> OpenBTreeIndexAsync(
-        string indexName, CancellationToken cancellationToken = default)
+        Indices.IndexInfo index, CancellationToken cancellationToken = default)
     {
-        var match = await ResolveIndexAsync(indexName, cancellationToken).ConfigureAwait(false);
-        return await Indices.BTreeIndex.OpenAsync(match.FileSystem ?? _fs, match.DirectoryPath, cancellationToken)
+        var directory = ResolveIndexDirectory(index);
+        return await Indices.BTreeIndex.OpenAsync(directory.FileSystem, directory.Path, cancellationToken)
             .ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Open a BITMAP scalar index by name. Convenience wrapper that calls
-    /// <see cref="GetIndicesAsync"/>, finds the matching <see cref="Indices.IndexInfo"/>,
-    /// and opens it via <see cref="Indices.BitmapIndex.OpenAsync(IO.ITableFileSystem, string, CancellationToken)"/>.
+    /// Open a BITMAP scalar index by name. Convenience wrapper that finds the index's
+    /// <see cref="Indices.IndexInfo"/> and calls <see cref="OpenBitmapIndexAsync(Indices.IndexInfo, CancellationToken)"/>.
+    /// Throws when the index has several segments; open each by its <see cref="Indices.IndexInfo"/> instead.
+    /// </summary>
+    public ValueTask<Indices.BitmapIndex> OpenBitmapIndexAsync(
+        string indexName, CancellationToken cancellationToken = default)
+        => OpenBitmapIndexAsync(FindIndex(indexName), cancellationToken);
+
+    /// <summary>
+    /// Open one BITMAP index segment of this dataset, as <see cref="GetIndicesAsync"/> listed it; see
+    /// <see cref="OpenBTreeIndexAsync(Indices.IndexInfo, CancellationToken)"/>.
     /// </summary>
     public async ValueTask<Indices.BitmapIndex> OpenBitmapIndexAsync(
-        string indexName, CancellationToken cancellationToken = default)
+        Indices.IndexInfo index, CancellationToken cancellationToken = default)
     {
-        var match = await ResolveIndexAsync(indexName, cancellationToken).ConfigureAwait(false);
-        return await Indices.BitmapIndex.OpenAsync(match.FileSystem ?? _fs, match.DirectoryPath, cancellationToken)
+        var directory = ResolveIndexDirectory(index);
+        return await Indices.BitmapIndex.OpenAsync(directory.FileSystem, directory.Path, cancellationToken)
             .ConfigureAwait(false);
     }
 
-    private async ValueTask<Indices.IndexInfo> ResolveIndexAsync(
-        string indexName, CancellationToken cancellationToken)
+    private ResolvedLanceFile ResolveIndexDirectory(Indices.IndexInfo index)
     {
-        var infos = await GetIndicesAsync(cancellationToken).ConfigureAwait(false);
-        foreach (var info in infos)
-            if (string.Equals(info.Name, indexName, StringComparison.Ordinal))
-                return info;
+        if (index is null) throw new ArgumentNullException(nameof(index));
+        if (!ReferenceEquals(index.Locator, _locator))
+            throw new ArgumentException(
+                $"Index '{index.Name}' ({index.Uuid}) was not listed by this table's GetIndicesAsync.", nameof(index));
+        return index.ResolveDirectory(_fs);
+    }
+
+    private Indices.IndexInfo FindIndex(string indexName)
+    {
+        var matches = _indices.Where(i => string.Equals(i.Name, indexName, StringComparison.Ordinal)).ToList();
+        if (matches.Count == 1)
+            return matches[0];
+        if (matches.Count == 0)
+            throw new ArgumentException(
+                $"Index '{indexName}' was not found on this dataset. " +
+                $"Available: [{string.Join(", ", _indices.Select(i => i.Name).Distinct())}].");
         throw new ArgumentException(
-            $"Index '{indexName}' was not found on this dataset. " +
-            $"Available: [{string.Join(", ", infos.Select(i => i.Name))}].");
+            $"Index '{indexName}' has {matches.Count} segments; open each one by the IndexInfo GetIndicesAsync lists.");
     }
 
     /// <summary>Optional version tag attached at write time.</summary>
@@ -273,12 +307,13 @@ public sealed class LanceTable : IAsyncDisposable
                     .ConfigureAwait(false)
                 : await ManifestPathResolver.ResolveLatestAsync(fs, cancellationToken)
                     .ConfigureAwait(false);
-        Proto.Manifest manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
+        var (manifest, indexSection) = await ManifestReader.ReadWithIndicesAsync(fs, entry.Path, cancellationToken)
             .ConfigureAwait(false);
 
         ValidateScope(manifest);
         var locator = new LanceFileLocator(fs, manifest, resolver);
         locator.Validate(manifest);
+        var indices = Indices.IndexCatalog.FromManifest(manifest, indexSection, locator);
 
         // Build an Arrow Schema by re-shaping the Manifest's flat fields into
         // a Lance Proto.Schema and reusing the existing converter.
@@ -288,7 +323,7 @@ public sealed class LanceTable : IAsyncDisposable
             lanceSchema.Metadata.Add(kv.Key, kv.Value);
         var arrowSchema = EngineeredWood.Lance.Schema.LanceSchemaConverter.ToArrowSchema(lanceSchema);
 
-        return new LanceTable(fs, ownsFileSystem, manifest, arrowSchema, locator);
+        return new LanceTable(fs, ownsFileSystem, manifest, arrowSchema, locator, indices);
     }
 
     private static void ValidateScope(Proto.Manifest manifest)
@@ -401,10 +436,10 @@ public sealed class LanceTable : IAsyncDisposable
         HashSet<uint>? candidateFragments = null;
         if (filter is not null)
         {
-            var indices = await GetIndicesAsync(cancellationToken).ConfigureAwait(false);
-            if (indices.Count > 0)
+            if (_indices.Count > 0)
                 candidateFragments = await Indices.IndexPruner
-                    .ComputeCandidatesAsync(filter, indices, _fs, cancellationToken)
+                    .ComputeCandidatesAsync(filter, _indices,
+                        _manifest.Fragments.Select(f => checked((uint)f.Id)).ToList(), _fs, cancellationToken)
                     .ConfigureAwait(false);
         }
 

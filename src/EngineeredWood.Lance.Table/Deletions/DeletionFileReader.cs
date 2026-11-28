@@ -34,8 +34,8 @@ internal static class DeletionFileReader
         return await ReadAsync(fs, path, fragmentId, deletionFile, cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>Reads the deletion file at <paramref name="path"/> in <paramref name="fs"/>: one a
-    /// <see cref="LanceFileLocator"/> resolved, which may lie under another base.</summary>
+    /// <summary>Reads the deletion file at <paramref name="path"/> in <paramref name="fs"/>, a path that
+    /// <see cref="LanceFileLocator"/> has already resolved and that may lie under another base.</summary>
     public static async ValueTask<DeletionMask> ReadAsync(
         ITableFileSystem fs, string path, ulong fragmentId, DeletionFile deletionFile,
         CancellationToken cancellationToken = default)
