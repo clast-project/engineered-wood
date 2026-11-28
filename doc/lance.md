@@ -108,8 +108,11 @@ Every commit path stamps `manifest.timestamp` for time travel.
 
 **Datasets with `base_paths`** (#990). The writer does what lance 14.0.3
 does when a writer names no target base:
-- Every manifest it commits carries the read manifest's `base_paths`,
-  and sets `FLAG_BASE_PATHS` (16) in the reader and writer feature flags.
+- Every manifest it commits carries the read manifest's `base_paths`.
+  Its reader and writer feature flags are recomputed from its contents,
+  as lance's `apply_feature_flags` does: `FLAG_DELETION_FILES` (1) when
+  any fragment has a deletion file, `FLAG_BASE_PATHS` (16) when it lists
+  bases.
   Fragments it carries forward keep their files' and deletion files'
   `base_id`s. Overwrite keeps the bases too, as lance does (measured).
 - Every file it creates goes under the dataset root, with no `base_id`.
@@ -128,9 +131,9 @@ does when a writer names no target base:
   through any base. It compares locations, not names or
   `(base_id, path)`, so a base that lies inside the root cannot make a
   live file look unreferenced. A base it cannot place, such as a relative
-  path, makes it refuse. A local base outside the root may still reach the
-  root's files through a symlink or junction, so vacuum also keeps any
-  file named like a live file under such a base.
+  path, makes it refuse. A local base, inside the root or outside it, may
+  reach the root's files through a symlink or junction, so vacuum also
+  keeps any file named like a live file reached through a local base.
 
 Every operation except vacuum refuses a manifest whose writer feature
 flags it does not maintain: stable row ids (2), table config (8) and any

@@ -333,9 +333,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// <summary>
     /// Carries <paramref name="basePaths"/> (the manifest's the operation read) into <paramref name="manifest"/>, as
     /// lance does on every commit (#990). The fragments it carries keep their <c>base_id</c>s, so their files stay
-    /// where they are; every file this writer creates goes under the dataset root, with no <c>base_id</c>. A manifest
-    /// with bases needs <c>FLAG_BASE_PATHS</c> (lance-table 14.0.3 <c>apply_feature_flags</c>), so a reader that
-    /// does not know them refuses the dataset rather than read the wrong files.
+    /// where they are; every file this writer creates goes under the dataset root, with no <c>base_id</c>. The
+    /// feature flags the bases need are set at commit (<see cref="ApplyFeatureFlags"/>).
     /// </summary>
     private static void CarryBasePaths(IReadOnlyList<BasePath> basePaths, LanceManifest manifest)
     {
@@ -343,8 +342,24 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             return;
         foreach (var basePath in basePaths)
             manifest.BasePaths.Add(basePath.Clone());
-        manifest.ReaderFeatureFlags |= FlagBasePaths;
-        manifest.WriterFeatureFlags |= FlagBasePaths;
+    }
+
+    /// <summary>
+    /// Sets the reader and writer feature flags <paramref name="manifest"/>'s contents need, recomputed from scratch
+    /// as lance-table 14.0.3 <c>apply_feature_flags</c> does: <c>FLAG_DELETION_FILES</c> when any fragment has a
+    /// deletion file, carried or new, and <c>FLAG_BASE_PATHS</c> when it lists bases, so that a reader without either
+    /// feature refuses the dataset rather than read it wrong. The flags this writer cannot maintain (stable row ids,
+    /// table config) are refused before it writes anything (<see cref="ThrowIfUnwritable"/>), so none is lost here.
+    /// </summary>
+    private static void ApplyFeatureFlags(LanceManifest manifest)
+    {
+        ulong flags = 0;
+        if (manifest.Fragments.Any(f => f.DeletionFile is not null))
+            flags |= FlagDeletionFiles;
+        if (manifest.BasePaths.Count > 0)
+            flags |= FlagBasePaths;
+        manifest.ReaderFeatureFlags = flags;
+        manifest.WriterFeatureFlags = flags;
     }
 
     /// <summary>
@@ -365,6 +380,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         // (`OpenAsync(path, asOf: ...)`). Don't overwrite an existing
         // timestamp; the manifest builder may already have set one (e.g.
         // when copying a manifest forward without a real new commit).
+        ApplyFeatureFlags(manifest);
         if (manifest.Timestamp is null)
             manifest.Timestamp = PbTimestamp.FromDateTime(DateTime.UtcNow);
         byte[] manifestBytes = manifest.ToByteArray();
@@ -1583,12 +1599,13 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         // the vacuum rather than guess.
         var tableLocation = fs.Location;
         var liveFiles = new HashSet<StorageLocation>();
-        // The names of live files under a LOCAL base outside the root. Such a
-        // base may reach this dataset's own files through a link (a symlink or
-        // junction to {root}/data, say), so its locations can differ from the
-        // listed ones for the same file. A listed file with such a name is kept:
-        // data file names are UUIDs, so this only keeps an occasional dead
-        // deletion file, never deletes a live one.
+        // The names of live files reached through a LOCAL base, inside the root
+        // or outside it. Such a base may reach this dataset's own files through
+        // a link (a symlink or junction to {root}/data, say: {root}/alias is
+        // lexically under the root yet names the same files), so its locations
+        // can differ from the listed ones for the same file. A listed file with
+        // such a name is kept: data file names are UUIDs, so this only keeps an
+        // occasional dead deletion file, never deletes a live one.
         var liveAliasNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var liveTxnFiles = new HashSet<string>(StringComparer.Ordinal);
         foreach (var entry in retainedEntries)
@@ -1600,21 +1617,22 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             foreach (var fragment in manifest.Fragments)
             {
                 foreach (var file in fragment.Files)
-                    AddLive(locator.LocateDataFile(fragment, file), file.Path);
+                    AddLive(locator.LocateDataFile(fragment, file), file.Path, file.HasBaseId);
                 if (fragment.DeletionFile is not null)
                 {
                     string deletionName = DeletionFileReader.FileName(fragment.Id, fragment.DeletionFile);
-                    AddLive(locator.LocateDeletionFile(fragment, deletionName), deletionName);
+                    AddLive(locator.LocateDeletionFile(fragment, deletionName), deletionName,
+                        fragment.DeletionFile.HasBaseId);
                 }
             }
             if (!string.IsNullOrEmpty(manifest.TransactionFile))
                 liveTxnFiles.Add(Path.GetFileName(manifest.TransactionFile));
         }
 
-        void AddLive(StorageLocation location, string path)
+        void AddLive(StorageLocation location, string path, bool throughBase)
         {
             liveFiles.Add(location);
-            if (location.IsFile && !location.IsUnder(tableLocation))
+            if (throughBase && location.IsFile)
                 liveAliasNames.Add(Path.GetFileName(path));
         }
 

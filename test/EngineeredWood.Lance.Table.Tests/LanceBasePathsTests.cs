@@ -585,6 +585,55 @@ public sealed class LanceBasePathsTests : IDisposable
 #endif
     }
 
+    [Fact]
+    public async Task Vacuum_KeepsAFileABaseInsideTheRootReachesThroughALink()
+    {
+#if NET6_0_OR_GREATER
+        // {multi}/alias is lexically under the root, yet a link to {multi}/data: the base names alias/x.lance, vacuum
+        // lists data/x.lance, and they are the same file.
+        string alias = Path.Combine(Multi, "alias");
+        try
+        {
+            Directory.CreateSymbolicLink(alias, Path.Combine(Multi, "data"));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return; // this machine may not create symbolic links
+        }
+
+        string moved = Directory.GetFiles(Path.Combine(_root, "filebase")).Single();
+        File.Move(moved, Path.Combine(Multi, "data", Path.GetFileName(moved)));
+        RewriteBases(Multi, b => { if (!b.IsDatasetRoot) b.Path = alias; });
+
+        var result = await LanceDatasetWriter.VacuumAsync(Multi, new LanceVacuumOptions { RetainVersions = 1 });
+
+        Assert.DoesNotContain(Path.GetFileName(moved), result.DataFilesDeleted);
+        var resolver = new StorageResolver().Register(new LocalTableFileSystem(Path.Combine(_root, "rootbase")));
+        await using var table = await LanceTable.OpenAsync(Multi, new LanceTableOptions { StorageResolver = resolver });
+        Assert.Equal(MultiIds, await ReadIdsAsync(table));
+#else
+        await Task.CompletedTask;
+#endif
+    }
+
+    [Fact]
+    public async Task FeatureFlags_FollowTheManifestsContents()
+    {
+        // A clone's manifest needs FLAG_DELETION_FILES | FLAG_BASE_PATHS (pylance writes 17); a commit keeps both
+        // while deletion files remain, and drops FLAG_DELETION_FILES once compaction has removed every one.
+        await LanceDatasetWriter.DeleteAsync(Clone, EngineeredWood.Expressions.Expressions.Equal("id", LiteralValue.Of(100)),
+            CloneWrite);
+        var afterDelete = await ReadLatestManifestAsync(Clone);
+        Assert.Equal(17UL, afterDelete.ReaderFeatureFlags);
+        Assert.Equal(17UL, afterDelete.WriterFeatureFlags);
+
+        await LanceDatasetWriter.CompactAsync(Clone, CloneWrite);
+        var afterCompact = await ReadLatestManifestAsync(Clone);
+        Assert.All(afterCompact.Fragments, f => Assert.Null(f.DeletionFile));
+        Assert.Equal(FlagBasePaths, afterCompact.ReaderFeatureFlags);
+        Assert.Equal(FlagBasePaths, afterCompact.WriterFeatureFlags);
+    }
+
     private static async Task AssertRefusesAsync(Func<Task> write, string expected)
     {
         var ex = await Assert.ThrowsAsync<NotSupportedException>(write);
