@@ -155,7 +155,7 @@ internal static class IndexPruner
             return null;
 
         return await QuerySegmentsAsync(segments, context,
-            (idx, ct) => op switch
+            async (idx, into, ct) => AddFragments(into, await (op switch
             {
                 ComparisonOperator.Equal => idx.QueryEqualAsync(v, ct),
                 ComparisonOperator.LessThan =>
@@ -165,9 +165,11 @@ internal static class IndexPruner
                 ComparisonOperator.GreaterThan =>
                     idx.QueryRangeAsync(min: v, max: null, includeMin: false, cancellationToken: ct),
                 _ => idx.QueryRangeAsync(min: v, max: null, includeMin: true, cancellationToken: ct),
-            },
+            }).ConfigureAwait(false)),
             // BITMAP only handles equality; for anything else a bitmap segment answers nothing.
-            op == ComparisonOperator.Equal ? (idx, ct) => idx.QueryEqualAsync(v, ct) : null,
+            op == ComparisonOperator.Equal
+                ? async (idx, into, ct) => AddFragments(into, await idx.QueryEqualAsync(v, ct).ConfigureAwait(false))
+                : null,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -187,56 +189,59 @@ internal static class IndexPruner
             ints.Add(lit.AsInt32);
         }
 
+        // Each literal's rows are reduced to their fragments as soon as they are read, so at most one query's
+        // row addresses are held at a time.
         return await QuerySegmentsAsync(segments, context,
-            async (idx, ct) =>
+            async (idx, into, ct) =>
             {
-                var hits = new List<IndexedRowAddress>();
                 foreach (int v in ints)
-                    hits.AddRange(await idx.QueryEqualAsync(v, ct).ConfigureAwait(false));
-                return hits;
+                    AddFragments(into, await idx.QueryEqualAsync(v, ct).ConfigureAwait(false));
             },
-            async (idx, ct) =>
+            async (idx, into, ct) =>
             {
-                var hits = new List<IndexedRowAddress>();
                 foreach (int v in ints)
-                    hits.AddRange(await idx.QueryEqualAsync(v, ct).ConfigureAwait(false));
-                return hits;
+                    AddFragments(into, await idx.QueryEqualAsync(v, ct).ConfigureAwait(false));
             },
             cancellationToken).ConfigureAwait(false);
     }
 
+    private static void AddFragments(HashSet<uint> into, IReadOnlyList<IndexedRowAddress> hits)
+    {
+        foreach (var h in hits) into.Add(h.FragmentId);
+    }
+
     /// <summary>
     /// Asks each segment that can answer (an Int32 index of a kind the queries cover, whose directory is reachable)
-    /// and returns the fragments they hit plus every fragment none of them covers; null when none can answer.
+    /// and returns the fragments they hit plus every fragment none of them covers; null when none can answer. Each
+    /// query adds the fragments it hits to the set it is given.
     /// </summary>
     private static async ValueTask<HashSet<uint>?> QuerySegmentsAsync(
         IReadOnlyList<IndexInfo> segments,
         Context context,
-        Func<BTreeIndex, CancellationToken, Task<IReadOnlyList<IndexedRowAddress>>> btree,
-        Func<BitmapIndex, CancellationToken, Task<IReadOnlyList<IndexedRowAddress>>>? bitmap,
+        Func<BTreeIndex, HashSet<uint>, CancellationToken, Task> btree,
+        Func<BitmapIndex, HashSet<uint>, CancellationToken, Task>? bitmap,
         CancellationToken cancellationToken)
     {
         HashSet<uint>? candidates = null;
         var covered = new HashSet<uint>();
         foreach (var segment in segments)
         {
-            IReadOnlyList<IndexedRowAddress> hits;
             if (IsBitmap(segment))
             {
                 if (bitmap is null) continue;
                 var idx = await context.OpenBitmapAsync(segment, cancellationToken).ConfigureAwait(false);
                 if (idx is null || idx.ValueType is not Apache.Arrow.Types.Int32Type) continue;
-                hits = await bitmap(idx, cancellationToken).ConfigureAwait(false);
+                candidates ??= new HashSet<uint>();
+                await bitmap(idx, candidates, cancellationToken).ConfigureAwait(false);
             }
             else
             {
                 var idx = await context.OpenBTreeAsync(segment, cancellationToken).ConfigureAwait(false);
                 if (idx is null || idx.ValueType is not Apache.Arrow.Types.Int32Type) continue;
-                hits = await btree(idx, cancellationToken).ConfigureAwait(false);
+                candidates ??= new HashSet<uint>();
+                await btree(idx, candidates, cancellationToken).ConfigureAwait(false);
             }
 
-            candidates ??= new HashSet<uint>();
-            foreach (var h in hits) candidates.Add(h.FragmentId);
             covered.UnionWith(segment.FragmentIds);
         }
         if (candidates is null) return null;
