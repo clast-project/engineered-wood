@@ -43,7 +43,8 @@ namespace EngineeredWood.Lance.Table;
 ///
 /// <para><b>Datasets with <c>base_paths</c></b> (a shallow clone, imported files, a multi-base write; #990): every
 /// operation carries the bases into the manifest it commits and writes its own files under the dataset root, as lance
-/// does when a writer names no target base. Delete, update and compact read existing files where their bases put them;
+/// does when a writer names no target base. Delete, delete-rows, update and compact read existing files where their
+/// bases put them;
 /// pass a <see cref="LanceWriteOptions"/> overload a <see cref="LanceWriteOptions.StorageResolver"/> to reach a base
 /// outside the dataset. Vacuum deletes only under the root.</para>
 ///

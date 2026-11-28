@@ -4,8 +4,8 @@
 namespace EngineeredWood.Lance.Table;
 
 /// <summary>
-/// How a <see cref="LanceDatasetWriter"/> operation that reads the dataset's existing files (delete, update, compact)
-/// reaches them.
+/// How a <see cref="LanceDatasetWriter"/> operation that reads the dataset's existing files (delete, delete-rows,
+/// update, compact) reaches them.
 /// </summary>
 public sealed class LanceWriteOptions
 {
