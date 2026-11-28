@@ -30,7 +30,16 @@ internal static class DeletionFileReader
         ITableFileSystem fs, ulong fragmentId, DeletionFile deletionFile,
         CancellationToken cancellationToken = default)
     {
-        string path = BuildPath(fragmentId, deletionFile);
+        string path = DeletionsDirectory + "/" + FileName(fragmentId, deletionFile);
+        return await ReadAsync(fs, path, fragmentId, deletionFile, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Reads the deletion file at <paramref name="path"/> in <paramref name="fs"/>: one a
+    /// <see cref="LanceFileLocator"/> resolved, which may lie under another base.</summary>
+    public static async ValueTask<DeletionMask> ReadAsync(
+        ITableFileSystem fs, string path, ulong fragmentId, DeletionFile deletionFile,
+        CancellationToken cancellationToken = default)
+    {
         byte[] bytes = await fs.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
 
         return deletionFile.FileType switch
@@ -42,12 +51,13 @@ internal static class DeletionFileReader
         };
     }
 
-    private static string BuildPath(ulong fragmentId, DeletionFile deletionFile)
+    /// <summary>A deletion file's name in its <c>_deletions/</c> directory.</summary>
+    public static string FileName(ulong fragmentId, DeletionFile deletionFile)
     {
         string ext = deletionFile.FileType == DeletionFile.Types.DeletionFileType.ArrowArray
             ? ".arrow"
             : ".bin";
-        return $"{DeletionsDirectory}/{fragmentId}-{deletionFile.ReadVersion}-{deletionFile.Id}{ext}";
+        return $"{fragmentId}-{deletionFile.ReadVersion}-{deletionFile.Id}{ext}";
     }
 
     private static DeletionMask ReadArrowArray(byte[] bytes, string pathForErrors)

@@ -7,7 +7,8 @@
 #
 # Usage:
 #   pip install pylance pyarrow
-#   python generate_test_data.py
+#   python generate_test_data.py              # every fixture
+#   python generate_test_data.py base_paths   # only base_paths_v21/
 #
 # The generated directories are committed to source control so tests can
 # run without invoking pylance.
@@ -146,5 +147,60 @@ def _write_with_delete(name, table, *, delete_predicate, version="2.1"):
     print(f"  {name}: {sz} bytes")
 
 
+def write_base_paths_fixtures(version="2.1"):
+    """Datasets whose manifests have base_paths (#963). Each base path
+    pylance stores is the ABSOLUTE local path of this machine's copy, so
+    the tests copy base_paths_v21/ and point every base at the copy (the
+    last segment of each stored path names the sibling directory).
+
+    clone_source + clone: a shallow clone. The source has two fragments,
+    one deleted row in each and a BTREE index; the clone then appends a
+    fragment and deletes a row of fragment 0, so it mixes data and deletion
+    files of base 0 (the source) with its own.
+
+    multi: written with initial_bases/target_bases: fragment 0 under
+    rootbase/data/ (is_dataset_root), fragment 1 directly in filebase/,
+    fragment 2 under multi/data/, then a delete across all three (whose
+    deletion files lance writes under multi/_deletions/)."""
+    root = os.path.join(THIS_DIR, "base_paths_v21")
+    if os.path.exists(root):
+        shutil.rmtree(root)
+    os.makedirs(root)
+
+    def ids(a, b):
+        return pa.table({"id": pa.array(range(a, b), type=pa.int32()),
+                         "v": pa.array([f"v{i}" for i in range(a, b)])})
+
+    source = os.path.join(root, "clone_source")
+    lance.write_dataset(ids(0, 10), source, data_storage_version=version)
+    ds = lance.write_dataset(ids(10, 20), source, mode="append")
+    ds.delete("id = 3 or id = 13")
+    ds.create_scalar_index("id", "BTREE")
+    clone = ds.shallow_clone(os.path.join(root, "clone"), ds.version)
+    clone.insert(ids(100, 102))
+    clone.delete("id = 5")
+
+    main = os.path.join(root, "multi")
+    lance.write_dataset(ids(0, 10), main, data_storage_version=version,
+        initial_bases=[
+            lance.DatasetBasePath(os.path.join(root, "rootbase"), name="rb", is_dataset_root=True),
+            lance.DatasetBasePath(os.path.join(root, "filebase"), name="fb", is_dataset_root=False),
+        ],
+        target_bases=["rb"])
+    lance.write_dataset(ids(10, 20), main, mode="append", target_bases=["fb"])
+    ds = lance.write_dataset(ids(20, 30), main, mode="append")
+    ds.delete("id % 10 = 0")
+
+    for name in ("clone", "multi"):
+        d = lance.dataset(os.path.join(root, name))
+        print(f"  base_paths_v21/{name}: {d.count_rows()} rows, bases "
+              f"{ {k: (v.path, v.is_dataset_root) for k, v in d.base_paths().items()} }")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if sys.argv[1:] == ["base_paths"]:
+        write_base_paths_fixtures()
+    else:
+        main()
+        write_base_paths_fixtures()

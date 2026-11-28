@@ -180,6 +180,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 .ConfigureAwait(false);
             baseManifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
                 .ConfigureAwait(false);
+            ThrowIfBasePaths(baseManifest, datasetPath, "append to");
             readVersion = baseManifest.Version;
         }
         else // Overwrite
@@ -194,6 +195,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                 {
                     var latest = await ManifestReader.ReadAsync(fs, entries[0].Path, cancellationToken)
                         .ConfigureAwait(false);
+                    ThrowIfBasePaths(latest, datasetPath, "overwrite");
                     readVersion = latest.Version;
                 }
             }
@@ -303,6 +305,21 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         await WriteManifestFileAsync(_datasetPath, manifest, transactionBytes, cancellationToken)
             .ConfigureAwait(false);
         _finished = true;
+    }
+
+    /// <summary>
+    /// Refuses to write a dataset whose manifest has <c>base_paths</c> (a shallow clone, imported files, a
+    /// multi-base write). This writer reads existing files as <c>data/{path}</c> and builds each new manifest without
+    /// <c>base_paths</c>, so on such a dataset it would read the wrong files and commit fragments naming a base the
+    /// manifest no longer lists. Reading such a dataset is supported (<see cref="LanceTable"/>).
+    /// </summary>
+    private static void ThrowIfBasePaths(LanceManifest manifest, string datasetPath, string operation)
+    {
+        if (manifest.BasePaths.Count > 0)
+            throw new NotSupportedException(
+                $"Cannot {operation} the Lance dataset at '{datasetPath}': its manifest (version {manifest.Version}) "
+                + $"has {manifest.BasePaths.Count} base path(s) (a shallow clone, imported files or a multi-base "
+                + "write), and LanceDatasetWriter does not yet write such datasets. They can be read with LanceTable.");
     }
 
     /// <summary>
@@ -547,6 +564,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             .ConfigureAwait(false);
         var baseManifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
             .ConfigureAwait(false);
+        ThrowIfBasePaths(baseManifest, datasetPath, "delete rows from");
         ulong readVersion = baseManifest.Version;
 
         // Filter out empty work and validate fragment ids upfront.
@@ -693,6 +711,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             .ConfigureAwait(false);
         var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
             .ConfigureAwait(false);
+        ThrowIfBasePaths(manifest, datasetPath, "delete from");
 
         var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
         lanceSchema.Fields.AddRange(manifest.Fields);
@@ -859,6 +878,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             .ConfigureAwait(false);
         var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
             .ConfigureAwait(false);
+        ThrowIfBasePaths(manifest, datasetPath, "update");
 
         var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
         lanceSchema.Fields.AddRange(manifest.Fields);
@@ -1108,6 +1128,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             .ConfigureAwait(false);
         var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
             .ConfigureAwait(false);
+        ThrowIfBasePaths(manifest, datasetPath, "compact");
 
         // Identify fragments with at least one tombstoned row. Fragments
         // without deletion files are well-packed already and aren't
@@ -1372,6 +1393,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         {
             var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
                 .ConfigureAwait(false);
+            ThrowIfBasePaths(manifest, datasetPath, "vacuum");
             foreach (var fragment in manifest.Fragments)
             {
                 foreach (var file in fragment.Files)

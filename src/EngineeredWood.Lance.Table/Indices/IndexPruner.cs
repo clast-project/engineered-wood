@@ -234,7 +234,7 @@ internal static class IndexPruner
         ITableFileSystem fs, CancellationToken cancellationToken)
     {
         if (opened.TryGetValue(info.Name, out var idx)) return idx;
-        idx = await BTreeIndex.OpenAsync(fs, info.DirectoryPath, cancellationToken)
+        idx = await BTreeIndex.OpenAsync(info.FileSystem ?? fs, info.DirectoryPath, cancellationToken)
             .ConfigureAwait(false);
         opened[info.Name] = idx;
         return idx;
@@ -245,7 +245,7 @@ internal static class IndexPruner
         ITableFileSystem fs, CancellationToken cancellationToken)
     {
         if (opened.TryGetValue(info.Name, out var idx)) return idx;
-        idx = await BitmapIndex.OpenAsync(fs, info.DirectoryPath, cancellationToken)
+        idx = await BitmapIndex.OpenAsync(info.FileSystem ?? fs, info.DirectoryPath, cancellationToken)
             .ConfigureAwait(false);
         opened[info.Name] = idx;
         return idx;

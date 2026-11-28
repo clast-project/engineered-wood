@@ -25,13 +25,16 @@ namespace EngineeredWood.Lance.Table;
 /// open time when encountered):</para>
 /// <list type="bullet">
 /// <item>Deletion files (<c>_deletions/</c>).</item>
-/// <item>Multi-base-path datasets (shallow clones, imported files).</item>
 /// <item>Time travel to an older version.</item>
 /// <item>Predicate pushdown / projection — callers receive full batches
 ///   and filter / project themselves.</item>
 /// <item>Indices (<c>_indices/</c>) — read path ignores them entirely.</item>
 /// <item>Writing.</item>
 /// </list>
+///
+/// <para>A dataset whose manifest has <c>base_paths</c> (a shallow clone, imported files, a multi-base write) is read
+/// with its files found under their bases; see <see cref="LanceTableOptions.StorageResolver"/> for how a base outside
+/// the dataset is reached.</para>
 /// </summary>
 public sealed class LanceTable : IAsyncDisposable
 {
@@ -39,15 +42,17 @@ public sealed class LanceTable : IAsyncDisposable
     private readonly bool _ownsFileSystem;
     private readonly Proto.Manifest _manifest;
     private readonly Apache.Arrow.Schema _arrowSchema;
+    private readonly LanceFileLocator _locator;
 
     private LanceTable(
         ITableFileSystem fs, bool ownsFileSystem,
-        Proto.Manifest manifest, Apache.Arrow.Schema arrowSchema)
+        Proto.Manifest manifest, Apache.Arrow.Schema arrowSchema, LanceFileLocator locator)
     {
         _fs = fs;
         _ownsFileSystem = ownsFileSystem;
         _manifest = manifest;
         _arrowSchema = arrowSchema;
+        _locator = locator;
     }
 
     /// <summary>The Arrow schema of the dataset.</summary>
@@ -97,7 +102,7 @@ public sealed class LanceTable : IAsyncDisposable
     /// </summary>
     public ValueTask<IReadOnlyList<Indices.IndexInfo>> GetIndicesAsync(
         CancellationToken cancellationToken = default)
-        => Indices.IndexCatalog.DiscoverAsync(_fs, _manifest, cancellationToken);
+        => Indices.IndexCatalog.DiscoverAsync(_fs, _manifest, _locator, cancellationToken);
 
     /// <summary>
     /// Open a BTREE scalar index by name. Convenience wrapper that calls
@@ -108,7 +113,7 @@ public sealed class LanceTable : IAsyncDisposable
         string indexName, CancellationToken cancellationToken = default)
     {
         var match = await ResolveIndexAsync(indexName, cancellationToken).ConfigureAwait(false);
-        return await Indices.BTreeIndex.OpenAsync(_fs, match.DirectoryPath, cancellationToken)
+        return await Indices.BTreeIndex.OpenAsync(match.FileSystem ?? _fs, match.DirectoryPath, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -121,7 +126,7 @@ public sealed class LanceTable : IAsyncDisposable
         string indexName, CancellationToken cancellationToken = default)
     {
         var match = await ResolveIndexAsync(indexName, cancellationToken).ConfigureAwait(false);
-        return await Indices.BitmapIndex.OpenAsync(_fs, match.DirectoryPath, cancellationToken)
+        return await Indices.BitmapIndex.OpenAsync(match.FileSystem ?? _fs, match.DirectoryPath, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -148,7 +153,7 @@ public sealed class LanceTable : IAsyncDisposable
         string directoryPath, CancellationToken cancellationToken = default)
     {
         var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(directoryPath);
-        return OpenAsyncCore(fs, ownsFileSystem: true, version: null, asOf: null, cancellationToken);
+        return OpenAsyncCore(fs, ownsFileSystem: true, version: null, asOf: null, resolver: null, cancellationToken);
     }
 
     /// <summary>
@@ -161,7 +166,7 @@ public sealed class LanceTable : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(directoryPath);
-        return OpenAsyncCore(fs, ownsFileSystem: true, version, asOf: null, cancellationToken);
+        return OpenAsyncCore(fs, ownsFileSystem: true, version, asOf: null, resolver: null, cancellationToken);
     }
 
     /// <summary>
@@ -171,7 +176,7 @@ public sealed class LanceTable : IAsyncDisposable
     /// </summary>
     public static ValueTask<LanceTable> OpenAsync(
         ITableFileSystem fileSystem, CancellationToken cancellationToken = default)
-        => OpenAsyncCore(fileSystem, ownsFileSystem: false, version: null, asOf: null, cancellationToken);
+        => OpenAsyncCore(fileSystem, ownsFileSystem: false, version: null, asOf: null, resolver: null, cancellationToken);
 
     /// <summary>
     /// Opens a Lance dataset at a specific historical version (time travel)
@@ -180,7 +185,7 @@ public sealed class LanceTable : IAsyncDisposable
     public static ValueTask<LanceTable> OpenAsync(
         ITableFileSystem fileSystem, ulong version,
         CancellationToken cancellationToken = default)
-        => OpenAsyncCore(fileSystem, ownsFileSystem: false, version, asOf: null, cancellationToken);
+        => OpenAsyncCore(fileSystem, ownsFileSystem: false, version, asOf: null, resolver: null, cancellationToken);
 
     /// <summary>
     /// Opens a Lance dataset at the latest version with
@@ -193,14 +198,40 @@ public sealed class LanceTable : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(directoryPath);
-        return OpenAsyncCore(fs, ownsFileSystem: true, version: null, asOf, cancellationToken);
+        return OpenAsyncCore(fs, ownsFileSystem: true, version: null, asOf, resolver: null, cancellationToken);
     }
 
     /// <inheritdoc cref="OpenAsync(string, DateTimeOffset, CancellationToken)"/>
     public static ValueTask<LanceTable> OpenAsync(
         ITableFileSystem fileSystem, DateTimeOffset asOf,
         CancellationToken cancellationToken = default)
-        => OpenAsyncCore(fileSystem, ownsFileSystem: false, version: null, asOf, cancellationToken);
+        => OpenAsyncCore(fileSystem, ownsFileSystem: false, version: null, asOf, resolver: null, cancellationToken);
+
+    /// <summary>
+    /// Opens a Lance dataset from a caller-provided <see cref="ITableFileSystem"/> with
+    /// <paramref name="options"/>: a version or timestamp to open, and the
+    /// <see cref="LanceTableOptions.StorageResolver"/> that reaches files the manifest's <c>base_paths</c> name
+    /// outside the dataset. The caller retains ownership of the filesystem instance.
+    /// </summary>
+    public static ValueTask<LanceTable> OpenAsync(
+        ITableFileSystem fileSystem, LanceTableOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        if (options is null) throw new ArgumentNullException(nameof(options));
+        return OpenAsyncCore(fileSystem, ownsFileSystem: false, options.Version, options.AsOf,
+            options.StorageResolver, cancellationToken);
+    }
+
+    /// <inheritdoc cref="OpenAsync(ITableFileSystem, LanceTableOptions, CancellationToken)"/>
+    public static ValueTask<LanceTable> OpenAsync(
+        string directoryPath, LanceTableOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        if (options is null) throw new ArgumentNullException(nameof(options));
+        var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(directoryPath);
+        return OpenAsyncCore(fs, ownsFileSystem: true, options.Version, options.AsOf,
+            options.StorageResolver, cancellationToken);
+    }
 
     /// <summary>
     /// Lists every available version number in the dataset, sorted
@@ -229,7 +260,7 @@ public sealed class LanceTable : IAsyncDisposable
 
     private static async ValueTask<LanceTable> OpenAsyncCore(
         ITableFileSystem fs, bool ownsFileSystem, ulong? version,
-        DateTimeOffset? asOf, CancellationToken cancellationToken)
+        DateTimeOffset? asOf, StorageResolver? resolver, CancellationToken cancellationToken)
     {
         if (version is not null && asOf is not null)
             throw new ArgumentException(
@@ -246,6 +277,8 @@ public sealed class LanceTable : IAsyncDisposable
             .ConfigureAwait(false);
 
         ValidateScope(manifest);
+        var locator = new LanceFileLocator(fs, manifest, resolver);
+        locator.Validate(manifest);
 
         // Build an Arrow Schema by re-shaping the Manifest's flat fields into
         // a Lance Proto.Schema and reusing the existing converter.
@@ -255,28 +288,26 @@ public sealed class LanceTable : IAsyncDisposable
             lanceSchema.Metadata.Add(kv.Key, kv.Value);
         var arrowSchema = EngineeredWood.Lance.Schema.LanceSchemaConverter.ToArrowSchema(lanceSchema);
 
-        return new LanceTable(fs, ownsFileSystem, manifest, arrowSchema);
+        return new LanceTable(fs, ownsFileSystem, manifest, arrowSchema, locator);
     }
 
     private static void ValidateScope(Proto.Manifest manifest)
     {
         // Feature flags: 1=deletion files, 2=stable row ids, 4=v2 format
-        // (deprecated), 8=table config. Reject anything we can't honour.
+        // (deprecated), 8=table config, 16=base paths (lance-table 14.0.3
+        // feature_flags.rs FLAG_BASE_PATHS, set whenever base_paths is
+        // non-empty). Reject anything we can't honour.
         const ulong FlagDeletionFiles = 1;
         const ulong FlagStableRowIds = 2;
         const ulong FlagV2DeprecatedMarker = 4;
         const ulong FlagTableConfig = 8;
+        const ulong FlagBasePaths = 16;
         const ulong KnownReaderFlags = FlagDeletionFiles | FlagStableRowIds
-            | FlagV2DeprecatedMarker | FlagTableConfig;
+            | FlagV2DeprecatedMarker | FlagTableConfig | FlagBasePaths;
         ulong unknownFlags = manifest.ReaderFeatureFlags & ~KnownReaderFlags;
         if (unknownFlags != 0)
             throw new LanceTableFormatException(
                 $"Manifest requires unknown reader feature flags 0x{unknownFlags:X}.");
-
-        if (manifest.BasePaths.Count > 0)
-            throw new NotImplementedException(
-                "Lance datasets with custom base_paths (shallow clones / imported files) " +
-                "are not yet supported.");
 
         foreach (var frag in manifest.Fragments)
         {
@@ -384,8 +415,9 @@ public sealed class LanceTable : IAsyncDisposable
                 continue;
 
             DataFile file = fragment.Files[0];
-            string relPath = "data/" + file.Path;
-            await using IRandomAccessFile raf = await _fs.OpenReadAsync(relPath, cancellationToken)
+            var dataFile = _locator.ResolveDataFile(fragment, file);
+            await using IRandomAccessFile raf = await dataFile.FileSystem
+                .OpenReadAsync(dataFile.Path, cancellationToken)
                 .ConfigureAwait(false);
             await using var reader = await EngineeredWood.Lance.LanceFileReader
                 .OpenAsync(raf, ownsReader: false, cancellationToken)
@@ -403,8 +435,11 @@ public sealed class LanceTable : IAsyncDisposable
             DeletionMask? deletionMask = null;
             if (fragment.DeletionFile is not null && fragment.DeletionFile.NumDeletedRows > 0)
             {
+                var deletionFile = _locator.ResolveDeletionFile(
+                    fragment, DeletionFileReader.FileName(fragment.Id, fragment.DeletionFile));
                 deletionMask = await DeletionFileReader.ReadAsync(
-                        _fs, fragment.Id, fragment.DeletionFile, cancellationToken)
+                        deletionFile.FileSystem, deletionFile.Path, fragment.Id, fragment.DeletionFile,
+                        cancellationToken)
                     .ConfigureAwait(false);
             }
 
