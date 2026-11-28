@@ -29,7 +29,8 @@ public readonly record struct LanceVersion(ushort Major, ushort Minor)
     /// v2.2 — adds Map type support and requires the "large chunk"
     /// mini-block grammar (<c>has_large_chunk</c>: u32 chunk-metadata words
     /// and value-buffer sizes, where v2.1 requires u16). Our reader accepts
-    /// both; our writer emits v2.2 only when it must (a Map column).
+    /// both. Our writer defaults to v2.1 and moves to v2.2 when a Map is the
+    /// first column; callers can also choose v2.2 when creating it.
     /// </summary>
     public static LanceVersion V2_2 => new(2, 2);
 

@@ -146,9 +146,9 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// Opens an existing Lance dataset for appending new fragments. The
     /// new fragments' schema must match the existing dataset's schema
     /// (same field names, types, and ids). Throws if no manifest exists
-    /// at <paramref name="datasetPath"/>. <paramref name="fileVersion"/> defaults
-    /// to the dataset's own data-storage version, and to v2.2 when its schema
-    /// has a Map column.
+    /// at <paramref name="datasetPath"/>. The new files take the dataset's own
+    /// data-storage version (v2.2 when its schema has a Map column);
+    /// <paramref name="fileVersion"/>, if given, must be that version.
     /// </summary>
     public static ValueTask<LanceDatasetWriter> AppendAsync(
         string datasetPath, CancellationToken cancellationToken = default,
@@ -246,11 +246,23 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         string dataFileName = Guid.NewGuid().ToString("N") + ".lance";
         string dataFilePath = Path.Combine(datasetPath, "data", dataFileName);
         // Append keeps the dataset's version (and v2.2 for a Map schema), so its
-        // columns can be written in schema order.
-        LanceVersion version = fileVersion
-            ?? (mode == LanceWriteMode.Append
-                ? FileVersionFor(baseManifest!, schema: null)
-                : LanceVersion.V2_1);
+        // columns can be written in schema order. lance refuses a dataset whose
+        // data files don't all share the manifest's version, so an explicit
+        // different one is refused rather than written.
+        LanceVersion version;
+        if (mode == LanceWriteMode.Append)
+        {
+            version = FileVersionFor(baseManifest!, schema: null);
+            if (fileVersion is { } requested && requested != version)
+                throw new ArgumentException(
+                    $"Cannot append Lance v{requested} files to the dataset at '{datasetPath}', whose data "
+                    + $"files are v{version}: lance requires every data file to share the dataset's version.",
+                    nameof(fileVersion));
+        }
+        else
+        {
+            version = fileVersion ?? LanceVersion.V2_1;
+        }
         var fileWriter = await LanceFileWriter.CreateAsync(
             dataFilePath, cancellationToken, compression, version).ConfigureAwait(false);
 

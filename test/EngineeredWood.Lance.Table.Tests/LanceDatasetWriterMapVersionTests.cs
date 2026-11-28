@@ -79,6 +79,35 @@ public class LanceDatasetWriterMapVersionTests
         }
     }
 
+    [Fact]
+    public async Task Append_WithADifferentVersion_IsRefused()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-mapver-{Guid.NewGuid():N}");
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("id", new[] { 1, 2, 3 });
+                await ds.FinishAsync();
+            }
+
+            var ex = await Assert.ThrowsAsync<ArgumentException>(async () =>
+                await LanceDatasetWriter.AppendAsync(path, fileVersion: LanceVersion.V2_2));
+            Assert.Equal("fileVersion", ex.ParamName);
+
+            // The matching version is accepted.
+            await using (var ds = await LanceDatasetWriter.AppendAsync(path, fileVersion: LanceVersion.V2_1))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("id", new[] { 4 });
+                await ds.FinishAsync();
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
     /// <summary>Three one-entry rows: {"k{first}": first}, {"k{first+1}": first+1}, ...</summary>
     private static MapArray BuildMap(int first)
     {
