@@ -115,7 +115,7 @@ public class LanceFileWriterChunkGrammarTests
                 "id", new Int32Array.Builder().Append(1).Append(2).Append(3).Build());
             var ex = await Assert.ThrowsAsync<NotSupportedException>(
                 () => writer.WriteColumnAsync("kvs", BuildMap()));
-            Assert.Contains("Write the Map column first", ex.Message);
+            Assert.Contains("LanceVersion.V2_2", ex.Message);
         }
         finally
         {
@@ -154,6 +154,71 @@ public class LanceFileWriterChunkGrammarTests
         {
             if (File.Exists(path)) File.Delete(path);
         }
+    }
+
+    // Copilot on #999: the Bool decoder read def_size as u32 in a large-chunk
+    // file. It is a u16 in both formats; only buffer sizes widen.
+    [Fact]
+    public async Task MapThenNullableBool_RoundTrips()
+    {
+        string path = TempPath();
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("kvs", BuildMap());
+                await writer.WriteColumnAsync(
+                    "b", new BooleanArray.Builder().Append(true).AppendNull().Append(false).Build());
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var b = (BooleanArray)await reader.ReadColumnAsync(1);
+            Assert.Equal(new bool?[] { true, null, false }, new[] { b.GetValue(0), b.GetValue(1), b.GetValue(2) });
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task ExplicitV2_2_AllowsAMapAfterOtherColumns()
+    {
+        string path = TempPath();
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path, version: LanceVersion.V2_2))
+            {
+                await writer.WriteColumnAsync(
+                    "id", new Int32Array.Builder().Append(1).Append(2).Append(3).Build());
+                await writer.WriteColumnAsync("kvs", BuildMap());
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.Equal(LanceVersion.V2_2, reader.Version);
+            foreach (var column in reader.ColumnMetadatas)
+                foreach (var page in column.Pages)
+                    Assert.True(MiniBlock(page).HasLargeChunk);
+            var ids = (Int32Array)await reader.ReadColumnAsync(0);
+            Assert.Equal(new int?[] { 1, 2, 3 }, ids.ToArray());
+            var map = (MapArray)await reader.ReadColumnAsync(1);
+            Assert.Equal("c", ((StringArray)map.Keys).GetString(2));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task UnsupportedVersion_IsRefused()
+    {
+        string path = TempPath();
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            async () => await LanceFileWriter.CreateAsync(path, version: LanceVersion.V2_0));
+        Assert.False(File.Exists(path));
     }
 
     private sealed record SingleChunk(MiniBlockLayout Layout, uint ValueBufferSize, byte[] ChunkBytes);

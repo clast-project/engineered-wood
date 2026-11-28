@@ -286,10 +286,10 @@ internal static class MiniBlockLayoutDecoder
             int defSize = 0;
             if (hasDef)
             {
-                defSize = hasLargeChunk
-                    ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))
-                    : BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
-                cursor += hasLargeChunk ? 4 : 2;
+                // def_size is a u16 in both grammars; only buffer sizes widen
+                // to u32 with has_large_chunk (lance miniblock_decode.rs).
+                defSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+                cursor += 2;
             }
             int valueBufSize = hasLargeChunk
                 ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))

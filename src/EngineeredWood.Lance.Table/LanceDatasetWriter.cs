@@ -131,39 +131,49 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// Creates an empty Lance dataset at <paramref name="datasetPath"/>.
     /// Throws <see cref="InvalidOperationException"/> if the path already
     /// contains a Lance dataset. Use <see cref="AppendAsync"/> or
-    /// <see cref="OverwriteAsync"/> for those cases.
+    /// <see cref="OverwriteAsync"/> for those cases. <paramref name="fileVersion"/>
+    /// is the data files' Lance version (default v2.1, which moves to v2.2 when
+    /// a Map column is written first); pass <see cref="LanceVersion.V2_2"/> to
+    /// write a Map column after other columns.
     /// </summary>
     public static ValueTask<LanceDatasetWriter> CreateAsync(
         string datasetPath, CancellationToken cancellationToken = default,
-        LanceCompressionScheme compression = LanceCompressionScheme.None)
-        => OpenInternalAsync(datasetPath, LanceWriteMode.Create, compression, cancellationToken);
+        LanceCompressionScheme compression = LanceCompressionScheme.None,
+        LanceVersion? fileVersion = null)
+        => OpenInternalAsync(datasetPath, LanceWriteMode.Create, compression, fileVersion, cancellationToken);
 
     /// <summary>
     /// Opens an existing Lance dataset for appending new fragments. The
     /// new fragments' schema must match the existing dataset's schema
     /// (same field names, types, and ids). Throws if no manifest exists
-    /// at <paramref name="datasetPath"/>.
+    /// at <paramref name="datasetPath"/>. <paramref name="fileVersion"/> defaults
+    /// to the dataset's own data-storage version, and to v2.2 when its schema
+    /// has a Map column.
     /// </summary>
     public static ValueTask<LanceDatasetWriter> AppendAsync(
         string datasetPath, CancellationToken cancellationToken = default,
-        LanceCompressionScheme compression = LanceCompressionScheme.None)
-        => OpenInternalAsync(datasetPath, LanceWriteMode.Append, compression, cancellationToken);
+        LanceCompressionScheme compression = LanceCompressionScheme.None,
+        LanceVersion? fileVersion = null)
+        => OpenInternalAsync(datasetPath, LanceWriteMode.Append, compression, fileVersion, cancellationToken);
 
     /// <summary>
     /// Opens an existing Lance dataset (or creates a new one) and prepares
     /// to overwrite its contents. The new manifest's version is one more
     /// than the latest existing version (or 1 if no prior version) and
     /// references only the new fragments. Old data files remain on disk
-    /// for a future vacuum step to clean up.
+    /// for a future vacuum step to clean up. <paramref name="fileVersion"/> is
+    /// as for <see cref="CreateAsync"/>.
     /// </summary>
     public static ValueTask<LanceDatasetWriter> OverwriteAsync(
         string datasetPath, CancellationToken cancellationToken = default,
-        LanceCompressionScheme compression = LanceCompressionScheme.None)
-        => OpenInternalAsync(datasetPath, LanceWriteMode.Overwrite, compression, cancellationToken);
+        LanceCompressionScheme compression = LanceCompressionScheme.None,
+        LanceVersion? fileVersion = null)
+        => OpenInternalAsync(datasetPath, LanceWriteMode.Overwrite, compression, fileVersion, cancellationToken);
 
     private static async ValueTask<LanceDatasetWriter> OpenInternalAsync(
         string datasetPath, LanceWriteMode mode,
         LanceCompressionScheme compression,
+        LanceVersion? fileVersion,
         CancellationToken cancellationToken)
     {
         if (datasetPath is null) throw new ArgumentNullException(nameof(datasetPath));
@@ -235,8 +245,14 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
 
         string dataFileName = Guid.NewGuid().ToString("N") + ".lance";
         string dataFilePath = Path.Combine(datasetPath, "data", dataFileName);
+        // Append keeps the dataset's version (and v2.2 for a Map schema), so its
+        // columns can be written in schema order.
+        LanceVersion version = fileVersion
+            ?? (mode == LanceWriteMode.Append
+                ? FileVersionFor(baseManifest!, schema: null)
+                : LanceVersion.V2_1);
         var fileWriter = await LanceFileWriter.CreateAsync(
-            dataFilePath, cancellationToken, compression).ConfigureAwait(false);
+            dataFilePath, cancellationToken, compression, version).ConfigureAwait(false);
 
         return new LanceDatasetWriter(
             datasetPath, mode, compression, baseManifest, readVersion, basePaths,
@@ -262,13 +278,17 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             throw new InvalidOperationException(
                 "Current fragment has no rows yet; write at least one column before starting a new fragment.");
 
+        // The next fragment starts at this one's version, which a Map column
+        // may have raised to v2.2, so the fragments agree and its columns can
+        // be written in the same order.
+        LanceVersion version = _currentFileWriter.Version;
         await CloseCurrentFragmentAsync(cancellationToken).ConfigureAwait(false);
 
         // Open the next fragment's writer.
         string newName = Guid.NewGuid().ToString("N") + ".lance";
         string newPath = Path.Combine(_datasetPath, "data", newName);
         _currentFileWriter = await LanceFileWriter.CreateAsync(
-            newPath, cancellationToken, _compression).ConfigureAwait(false);
+            newPath, cancellationToken, _compression, version).ConfigureAwait(false);
         _currentDataFileName = newName;
     }
 
@@ -1097,7 +1117,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         LanceVersion newFileVersion;
         IReadOnlyList<LanceField> newFileFields;
         await using (var w = await EngineeredWood.Lance.LanceFileWriter
-            .CreateAsync(newDataFilePath, cancellationToken).ConfigureAwait(false))
+            .CreateAsync(newDataFilePath, cancellationToken,
+                version: FileVersionFor(manifest, arrowSchema)).ConfigureAwait(false))
         {
             for (int i = 0; i < arrowSchema.FieldsList.Count; i++)
             {
@@ -1344,7 +1365,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             LanceVersion newFileVersion;
             IReadOnlyList<LanceField> newFileFields;
             await using (var w = await EngineeredWood.Lance.LanceFileWriter
-                .CreateAsync(newDataFilePath, cancellationToken).ConfigureAwait(false))
+                .CreateAsync(newDataFilePath, cancellationToken,
+                    version: FileVersionFor(manifest, arrowSchema)).ConfigureAwait(false))
             {
                 for (int i = 0; i < arrowSchema.FieldsList.Count; i++)
                     await w.WriteColumnAsync(
@@ -1467,6 +1489,33 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
                     $"Cannot rewrite the Lance dataset at '{datasetPath}': fragment {fragment.Id} has "
                     + $"{fragment.Files.Count} data files (a column-split layout), which LanceDatasetWriter does not read.");
         }
+    }
+
+    /// <summary>
+    /// The version for a data file written into an existing dataset: v2.2 when
+    /// the dataset's data-storage version is 2.2 or its schema has a Map column
+    /// (which needs v2.2, and whose columns are written in schema order, so the
+    /// writer can't move to v2.2 on reaching it), else v2.1.
+    /// </summary>
+    private static LanceVersion FileVersionFor(LanceManifest manifest, Apache.Arrow.Schema? schema)
+    {
+        if (manifest.DataFormat?.Version == "2.2") return LanceVersion.V2_2;
+        if (schema is null)
+        {
+            var lanceSchema = new EngineeredWood.Lance.Proto.Schema();
+            lanceSchema.Fields.AddRange(manifest.Fields);
+            schema = EngineeredWood.Lance.Schema.LanceSchemaConverter.ToArrowSchema(lanceSchema);
+        }
+        foreach (var field in schema.FieldsList)
+            if (HasMap(field.DataType)) return LanceVersion.V2_2;
+        return LanceVersion.V2_1;
+
+        static bool HasMap(IArrowType type) => type switch
+        {
+            MapType => true,
+            NestedType nested => nested.Fields.Any(f => HasMap(f.DataType)),
+            _ => false,
+        };
     }
 
     /// <summary>Reads <paramref name="fragment"/>'s deletion file, wherever its base puts it.</summary>

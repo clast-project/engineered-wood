@@ -97,7 +97,11 @@ public sealed class LanceFileWriter : IAsyncDisposable
     /// </summary>
     internal long FinalSizeBytes => _finalSizeBytes;
 
-    internal LanceVersion Version => _version;
+    /// <summary>
+    /// The file's Lance version: the one the writer was created with, or v2.2
+    /// once a Map column moved a v2.1 writer there.
+    /// </summary>
+    public LanceVersion Version => _version;
 
     private LanceFileWriter(
         ISequentialFile file, bool ownsFile, LanceVersion version,
@@ -114,13 +118,16 @@ public sealed class LanceFileWriter : IAsyncDisposable
     /// The caller controls the file's lifetime when <paramref name="ownsFile"/>
     /// is <c>false</c>. <paramref name="compression"/> controls per-chunk
     /// value-buffer compression; see <see cref="LanceCompressionScheme"/>.
+    /// <paramref name="version"/> is the file version; see
+    /// <see cref="ResolveVersion"/>.
     /// </summary>
     public static LanceFileWriter Create(
         ISequentialFile file, bool ownsFile = false,
-        LanceCompressionScheme compression = LanceCompressionScheme.None)
+        LanceCompressionScheme compression = LanceCompressionScheme.None,
+        LanceVersion? version = null)
     {
         if (file is null) throw new ArgumentNullException(nameof(file));
-        return new LanceFileWriter(file, ownsFile, LanceVersion.V2_1, compression);
+        return new LanceFileWriter(file, ownsFile, ResolveVersion(version), compression);
     }
 
     /// <summary>
@@ -128,16 +135,38 @@ public sealed class LanceFileWriter : IAsyncDisposable
     /// filesystem, overwriting any existing file. The returned writer owns
     /// the underlying file handle. <paramref name="compression"/> controls
     /// per-chunk value-buffer compression; see <see cref="LanceCompressionScheme"/>.
+    /// <paramref name="version"/> is the file version; see
+    /// <see cref="ResolveVersion"/>.
     /// </summary>
     public static async ValueTask<LanceFileWriter> CreateAsync(
         string path, CancellationToken cancellationToken = default,
-        LanceCompressionScheme compression = LanceCompressionScheme.None)
+        LanceCompressionScheme compression = LanceCompressionScheme.None,
+        LanceVersion? version = null)
     {
+        LanceVersion resolved = ResolveVersion(version);
         var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(
             System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path))!);
         var seq = await fs.CreateAsync(
             System.IO.Path.GetFileName(path), overwrite: true, cancellationToken).ConfigureAwait(false);
-        return new LanceFileWriter(seq, ownsFile: true, LanceVersion.V2_1, compression);
+        return new LanceFileWriter(seq, ownsFile: true, resolved, compression);
+    }
+
+    /// <summary>
+    /// The file version a writer starts at: <see cref="LanceVersion.V2_1"/>
+    /// when <paramref name="version"/> is null, otherwise
+    /// <see cref="LanceVersion.V2_1"/> or <see cref="LanceVersion.V2_2"/>.
+    /// A v2.1 writer moves to v2.2 when a Map column is written before any
+    /// other column. Choose v2.2 up front to write a Map after other columns:
+    /// the two versions use different mini-block chunk formats, so a file
+    /// can't change version once such a page is on disk.
+    /// </summary>
+    private static LanceVersion ResolveVersion(LanceVersion? version)
+    {
+        LanceVersion v = version ?? LanceVersion.V2_1;
+        if (!v.IsV2_1 && !v.IsV2_2)
+            throw new ArgumentOutOfRangeException(
+                nameof(version), v, "LanceFileWriter writes Lance v2.1 and v2.2 files only.");
+        return v;
     }
 
     private static CompressiveEncoding FlatEncoding(int bitsPerValue) =>
@@ -1546,7 +1575,8 @@ public sealed class LanceFileWriter : IAsyncDisposable
             if (_wroteMiniBlockPage)
                 throw new NotSupportedException(
                     $"Map column '{name}' needs a Lance v2.2 file, but earlier columns were already " +
-                    "written in the v2.1 mini-block grammar. Write the Map column first.");
+                    "written in the v2.1 mini-block format. Create the writer with " +
+                    "LanceVersion.V2_2, or write the Map column first.");
             _version = LanceVersion.V2_2;
         }
 
