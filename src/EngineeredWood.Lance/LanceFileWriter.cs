@@ -70,6 +70,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
     private readonly bool _ownsFile;
     private LanceVersion _version;  // bumped to V2_2 if a Map column is written
     private bool _wroteMiniBlockPage;  // a page whose chunk grammar depends on _version
+    private readonly bool _versionPinned;  // created with an explicit version: never moved to v2.2
     private readonly LanceCompressionScheme _compression;
     private readonly List<Proto.Field> _fields = new();
     private readonly List<ColumnMetadata> _columns = new();
@@ -113,6 +114,14 @@ public sealed class LanceFileWriter : IAsyncDisposable
         _compression = compression;
     }
 
+    private LanceFileWriter(
+        ISequentialFile file, bool ownsFile, LanceVersion? requested,
+        LanceCompressionScheme compression)
+        : this(file, ownsFile, ResolveVersion(requested), compression)
+    {
+        _versionPinned = requested is not null;
+    }
+
     /// <summary>
     /// Creates a writer over a caller-provided <see cref="ISequentialFile"/>.
     /// The caller controls the file's lifetime when <paramref name="ownsFile"/>
@@ -127,7 +136,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
         LanceVersion? version = null)
     {
         if (file is null) throw new ArgumentNullException(nameof(file));
-        return new LanceFileWriter(file, ownsFile, ResolveVersion(version), compression);
+        return new LanceFileWriter(file, ownsFile, version, compression);
     }
 
     /// <summary>
@@ -143,22 +152,23 @@ public sealed class LanceFileWriter : IAsyncDisposable
         LanceCompressionScheme compression = LanceCompressionScheme.None,
         LanceVersion? version = null)
     {
-        LanceVersion resolved = ResolveVersion(version);
+        ResolveVersion(version);  // validate before creating the file
         var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(
             System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path))!);
         var seq = await fs.CreateAsync(
             System.IO.Path.GetFileName(path), overwrite: true, cancellationToken).ConfigureAwait(false);
-        return new LanceFileWriter(seq, ownsFile: true, resolved, compression);
+        return new LanceFileWriter(seq, ownsFile: true, version, compression);
     }
 
     /// <summary>
-    /// The file version a writer starts at: <see cref="LanceVersion.V2_1"/>
-    /// when <paramref name="version"/> is null, otherwise
-    /// <see cref="LanceVersion.V2_1"/> or <see cref="LanceVersion.V2_2"/>.
-    /// A v2.1 writer moves to v2.2 when a Map column is written before any
-    /// other column. Choose v2.2 up front to write a Map after other columns:
-    /// the two versions use different mini-block chunk formats, so a file
-    /// can't change version once such a page is on disk.
+    /// The file version a writer starts at. With <paramref name="version"/>
+    /// null it is <see cref="LanceVersion.V2_1"/>, and moves to v2.2 when a Map
+    /// column is written before any other column. An explicit
+    /// <see cref="LanceVersion.V2_1"/> or <see cref="LanceVersion.V2_2"/> is
+    /// kept: a v2.1 writer created that way refuses a Map column. Choose v2.2
+    /// up front to write a Map after other columns: the two versions use
+    /// different mini-block chunk formats, so a file can't change version once
+    /// such a page is on disk.
     /// </summary>
     private static LanceVersion ResolveVersion(LanceVersion? version)
     {
@@ -1572,6 +1582,9 @@ public sealed class LanceFileWriter : IAsyncDisposable
         // lance reader accepts.
         if (_version != LanceVersion.V2_2)
         {
+            if (_versionPinned)
+                throw new NotSupportedException(
+                    $"Map column '{name}' needs a Lance v2.2 file, but this writer was created for v{_version}.");
             if (_wroteMiniBlockPage)
                 throw new NotSupportedException(
                     $"Map column '{name}' needs a Lance v2.2 file, but earlier columns were already " +

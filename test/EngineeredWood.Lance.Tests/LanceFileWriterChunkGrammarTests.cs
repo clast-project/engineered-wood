@@ -212,6 +212,26 @@ public class LanceFileWriterChunkGrammarTests
         }
     }
 
+    // An explicit version is kept: a writer created for v2.1 doesn't move to
+    // v2.2 even when the Map is its first column.
+    [Fact]
+    public async Task ExplicitV2_1_RefusesAMap()
+    {
+        string path = TempPath();
+        try
+        {
+            await using var writer = await LanceFileWriter.CreateAsync(path, version: LanceVersion.V2_1);
+            var ex = await Assert.ThrowsAsync<NotSupportedException>(
+                () => writer.WriteColumnAsync("kvs", BuildMap()));
+            Assert.Contains("created for v2.1", ex.Message);
+            Assert.Equal(LanceVersion.V2_1, writer.Version);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
     [Fact]
     public async Task UnsupportedVersion_IsRefused()
     {

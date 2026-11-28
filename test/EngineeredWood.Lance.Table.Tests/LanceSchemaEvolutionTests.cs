@@ -190,6 +190,24 @@ public class LanceSchemaEvolutionTests
         }
     }
 
+    // Without data_format, lance infers the version from the data files, so a 2.0 dataset is still refused.
+    [Fact]
+    public async Task DroppedColumn_V20_WithoutDataFormat_IsStillRefused()
+    {
+        string path = CopyFixture("dropped_column_v20");
+        try
+        {
+            LanceBasePathsTests.RewriteManifests(path, m => m.DataFormat = null);
+            var ex = await Assert.ThrowsAsync<NotSupportedException>(async () =>
+                await LanceDatasetWriter.AppendAsync(path));
+            Assert.Contains("2.0 dataset", ex.Message);
+        }
+        finally
+        {
+            DeleteDirectory(path);
+        }
+    }
+
     [Fact]
     public async Task DroppedNestedField_V21_UpdateRewritesWithTheManifestsIds()
     {

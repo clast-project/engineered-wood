@@ -263,8 +263,12 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         {
             version = fileVersion ?? LanceVersion.V2_1;
         }
+        // Append pins the dataset's version. Create and Overwrite pass the
+        // caller's choice through, so null keeps the file writer's default
+        // (v2.1, moving to v2.2 for a Map written first).
         var fileWriter = await LanceFileWriter.CreateAsync(
-            dataFilePath, cancellationToken, compression, version).ConfigureAwait(false);
+            dataFilePath, cancellationToken, compression,
+            mode == LanceWriteMode.Append ? version : fileVersion).ConfigureAwait(false);
 
         return new LanceDatasetWriter(
             datasetPath, mode, compression, baseManifest, readVersion, basePaths,
@@ -508,15 +512,31 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             newFragments.Add(fragProto);
         }
 
+        // lance refuses a dataset whose data files don't all share one version,
+        // so check before committing: the new fragments against each other, and
+        // for Append against the dataset's version (which the manifest keeps).
+        LanceVersion newVersion = _completedFragments[0].Version;
+        foreach (var fragment in _completedFragments)
+            if (fragment.Version != newVersion)
+                throw new InvalidOperationException(
+                    $"The new fragments mix Lance v{newVersion} and v{fragment.Version} data files.");
+        if (_mode == LanceWriteMode.Append
+            && DatasetVersion(_baseManifest!, _datasetPath) is { } datasetVersion
+            && datasetVersion != $"{newVersion.Major}.{newVersion.Minor}")
+            throw new InvalidOperationException(
+                $"The appended fragments are Lance v{newVersion} files, but the dataset's are v{datasetVersion}.");
+
         var manifest = new LanceManifest
         {
             Version = nextVersion,
             TransactionFile = transactionFileName,
-            DataFormat = new LanceManifest.Types.DataStorageFormat
-            {
-                FileFormat = "lance",
-                Version = $"{_completedFragments[0].Version.Major}.{_completedFragments[0].Version.Minor}",
-            },
+            DataFormat = _mode == LanceWriteMode.Append && _baseManifest!.DataFormat is { } baseFormat
+                ? baseFormat.Clone()
+                : new LanceManifest.Types.DataStorageFormat
+                {
+                    FileFormat = "lance",
+                    Version = $"{newVersion.Major}.{newVersion.Minor}",
+                },
         };
         foreach (var f in manifestFields)
             manifest.Fields.Add(f);
@@ -1528,10 +1548,10 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         }
         bool hasMap = schema.FieldsList.Any(f => HasMap(f.DataType));
 
-        string? declared = manifest.DataFormat?.Version;
+        string? declared = DatasetVersion(manifest, datasetPath);
         switch (declared)
         {
-            case null or "":
+            case null:
                 return hasMap ? LanceVersion.V2_2 : LanceVersion.V2_1;
             case "2.2":
                 return LanceVersion.V2_2;
@@ -1559,6 +1579,30 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             NestedType nested => nested.Fields.Any(f => HasMap(f.DataType)),
             _ => false,
         };
+    }
+
+    /// <summary>
+    /// The dataset's data-file version as lance resolves it: the manifest's
+    /// <c>data_format.version</c>, or, when that is absent, the version every
+    /// data file records (lance-table <c>Fragment::try_infer_version</c>), or
+    /// null for a dataset with neither. Files that disagree are refused, as
+    /// lance refuses them ("All data files must have the same version").
+    /// </summary>
+    private static string? DatasetVersion(LanceManifest manifest, string datasetPath)
+    {
+        if (manifest.DataFormat is { Version.Length: > 0 } format) return format.Version;
+        string? inferred = null;
+        foreach (var fragment in manifest.Fragments)
+            foreach (var file in fragment.Files)
+            {
+                string version = $"{file.FileMajorVersion}.{file.FileMinorVersion}";
+                if (inferred is null) inferred = version;
+                else if (inferred != version)
+                    throw new NotSupportedException(
+                        $"Cannot write to the Lance dataset at '{datasetPath}': it declares no data storage version "
+                        + $"and its data files mix versions {inferred} and {version}.");
+            }
+        return inferred;
     }
 
     /// <summary>Reads <paramref name="fragment"/>'s deletion file, wherever its base puts it.</summary>

@@ -144,6 +144,75 @@ public class LanceDatasetWriterMapVersionTests
         }
     }
 
+    // Append pins the dataset's version, so a Map written first can't move the
+    // new file to v2.2 under a 2.1 manifest. (The schema check would refuse it
+    // at commit anyway, but only after writing the file.)
+    [Fact]
+    public async Task Append_ToA2_1Dataset_CantMoveToV2_2()
+    {
+        string path = NewDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("id", new[] { 1, 2, 3 });
+                await ds.FinishAsync();
+            }
+
+            await using var append = await LanceDatasetWriter.AppendAsync(path);
+            await Assert.ThrowsAsync<NotSupportedException>(
+                () => append.FileWriter.WriteColumnAsync("kvs", BuildMap(1)));
+            Assert.Equal(LanceVersion.V2_1, append.FileWriter.Version);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    // lance infers a missing data_format from the data files' own versions
+    // (lance-table Fragment::try_infer_version), and so does EW.
+    [Fact]
+    public async Task MissingDataFormat_IsInferredFromTheDataFiles()
+    {
+        string path = NewDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path, fileVersion: LanceVersion.V2_2))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("id", new[] { 1, 2, 3 });
+                await ds.FinishAsync();
+            }
+            LanceBasePathsTests.RewriteManifests(path, m => m.DataFormat = null);
+
+            // Inferred 2.2, so Append starts there (not at the 2.1 default) and the
+            // appended files match the existing ones.
+            await using (var ds = await LanceDatasetWriter.AppendAsync(path))
+            {
+                Assert.Equal(LanceVersion.V2_2, ds.FileWriter.Version);
+                await ds.FileWriter.WriteInt32ColumnAsync("id", new[] { 4 });
+                await ds.FinishAsync();
+            }
+            var (updated, _) = await LanceDatasetWriter.UpdateAsync(path,
+                EngineeredWood.Expressions.Expressions.LessThan("id", LiteralValue.Of(2)),
+                new Dictionary<string, Expression> { ["id"] = new LiteralExpression(LiteralValue.Of(10)) });
+            Assert.Equal(1, updated);
+
+            foreach (string file in Directory.GetFiles(Path.Combine(path, "data"), "*.lance"))
+            {
+                await using var reader = await LanceFileReader.OpenAsync(file);
+                Assert.Equal(LanceVersion.V2_2, reader.Version);
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    private static string NewDatasetPath() =>
+        Path.Combine(Path.GetTempPath(), $"ew-lance-mapver-{Guid.NewGuid():N}");
+
     /// <summary>Three one-entry rows: {"k{first}": first}, {"k{first+1}": first+1}, ...</summary>
     private static MapArray BuildMap(int first)
     {
